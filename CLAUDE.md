@@ -8,6 +8,32 @@ nothing here should be a copy of it.
 WSL only. Python lives in `.venv`; `make` puts it on PATH for you, so there is
 nothing to activate.
 
+## Origin story
+
+This repository will seem empty, and that is the plan working, not a problem
+to solve.
+
+sadana-harness is a reconstruction. `../hermes-agent` is a working agent
+runtime — 2.3M lines over 27,000 commits — that has been measured into 21
+purpose blocks, and the order those blocks must be built in is already known.
+We are not discovering what to build. We are rebuilding a shape someone else
+arrived at by accident, on purpose, in the order they could not use.
+
+Three consequences you might encounter, and they are why a step can look wrong from inside the repo:
+
+- **Early steps might have no callers yet, deliberately.**
+  An interface with no callers is not premature here — it is the only moment it is
+  cheap.
+- **The order is evidence, not preference.** Each step's position came from a
+  measured pathology in the reference. If a step looks out of order, say so in
+  one sentence and continue. Follow the plan until it breaks.
+- **"What should we build first" is already answered.** Interrogate the step's
+  intent as hard as you like. Do not reopen the scope of the project at the
+  start of every session.
+
+**We copy decisions, we try not to copy code.** Read the reference to learn how a problem was
+solved and what it cost, then try to write our own answer. Although straight up copying a file might be a shortcut, they have had this codebase for years, the only problem is that it is catered for different end goals.
+
 ## How work flows
 
 One work item = one artifact chain = one commit. Six stages, four files:
