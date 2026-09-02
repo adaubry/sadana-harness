@@ -1,0 +1,35 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(../hermes-agent/**)"
+    ],
+    "deny": [
+      "Write(../hermes-agent/**)", "Edit(../hermes-agent/**)",
+      "Bash(rm -rf *)",
+      "Read(./**/.env)", "Read(./**/.env.*)"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Write|Edit|Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"$CLAUDE_PROJECT_DIR/.claude/hooks/gate-artifact-chain.sh\""
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"$CLAUDE_PROJECT_DIR/.claude/hooks/stop-verify.sh\""
+          }
+        ]
+      }
+    ]
+  }
+}

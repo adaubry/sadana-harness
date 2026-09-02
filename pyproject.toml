@@ -1,0 +1,53 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sadana"
+version = "0.0.1"
+description = "sadana-harness"
+requires-python = ">=3.11"
+dependencies = []
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+# ── ruff ─────────────────────────────────────────────────────────────────────
+# Arguments live here, not in the Makefile and not in .pre-commit-config.yaml.
+# One owner. Adjust line-length to taste before you have code to reformat.
+[tool.ruff]
+# 120 rather than 88: scripts/artifact.py already has lines in the low 100s,
+# and a lint that is red on day one for reasons unrelated to your change is a
+# lint people learn to ignore. Tighten it later, in its own work item.
+line-length = 120
+src = ["src", "tests", "scripts"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+# ── mypy ─────────────────────────────────────────────────────────────────────
+[tool.mypy]
+python_version = "3.11"
+files = ["src"]
+warn_unused_configs = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+disallow_untyped_defs = true
+no_implicit_optional = true
+
+# ── pytest ───────────────────────────────────────────────────────────────────
+# Tiers are markers so `-m unit` works, and --strict-markers means a typo in a
+# marker is an error rather than a silently-unfiltered run.
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# src-layout: without this, `import sadana` fails under the hermetic runner
+# unless the package is pip-installed. pythonpath keeps the venv disposable —
+# no editable install to go stale, nothing to re-run when metadata changes.
+pythonpath = ["src"]
+addopts = "--strict-markers -q"
+markers = [
+  "unit: touches only the module under test",
+  "integration: crosses a real boundary",
+  "contract: pins an external interface",
+  "eval: model-in-the-loop, slow, not part of the default gate",
+]

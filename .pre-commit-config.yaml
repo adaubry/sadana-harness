@@ -1,0 +1,76 @@
+# pre-commit owns lint, format and every mechanical check. The Makefile never
+# names ruff; ruff's arguments live in pyproject.toml. One owner per concern.
+#
+# mypy is deliberately NOT here — `make typecheck` owns static types. Running
+# it in both places means two configs that will disagree.
+#
+# docs/reference/ is excluded: the hermes index is a generated 500KB+ CSV, and
+# formatting a corpus you did not write is noise.
+exclude: '^(\.sadana-bootstrap-backup/|docs/reference/)'
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+
+      # You develop on Windows and run in WSL. These two are not hygiene —
+      # they are the exact class of bug that made `MAKEFILE` look like it
+      # worked: CRLF sneaking into shell scripts, and two files whose names
+      # differ only in case surviving on NTFS and colliding on ext4.
+      - id: mixed-line-ending
+        args: [--fix=lf]
+      - id: check-case-conflict
+
+      - id: check-yaml
+      - id: check-toml
+      - id: check-json
+      - id: check-merge-conflict
+      - id: check-added-large-files
+        args: [--maxkb=1024]
+
+      # A shell script with a shebang that is not executable fails silently
+      # at the worst moment — inside a hook, where nobody is watching.
+      - id: check-shebang-scripts-are-executable
+      - id: check-executables-have-shebangs
+
+      - id: detect-private-key
+
+      # Turn this on the day you start working in branches. It is the cheap
+      # local stand-in for the branch protection you do not have yet, and the
+      # thing that makes "one artifact, one PR" real.
+      # - id: no-commit-to-branch
+      #   args: [--branch, main]
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.8.6
+    hooks:
+      - id: ruff
+        args: [--fix]
+      - id: ruff-format
+
+  # Your hooks and your test runner are shell, they are load-bearing, and a
+  # bug in them fails open — the gate simply stops gating. shellcheck already
+  # found one real defect in run_tests.sh (an unguarded cd).
+  - repo: https://github.com/shellcheck-py/shellcheck-py
+    rev: v0.10.0.1
+    hooks:
+      - id: shellcheck
+
+  # detect-private-key only catches literal key blocks. This catches tokens,
+  # cloud credentials and API keys — which matters because the test runner's
+  # whole env -i design exists to keep credentials out of test processes.
+  #
+  # This was gitleaks, which is better at the job but is a Go binary built
+  # from source at install time, and its go.mod needs Go 1.21+. Debian's
+  # golang-go is older, so it fails with "unknown directive: toolchain".
+  # detect-secrets is pure Python and installs into the venv pre-commit
+  # already builds: no second toolchain to keep current. Swap back to gitleaks
+  # if you ever need Go for its own sake.
+  #
+  # False positive? Add `# pragma: allowlist secret` on that line.
+  - repo: https://github.com/Yelp/detect-secrets
+    rev: v1.5.0
+    hooks:
+      - id: detect-secrets
