@@ -304,3 +304,10 @@ def test_wall_clock_budget_from_config_explicit_zero_is_none(monkeypatch: pytest
 def test_wall_clock_budget_from_config_positive_value(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("SADANA_CONVERSATION_RUN_BUDGET_SECONDS", "30")
     assert wall_clock_budget_from_config(now=100.0) == WallClockBudget(deadline=130.0)
+
+
+@pytest.mark.unit
+def test_wall_clock_budget_from_config_raises_for_negative(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SADANA_CONVERSATION_RUN_BUDGET_SECONDS", "-1")
+    with pytest.raises(ValueError):
+        wall_clock_budget_from_config(now=0.0)

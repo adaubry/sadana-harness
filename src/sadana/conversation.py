@@ -296,8 +296,11 @@ def wall_clock_budget_from_config(now: float) -> WallClockBudget | None:
     translating `docs/reference/conversation_block_blueprint.md` §5.7's
     ``run_budget_seconds: null``). Returns ``None`` when unset or 0 — a
     0-second budget is not a coherent allotment, so it is free to mean
-    "disabled" without a new ``config.py`` primitive."""
+    "disabled" without a new ``config.py`` primitive. Raises ``ValueError``
+    for a negative value, matching ``iteration_budget_from_config``."""
     seconds = config.env_int("SADANA_CONVERSATION_RUN_BUDGET_SECONDS", 0)
-    if seconds <= 0:
+    if seconds < 0:
+        raise ValueError(f"SADANA_CONVERSATION_RUN_BUDGET_SECONDS={seconds} must not be negative")
+    if seconds == 0:
         return None
     return WallClockBudget(deadline=now + seconds)
