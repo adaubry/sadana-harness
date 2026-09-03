@@ -20,9 +20,19 @@ if [ -n "$path" ]; then
 fi
 
 if [ -n "$cmd" ]; then
-  # Heredoc/redirect into an artifact path is a write wearing a Bash coat.
-  tgt=$(printf '%s' "$cmd" | grep -oE '(docs/tasks/[^[:space:]"'"'"']+|src/[^[:space:]"'"'"']+)' | head -1 || true)
-  if [ -n "$tgt" ] && printf '%s' "$cmd" | grep -Eq '>|tee|sed -i|python .*write'; then
+  # Heredoc/redirect into an artifact path is a write wearing a Bash coat —
+  # but the path must be the actual destination of the redirect/tee/sed -i,
+  # not just present anywhere else in the command. Without this, a read-only
+  # `grep foo src/x.py > /tmp/out` gets gated as a write to src/x.py because
+  # the command merely contains a `>` somewhere.
+  pathre='(docs/tasks/[^[:space:]"'"'"']+|src/[^[:space:]"'"'"']+)'
+  tgt=$(printf '%s' "$cmd" \
+    | grep -oE ">>?[[:space:]]*$pathre|tee[[:space:]]+(-a[[:space:]]+)?$pathre|sed[[:space:]]+-i[^[:space:]]*[[:space:]].*$pathre" \
+    | grep -oE "$pathre" | tail -1 || true)
+  if [ -z "$tgt" ] && printf '%s' "$cmd" | grep -Eq 'python' && printf '%s' "$cmd" | grep -Eq '\.write\('; then
+    tgt=$(printf '%s' "$cmd" | grep -oE "$pathre" | head -1 || true)
+  fi
+  if [ -n "$tgt" ]; then
     python3 scripts/artifact.py gate write "$tgt" || exit $?
   fi
   if printf '%s' "$cmd" | grep -Eq '(^|[;&|[:space:]])git[[:space:]]+commit'; then

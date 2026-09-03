@@ -1,6 +1,6 @@
 ---
 name: deploy-skill
-description: Run the Deploy stage for a work item — gather the verification evidence, review the change across three passes, reconcile it against intent, spec and plan, write review.md, and stop for a human decision. Use when a work item's code is written and review.md is missing, when the user asks for a review, or before opening a PR.
+description: Run the Deploy stage for a work item — gather the verification evidence, review the change across three passes, take a second opinion from the review commands, reconcile it against intent, spec and plan, write review.md, and stop for a human decision. Use when a work item's code is written and review.md is missing, when the user asks for a review, or before opening a PR.
 ---
 
 # Deploy stage — review, then hand the decision over
@@ -125,7 +125,58 @@ artifact chain no longer describes the code is. Nothing declares deviations
 for you — the Test stage writes no file — so the only place they surface is
 the diff comparison you did in step 3.
 
-## 6. Severity, and what not to report
+## 6. Second opinion — the review commands
+
+Your own passes are finished and your findings are written down. **Only now**
+run the two commands, in this order. Run them earlier and they become an
+anchor: you will find what they found. Run them here and they are a check on a
+view you already committed to, which is the only way a second opinion is worth
+anything.
+
+**First `/ponytail-review`.** Give it the work item and the areas the diff
+actually touches — named from `plan.md` § Files that change, not a generic
+request:
+
+```
+/ponytail-review my work on <short name> — <the two or three areas the diff
+touches, in the project's own words>
+```
+
+**Then `/simplify`**, once `/ponytail-review` has returned its output. It reads
+the same change and proposes reductions.
+
+If a command is not available in this session, say so under `## Findings` as a
+stated limitation of the review — the same way a review that could not be run
+cold declares itself — and continue. A missing tool is not a reason to skip
+the stage.
+
+### Triaging what comes back
+
+Neither command's output is findings. Both produce **candidates**, and every
+candidate is sorted before it can appear in `review.md`. Never paste a
+command's raw output into the review.
+
+`/simplify` in particular will return more than belongs here, because its job
+is to suggest and this stage's job is to be read. Sort each candidate:
+
+- **It removes a bet, drops mutable state, or moves a step off the common
+  path** → a Compliance finding, citing design principle 2, 5 or 4. These are
+  the ones worth having, and they are why this step exists.
+- **It contradicts something `spec.md` § Rejected alternatives already
+  settled** → not a finding. One line noting the spec held, and move on.
+- **It would change behaviour** → not a finding at all. It is a candidate for
+  the next work item's `intent.md`. Say so in a sentence and keep it out of
+  `## Findings` entirely; this review is about whether the change matches what
+  was decided, not about deciding something else.
+- **Anything else** → a Nit, inside the cap of five, or dropped.
+
+If a command duplicates a finding you already made, keep yours and note that
+it was confirmed — do not list it twice. If a command **contradicts** one of
+yours, that disagreement is the most useful thing a second opinion produces:
+resolve it, and put the resolution in the finding rather than dropping either
+side silently.
+
+## 7. Severity, and what not to report
 
 **Important** — a defect, a security exposure, or a compliance gap. Something
 that should change before merge.
@@ -144,9 +195,11 @@ thirty nits and two real findings has hidden the two.
   next work item, not in a review of this one.
 
 Signal density is the whole product of this stage. A review nobody reads
-carefully is review theatre with extra steps.
+carefully is review theatre with extra steps — and adding a second opinion in
+step 6 raises that risk, not lowers it, unless its output is triaged as hard
+as your own.
 
-## 7. Write review.md
+## 8. Write review.md
 
 `docs/tasks/<ID>-<slug>/review.md`:
 
@@ -155,10 +208,11 @@ carefully is review theatre with extra steps.
 
 Reviewed: <base>..HEAD — N files, +X/-Y
 Reviewer context: fresh session | same session as build (limitation noted)
+Second opinion: /ponytail-review, /simplify — both ran | <name> unavailable
 
 ## Evidence
-
 ```
+
 $ make verify
 no active task — nothing to check
 CHAIN OK
@@ -166,10 +220,11 @@ CHAIN OK
 LINT OK
 TYPES OK
 ▶ hermetic run: TZ=UTC LANG=C.UTF-8 PYTHONHASHSEED=0, empty env
-......                                                   [100%]
+...... [100%]
 6 passed in 0.41s
 TESTS OK
 VERIFY OK
+
 ```
 
 ## Findings
@@ -179,35 +234,50 @@ VERIFY OK
   case; the diff adds three cases and no malformed-file test.
 - [Bugs] resolve_path() returns None for an empty spec; the one caller at
   src/loader.py:41 dereferences it without a check.
+- [Compliance] /simplify proposed collapsing the two retry paths in
+  client.py:70-96 into one; taking it removes a bet spec.md never sanctioned
+  (principle 2). Confirmed against § Rejected alternatives — not one of them.
 
 ### Nits
 - [Bugs] The retry bound in client.py:88 is a literal; spec.md § Design names
   it as configurable.
+
+### Raised, not findings
+- /simplify suggested dropping the empty-response guard entirely. That changes
+  behaviour and belongs in a later intent.md, not in this review.
 
 ## Decision
 Pending — awaiting <name>.
 ```
 
 Write findings as full sentences with a location and a consequence. "Missing
-test" is not a finding; the example above is.
+test" is not a finding; the examples above are. A candidate that came from a
+command is written as your finding, in your words, with the command named as
+its source — not quoted.
+
+`### Raised, not findings` is optional and belongs only where a command
+produced something worth remembering for a later work item. Leave it out
+rather than padding it.
 
 **If the change is genuinely clean, say what you checked and found clean** —
-name the passes, name the artifacts you reconciled. `## Findings` is the trace
-of this stage, and a three-word "No issues found." both fails the validator and
+name the passes, name the artifacts you reconciled, say what the two commands
+returned and why none of it rose to a finding. `## Findings` is the trace of
+this stage, and a three-word "No issues found." both fails the validator and
 tells the next reader nothing about whether a review happened.
 
-## 8. Stop
+## 9. Stop
 
 Show the findings and ask plainly: **approve, request changes, or tell me what
 to look at again.**
 
 Do not write the decision yourself. Do not merge. Do not treat silence, a
 thumbs-up, or a follow-up question as approval. `## Decision` stays `Pending`
-until a person gives you an answer, and then it records *their* answer with
+until a person gives you an answer, and then it records _their_ answer with
 their name and the date:
 
 ```markdown
 ## Decision
+
 Approved by Adam, 2026-09-02, with the Important compliance finding fixed in
 this branch before merge.
 ```
@@ -216,7 +286,7 @@ Findings do not approve or block on their own. That is the point of the
 separation, and it is the only part of this stage that cannot be recovered
 later if it is skipped.
 
-## 9. After the decision
+## 10. After the decision
 
 If changes are requested, fix them in this branch and update `## Findings` with
 what changed — do not open a new work item for your own review findings.
@@ -224,14 +294,18 @@ what changed — do not open a new work item for your own review findings.
 If approved, the PR description carries the chain: link `intent.md`, `spec.md`,
 `plan.md` and `review.md`, and list the Important findings with their
 resolutions. The evidence is already in `review.md`; when CI exists it moves to
-the check run and `## Evidence` can go. The PR is the audit record — everything a later reader needs to reconstruct why this change exists
-and who agreed to it should be reachable from it without opening a session
-transcript.
+the check run and `## Evidence` can go. The PR is the audit record — everything
+a later reader needs to reconstruct why this change exists and who agreed to it
+should be reachable from it without opening a session transcript.
 
 ## Do not
 
 - Write your own approval, or merge on your own judgement.
 - Review in the same session that wrote the code without saying so.
+- Run `/ponytail-review` or `/simplify` before your own passes are written
+  down. Their value is as a check, and a check that arrives first is an anchor.
+- Paste a command's raw output into `## Findings`, or let a simplification that
+  changes behaviour enter the review at all.
 - Report anything `make verify` already enforces.
 - Let nits outnumber Important findings.
 - Skip the compliance pass because the tests are green — green tests and a
