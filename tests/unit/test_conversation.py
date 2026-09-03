@@ -6,16 +6,22 @@ import pytest
 
 from sadana.conversation import (
     DuplicateToolError,
+    IterationBudget,
     Message,
     MessageKey,
     ToolSpec,
     TranscriptInvariantError,
+    WallClockBudget,
     append,
     build_surface,
+    consume_iteration,
     filter_surface,
+    iteration_budget_from_config,
     pending_tool_call_ids,
     repair,
     surface_hash,
+    wall_clock_budget_from_config,
+    wall_clock_remaining,
 )
 
 
@@ -225,3 +231,76 @@ def test_surface_hash_changes_when_a_field_differs() -> None:
     surface = build_surface([_spec("a", "alpha")])
     other = build_surface([_spec("a", "alpha", describe=lambda r: "a different description")])
     assert surface_hash(surface) != surface_hash(other)
+
+
+# ── budgets ──────────────────────────────────────────────────────────────
+
+
+@pytest.mark.unit
+def test_consume_iteration_below_max_returns_incremented_budget() -> None:
+    budget = IterationBudget(max_total=3, used=1)
+    new_budget = consume_iteration(budget)
+    assert new_budget == IterationBudget(max_total=3, used=2)
+    assert budget == IterationBudget(max_total=3, used=1)
+
+
+@pytest.mark.unit
+def test_consume_iteration_at_max_returns_none() -> None:
+    budget = IterationBudget(max_total=3, used=3)
+    assert consume_iteration(budget) is None
+
+
+@pytest.mark.unit
+def test_consume_iteration_zero_max_returns_none_immediately() -> None:
+    budget = IterationBudget(max_total=0)
+    assert consume_iteration(budget) is None
+
+
+@pytest.mark.unit
+def test_wall_clock_remaining_positive_before_deadline() -> None:
+    budget = WallClockBudget(deadline=1000.0)
+    assert wall_clock_remaining(budget, now=900.0) == 100.0
+
+
+@pytest.mark.unit
+def test_wall_clock_remaining_non_positive_at_or_after_deadline() -> None:
+    budget = WallClockBudget(deadline=1000.0)
+    assert wall_clock_remaining(budget, now=1000.0) == 0.0
+    assert wall_clock_remaining(budget, now=1100.0) < 0
+
+
+@pytest.mark.unit
+def test_iteration_budget_from_config_defaults_to_60(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("SADANA_CONVERSATION_MAX_ITERATIONS", raising=False)
+    assert iteration_budget_from_config() == IterationBudget(max_total=60)
+
+
+@pytest.mark.unit
+def test_iteration_budget_from_config_uses_env_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SADANA_CONVERSATION_MAX_ITERATIONS", "12")
+    assert iteration_budget_from_config() == IterationBudget(max_total=12)
+
+
+@pytest.mark.unit
+def test_iteration_budget_from_config_raises_for_negative(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SADANA_CONVERSATION_MAX_ITERATIONS", "-1")
+    with pytest.raises(ValueError):
+        iteration_budget_from_config()
+
+
+@pytest.mark.unit
+def test_wall_clock_budget_from_config_defaults_to_none(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("SADANA_CONVERSATION_RUN_BUDGET_SECONDS", raising=False)
+    assert wall_clock_budget_from_config(now=0.0) is None
+
+
+@pytest.mark.unit
+def test_wall_clock_budget_from_config_explicit_zero_is_none(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SADANA_CONVERSATION_RUN_BUDGET_SECONDS", "0")
+    assert wall_clock_budget_from_config(now=0.0) is None
+
+
+@pytest.mark.unit
+def test_wall_clock_budget_from_config_positive_value(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SADANA_CONVERSATION_RUN_BUDGET_SECONDS", "30")
+    assert wall_clock_budget_from_config(now=100.0) == WallClockBudget(deadline=130.0)

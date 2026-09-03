@@ -33,6 +33,7 @@ WSL only. Python lives in `.venv`; `make` puts it on PATH for you, so there is n
 - When it comes to the system prompt, enforce a state contract that makes the principle "the system prompt is byte-stable for the life of a conversation" directly checkable, maintaining compression as the single named exception and using deferred invalidation as the default for any action that mutates prompt state
 - Prove a block's first real external round trip with a standalone script outside `make test`; paste its output as Deploy-stage Evidence rather than relaxing testing-conventions' network ban in the unit suite
 - A conversation's message history is mutated only through conversation.append/conversation.repair — never by direct list or tuple mutation elsewhere
+- Model a resource that can be consumed or exhausted (a budget, an allowance) as an immutable value with a consume() function returning a new value or None — never a mutable counter guarded by a lock
 
 ## Glossary
 

@@ -16,8 +16,10 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Callable, Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Literal
+
+from sadana import config
 
 # A caller-supplied natural key, e.g. "support/ticket-4821". This module
 # does not mint or validate one, and does not enforce it is unique — that
@@ -226,3 +228,76 @@ def surface_hash(surface: ToolSurface) -> str:
     same choice as ``MessageKey.msg_seq``."""
     canonical = json.dumps(list(surface), sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+# ── CONV-03: budgets ─────────────────────────────────────────────────────
+# Its full contract is `docs/tasks/C4-budgets/spec.md`.
+
+
+@dataclass(frozen=True)
+class IterationBudget:
+    """How many more actions a conversation's run is allowed to take.
+
+    Immutable, not hermes's mutable-plus-lock shape: the lock in hermes's
+    ``agent/iteration_budget.py`` protects one instance from concurrent
+    mutation by more than one thread, a scenario this project's
+    async-first loop design removes. No ``refund`` — hermes's only existed
+    for ``execute_code`` turns, a tool this project doesn't have.
+    """
+
+    max_total: int
+    used: int = 0
+
+
+def consume_iteration(budget: IterationBudget) -> IterationBudget | None:
+    """One more iteration used, or ``None`` if ``budget`` was already at
+    ``max_total``. Never raises — an exhausted budget is a normal outcome
+    of a run, not a broken invariant."""
+    if budget.used >= budget.max_total:
+        return None
+    return replace(budget, used=budget.used + 1)
+
+
+def iteration_budget_from_config() -> IterationBudget:
+    """Reads ``SADANA_CONVERSATION_MAX_ITERATIONS`` (default 60, matching
+    `docs/reference/conversation_block_blueprint.md` §5.7). Raises
+    ``ValueError`` for a negative configured value rather than building a
+    budget nobody could ever consume from."""
+    max_total = config.env_int("SADANA_CONVERSATION_MAX_ITERATIONS", 60)
+    if max_total < 0:
+        raise ValueError(f"SADANA_CONVERSATION_MAX_ITERATIONS={max_total} must not be negative")
+    return IterationBudget(max_total=max_total)
+
+
+@dataclass(frozen=True)
+class WallClockBudget:
+    """A deadline a conversation's run should not run past.
+
+    ``deadline`` must be on the same clock as every ``now`` passed to
+    ``wall_clock_remaining`` — ``time.monotonic()``, never ``time.time()``.
+    Nothing here enforces that; it is a caller responsibility, the same
+    kind of contract ``MessageKey.msg_seq`` and ``surface_hash`` place on
+    their callers without a runtime check.
+    """
+
+    deadline: float
+
+
+def wall_clock_remaining(budget: WallClockBudget, now: float) -> float:
+    """Seconds left before ``budget.deadline``, given the caller's own
+    ``now``. Possibly negative once exhausted — the caller compares the
+    result to 0 itself. Pure: never reads the real clock, so a test can
+    call this with any ``now`` it likes."""
+    return budget.deadline - now
+
+
+def wall_clock_budget_from_config(now: float) -> WallClockBudget | None:
+    """Reads ``SADANA_CONVERSATION_RUN_BUDGET_SECONDS`` (default 0,
+    translating `docs/reference/conversation_block_blueprint.md` §5.7's
+    ``run_budget_seconds: null``). Returns ``None`` when unset or 0 — a
+    0-second budget is not a coherent allotment, so it is free to mean
+    "disabled" without a new ``config.py`` primitive."""
+    seconds = config.env_int("SADANA_CONVERSATION_RUN_BUDGET_SECONDS", 0)
+    if seconds <= 0:
+        return None
+    return WallClockBudget(deadline=now + seconds)
