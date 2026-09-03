@@ -11,13 +11,16 @@ from sadana import model_access
 from sadana.conversation import (
     Completion,
     ContextOverflow,
+    ConversationTemplate,
     DuplicateToolError,
     ExitReason,
     IterationBudget,
     Message,
     MessageKey,
+    PluginCatalogEntry,
     PromptDriftError,
     ProviderFailure,
+    TemplateRecipe,
     ToolSpec,
     ToolSurface,
     TranscriptInvariantError,
@@ -29,6 +32,8 @@ from sadana.conversation import (
     coalesce_tool_call_id,
     complete,
     consume_iteration,
+    create_conversation,
+    defer_invalidation,
     deterministic_call_id,
     filter_surface,
     iteration_budget_from_config,
@@ -37,6 +42,7 @@ from sadana.conversation import (
     repair_tool_call_arguments,
     run_turn,
     surface_hash,
+    take_turn,
     turn_prompt_hash,
     uniquify_tool_call_ids,
     wall_clock_budget_from_config,
@@ -900,3 +906,212 @@ def test_deduplicate_tool_calls_leaves_unique_unchanged() -> None:
         {"id": "2", "name": "a", "arguments": {"x": 2}},
     )
     assert _deduplicate_tool_calls(calls) == calls
+
+
+# ── conversation aggregate + template (CONV-06) ──────────────────────────
+
+
+def _recipe(stable: str = "You are helpful.", catalog: tuple = (), tool_specs: tuple | None = None) -> TemplateRecipe:
+    return TemplateRecipe(
+        stable_prompt=stable,
+        catalog=catalog,
+        tool_specs=tool_specs if tool_specs is not None else (_spec("noop", "noop"),),
+    )
+
+
+def _template(name: str = "t1", recipe: TemplateRecipe | None = None) -> ConversationTemplate:
+    return ConversationTemplate(name=name, recipe=recipe or _recipe())
+
+
+def _budget(max_total: int = 5) -> IterationBudget:
+    return IterationBudget(max_total=max_total)
+
+
+@pytest.mark.unit
+def test_create_conversation_prompt_sha256_matches_turn_prompt_hash() -> None:
+    conversation, _t = create_conversation(_template(), "c1", "hi", iteration_budget=_budget())
+    assert conversation.prompt_sha256 == turn_prompt_hash(conversation.system_prompt, conversation.tool_surface)
+
+
+@pytest.mark.unit
+def test_create_conversation_catalog_changes_the_hash() -> None:
+    entry = PluginCatalogEntry(name="p1", purpose="does a thing", entry_tool="p1.start")
+    template_plain = _template()
+    template_with_catalog = _template(recipe=_recipe(catalog=(entry,)))
+
+    conv_plain, _ = create_conversation(template_plain, "c1", "hi", iteration_budget=_budget())
+    conv_with_catalog, _ = create_conversation(template_with_catalog, "c1", "hi", iteration_budget=_budget())
+
+    assert conv_plain.system_prompt != conv_with_catalog.system_prompt
+    assert conv_plain.prompt_sha256 != conv_with_catalog.prompt_sha256
+
+
+@pytest.mark.unit
+def test_defer_invalidation_returns_new_value_original_untouched() -> None:
+    template = _template()
+    new_recipe = _recipe(stable="You are different now.")
+
+    updated = defer_invalidation(template, new_recipe)
+
+    assert updated.pending_recipe == new_recipe
+    assert template.pending_recipe is None
+    assert template.recipe.stable_prompt == "You are helpful."
+
+
+@pytest.mark.unit
+def test_defer_invalidation_is_invisible_to_an_already_created_conversation() -> None:
+    template = _template()
+    conversation, template = create_conversation(template, "c1", "hi", iteration_budget=_budget())
+    before = (conversation.system_prompt, conversation.prompt_sha256, conversation.tool_surface)
+
+    defer_invalidation(template, _recipe(stable="A brand new identity."))
+
+    assert (conversation.system_prompt, conversation.prompt_sha256, conversation.tool_surface) == before
+
+
+@pytest.mark.unit
+def test_create_conversation_promotes_pending_recipe_and_clears_it() -> None:
+    template = _template()
+    new_recipe = _recipe(stable="A brand new identity.")
+    template = defer_invalidation(template, new_recipe)
+
+    conversation, template = create_conversation(template, "c2", "hi", iteration_budget=_budget())
+
+    assert conversation.system_prompt.startswith("A brand new identity.")
+    assert template.pending_recipe is None
+    assert template.recipe == new_recipe
+
+
+@pytest.mark.unit
+def test_create_conversation_reuses_promoted_recipe_without_further_defer() -> None:
+    template = _template()
+    new_recipe = _recipe(stable="A brand new identity.")
+    template = defer_invalidation(template, new_recipe)
+    _first, template = create_conversation(template, "c2", "hi", iteration_budget=_budget())
+
+    second, _template2 = create_conversation(template, "c3", "hi", iteration_budget=_budget())
+
+    assert second.system_prompt.startswith("A brand new identity.")
+
+
+@pytest.mark.unit
+def test_take_turn_completed_updates_conversation(monkeypatch: pytest.MonkeyPatch) -> None:
+    conversation, _t = create_conversation(_template(), "c1", "hi", iteration_budget=_budget())
+    monkeypatch.setattr(model_access, "send", lambda request: _text_response("hi there"))
+
+    result, updated = asyncio.run(
+        take_turn(
+            conversation,
+            user_input="hello",
+            provider="p",
+            model="m",
+            dispatch=_fake_dispatch_ok,
+            compress=_fake_compress_none,
+            now=0.0,
+        )
+    )
+
+    assert result.exit_reason == ExitReason.COMPLETED
+    assert updated.messages[-2].role == "user"
+    assert updated.messages[-2].content == "hello"
+    assert updated.messages[-1].role == "assistant"
+    assert updated.messages[-1].content == "hi there"
+    assert updated.next_turn_seq == 1
+    assert updated.iteration_budget.used == 1
+    assert updated.prompt_epoch == 0
+
+
+@pytest.mark.unit
+def test_take_turn_compression_rotates_prompt_and_stays_self_consistent(monkeypatch: pytest.MonkeyPatch) -> None:
+    conversation, _t = create_conversation(_template(), "c1", "hi", iteration_budget=_budget())
+
+    outcomes = iter([model_access.NeedsContextCompression("too big"), _text_response("ok now")])
+    monkeypatch.setattr(model_access, "send", lambda request: next(outcomes))
+
+    async def compress_to_shorter(messages: tuple[Message, ...], system_prompt: str) -> str | None:
+        return "a shorter prompt"
+
+    result, updated = asyncio.run(
+        take_turn(
+            conversation,
+            user_input="hello",
+            provider="p",
+            model="m",
+            dispatch=_fake_dispatch_ok,
+            compress=compress_to_shorter,
+            now=0.0,
+        )
+    )
+
+    assert result.exit_reason == ExitReason.COMPLETED
+    assert updated.prompt_epoch == 1
+    assert updated.prompt_sha256 == turn_prompt_hash(updated.system_prompt, updated.tool_surface)
+
+    monkeypatch.setattr(model_access, "send", lambda request: _text_response("second reply"))
+    result2, _updated2 = asyncio.run(
+        take_turn(
+            updated,
+            user_input="again",
+            provider="p",
+            model="m",
+            dispatch=_fake_dispatch_ok,
+            compress=_fake_compress_none,
+            now=0.0,
+        )
+    )
+    assert result2.exit_reason == ExitReason.COMPLETED  # no PromptDriftError raised
+
+
+@pytest.mark.unit
+def test_take_turn_twice_accumulates_one_shared_history(monkeypatch: pytest.MonkeyPatch) -> None:
+    conversation, _t = create_conversation(_template(), "c1", "hi", iteration_budget=_budget())
+    monkeypatch.setattr(model_access, "send", lambda request: _text_response("reply"))
+
+    _result1, after_first = asyncio.run(
+        take_turn(
+            conversation,
+            user_input="first",
+            provider="p",
+            model="m",
+            dispatch=_fake_dispatch_ok,
+            compress=_fake_compress_none,
+            now=0.0,
+        )
+    )
+    _result2, after_second = asyncio.run(
+        take_turn(
+            after_first,
+            user_input="second",
+            provider="p",
+            model="m",
+            dispatch=_fake_dispatch_ok,
+            compress=_fake_compress_none,
+            now=0.0,
+        )
+    )
+
+    contents = [m.content for m in after_second.messages]
+    assert "first" in contents
+    assert "second" in contents
+    assert len(after_second.messages) == 4
+    assert after_second.next_turn_seq == 2
+
+
+@pytest.mark.unit
+def test_rotate_prompt_is_the_only_epoch_mutating_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    conversation, _t = create_conversation(_template(), "c1", "hi", iteration_budget=_budget())
+    assert conversation.prompt_epoch == 0
+    monkeypatch.setattr(model_access, "send", lambda request: _text_response("reply"))
+
+    _result, updated = asyncio.run(
+        take_turn(
+            conversation,
+            user_input="hello",
+            provider="p",
+            model="m",
+            dispatch=_fake_dispatch_ok,
+            compress=_fake_compress_none,
+            now=0.0,
+        )
+    )
+    assert updated.prompt_epoch == 0

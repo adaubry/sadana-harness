@@ -868,3 +868,201 @@ async def run_turn(
         appended=range(turn_start_seq, len(messages)),
     )
     return result, messages, iteration_budget, system_prompt
+
+
+# ── CONV-06: conversation aggregate + template ──────────────────────────
+# Its full contract is `docs/tasks/C8-conversation-aggregate/spec.md`.
+
+# A caller-minted natural key for a starting point conversations are
+# created from — same posture as `ConversationKey`: not generated, not
+# validated, not enforced unique here. That needs a store, CONV-08's job.
+TemplateName = str
+
+
+@dataclass(frozen=True)
+class PluginCatalogEntry:
+    """One caller-supplied fact about an outside procedure. Nothing here
+    discovers, loads, or validates one — a future PLUGINS block is the real
+    producer of this data; this work item only defines the three fields
+    blueprint §8 Open Question 1 named. ``entry_tool`` is stored as a
+    literal string, not resolved against a ``ToolSurface``'s resolved
+    names — see spec.md's Open questions."""
+
+    name: str
+    purpose: str  # one sentence, rendered verbatim
+    entry_tool: str
+
+
+@dataclass(frozen=True)
+class TemplateRecipe:
+    """Everything a starting point contributes to a conversation's prompt
+    and tool surface, as one atomic bundle — not three separately-pending
+    fields (spec.md's Rejected alternatives: no reader needs a partial
+    change yet, so one bundle is fewer bets and less state)."""
+
+    stable_prompt: str
+    catalog: tuple[PluginCatalogEntry, ...]
+    tool_specs: tuple[ToolSpec, ...]
+
+
+@dataclass(frozen=True)
+class ConversationTemplate:
+    """A starting point conversations are created from. Frozen, like every
+    other value in this module: recording a deferred change is a function
+    returning a new value, never an in-place mutation — the same shape
+    ``IterationBudget``'s ``consume_iteration`` already established, and
+    CLAUDE.md's explicit rule for a consumable resource."""
+
+    name: TemplateName
+    recipe: TemplateRecipe
+    pending_recipe: TemplateRecipe | None = None
+
+
+def defer_invalidation(template: ConversationTemplate, new_recipe: TemplateRecipe) -> ConversationTemplate:
+    """Records ``new_recipe`` as ``template``'s pending replacement.
+    Returns a new ``ConversationTemplate`` value; ``template`` itself, and
+    every ``Conversation`` already built from it, are unreachable from this
+    call — not merely untouched by this call's own code path, but
+    unreachable by construction, since ``Conversation`` holds only
+    ``template.name``, never ``template`` itself (spec.md's central design
+    choice — see its Design section, "structural removal")."""
+    return replace(template, pending_recipe=new_recipe)
+
+
+class PromptRotationReason(Enum):
+    """The one member blueprint §4.3 names. A second member is a visible
+    diff at every call site that already pattern-matches on this enum —
+    that visibility, not the value itself, is what this type is for."""
+
+    COMPRESSION = "compression"
+
+
+@dataclass(frozen=True)
+class Conversation:
+    """One continuing conversation. Holds ``template_name``, never a
+    ``ConversationTemplate`` — see ``defer_invalidation`` above."""
+
+    key: ConversationKey
+    template_name: TemplateName
+    system_prompt: str
+    prompt_sha256: str
+    prompt_epoch: int
+    tool_surface: ToolSurface
+    messages: tuple[Message, ...]
+    next_turn_seq: int
+    iteration_budget: IterationBudget
+    wall_clock_budget: WallClockBudget | None
+
+
+def _render_context(system_message: str, catalog: tuple[PluginCatalogEntry, ...]) -> str:
+    """The context tier: a caller-supplied message plus one rendered line
+    per catalog entry, each part skipped if empty (blueprint §4.3)."""
+    catalog_lines = "\n".join(f"{e.name}: {e.purpose} (start with {e.entry_tool})" for e in catalog)
+    return "\n\n".join(part for part in (system_message, catalog_lines) if part)
+
+
+def create_conversation(
+    template: ConversationTemplate,
+    key: ConversationKey,
+    system_message: str,
+    *,
+    iteration_budget: IterationBudget,
+    wall_clock_budget: WallClockBudget | None = None,
+) -> tuple[Conversation, ConversationTemplate]:
+    """If ``template.pending_recipe`` is set, it is promoted to
+    ``template.recipe`` and cleared — this call, not ``defer_invalidation``'s
+    call, is "the next conversation created from the same template" per
+    blueprint §4.3. Builds ``tool_surface`` from the (possibly just-promoted)
+    recipe's ``tool_specs``, composes ``system_prompt`` from
+    ``recipe.stable_prompt`` plus the rendered context tier, and hashes it
+    with ``turn_prompt_hash`` — the same function C7 already defined, not a
+    second one. Returns the new ``Conversation`` (epoch 0, empty history,
+    ``next_turn_seq=0``) alongside the template value the caller should keep
+    using next; ``template`` itself is never mutated."""
+    recipe = template.pending_recipe if template.pending_recipe is not None else template.recipe
+    updated_template = replace(template, recipe=recipe, pending_recipe=None)
+
+    tool_surface = build_surface(recipe.tool_specs)
+    context = _render_context(system_message, recipe.catalog)
+    system_prompt = "\n\n".join(part for part in (recipe.stable_prompt, context) if part)
+    prompt_sha256 = turn_prompt_hash(system_prompt, tool_surface)
+
+    conversation = Conversation(
+        key=key,
+        template_name=template.name,
+        system_prompt=system_prompt,
+        prompt_sha256=prompt_sha256,
+        prompt_epoch=0,
+        tool_surface=tool_surface,
+        messages=(),
+        next_turn_seq=0,
+        iteration_budget=iteration_budget,
+        wall_clock_budget=wall_clock_budget,
+    )
+    return conversation, updated_template
+
+
+def rotate_prompt(conversation: Conversation, *, reason: PromptRotationReason, new_prompt: str) -> Conversation:
+    """The only function in this module that increments ``prompt_epoch``.
+    Recomputes ``prompt_sha256`` against ``new_prompt`` and the
+    conversation's existing ``tool_surface`` so the result is
+    self-consistent for the very next turn's own PROLOGUE check. ``reason``
+    selects behavior at the call site (there being only one member today)
+    and is not stored — no reader exists yet (spec.md's Rejected
+    alternatives)."""
+    del reason  # accepted for call-site clarity only; see docstring.
+    return replace(
+        conversation,
+        system_prompt=new_prompt,
+        prompt_sha256=turn_prompt_hash(new_prompt, conversation.tool_surface),
+        prompt_epoch=conversation.prompt_epoch + 1,
+    )
+
+
+async def take_turn(
+    conversation: Conversation,
+    *,
+    user_input: str,
+    provider: str,
+    model: str,
+    dispatch: Callable[[str, dict], Awaitable[str]],
+    compress: Callable[[tuple[Message, ...], str], Awaitable[str | None]],
+    persist: Callable[[tuple[Message, ...]], Awaitable[None]] = _noop_persist,
+    now: float,
+) -> tuple[TurnResult, Conversation]:
+    """Calls C7's ``run_turn`` with every value it needs, read off
+    ``conversation``. If the returned ``system_prompt`` differs from
+    ``conversation.system_prompt`` (compression rotated it mid-turn), the
+    result goes through ``rotate_prompt`` first, so epoch and hash always
+    move together through the one sanctioned path; ``messages``,
+    ``iteration_budget``, and ``next_turn_seq + 1`` are then folded in.
+    Never mutates ``conversation`` — returns a new value."""
+    result, messages, iteration_budget, new_system_prompt = await run_turn(
+        conversation=conversation.key,
+        turn_seq=conversation.next_turn_seq,
+        messages=conversation.messages,
+        user_input=user_input,
+        system_prompt=conversation.system_prompt,
+        prompt_sha256=conversation.prompt_sha256,
+        tool_surface=conversation.tool_surface,
+        iteration_budget=conversation.iteration_budget,
+        wall_clock_budget=conversation.wall_clock_budget,
+        now=now,
+        provider=provider,
+        model=model,
+        dispatch=dispatch,
+        compress=compress,
+        persist=persist,
+    )
+
+    updated = conversation
+    if new_system_prompt != conversation.system_prompt:
+        updated = rotate_prompt(updated, reason=PromptRotationReason.COMPRESSION, new_prompt=new_system_prompt)
+
+    updated = replace(
+        updated,
+        messages=messages,
+        next_turn_seq=conversation.next_turn_seq + 1,
+        iteration_budget=iteration_budget,
+    )
+    return result, updated

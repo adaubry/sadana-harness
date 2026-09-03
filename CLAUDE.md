@@ -24,6 +24,7 @@ WSL only. Python lives in `.venv`; `make` puts it on PATH for you, so there is n
 
 - When you simplify a procedure, name the step that is still load-bearing and say why.
 - Use names, not pointers for anything long-lived: Anything long-lived a user returns to should be addressed by a unique natural key with a database constraint behind it
+- Apply the same rule in memory, before a database exists: a value should hold another long-lived value's name, never a live reference to it, whenever something else might change independently of what already holds the reference.
 - Use .env for secrets (API keys, tokens, passwords, etc...)
 - Use config for behaviours (Timeouts, thresholds, feature flags, display preferences go in the config file; bridge internally to an env var if a mechanism needs one, but the user-facing setting is the config key)
 - Know which config loader you are inside
