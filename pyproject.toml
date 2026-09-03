@@ -29,6 +29,16 @@ select = ["E", "F", "I", "UP", "B", "SIM"]
 [tool.mypy]
 python_version = "3.11"
 files = ["src"]
+# ponytail: model_providers/*/provider.py are dynamically loaded via
+# importlib.util.spec_from_file_location (mirroring hermes's own provider
+# discovery), never `import`ed as regular packages — several directory names
+# carry hyphens, so mypy's package-derived module naming collides them all
+# onto one "provider" module. Excluded rather than fought; the logic worth
+# type-checking (Request/Outcome, classify(), send()) lives in
+# sadana/model_access.py and stays covered. Upgrade path: if a second wired
+# provider grows enough real logic to want static checking, give it a
+# hyphen-free package under sadana/ proper and re-include it here.
+exclude = ["^src/sadana/model_providers/"]
 warn_unused_configs = true
 warn_redundant_casts = true
 warn_unused_ignores = true

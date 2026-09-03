@@ -31,6 +31,7 @@ WSL only. Python lives in `.venv`; `make` puts it on PATH for you, so there is n
 - Say exactly what each async operation survives
 - compose tool descriptions that reference other tools at definition-build time from the resolved set, ensuring no cross-reference is ever a literal
 - When it comes to the system prompt, enforce a state contract that makes the principle "the system prompt is byte-stable for the life of a conversation" directly checkable, maintaining compression as the single named exception and using deferred invalidation as the default for any action that mutates prompt state
+- Prove a block's first real external round trip with a standalone script outside `make test`; paste its output as Deploy-stage Evidence rather than relaxing testing-conventions' network ban in the unit suite
 
 ## Glossary
 
