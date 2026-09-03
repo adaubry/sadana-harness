@@ -4,9 +4,33 @@ Version 1.01 (03/09/2026)
 
 An agent runtime built from scratch. `../hermes-agent` is a **reference corpus.**
 Refer to our methodology for learning from the reference.
-Nothing here imports from it, we can sometimes copy it if it speeds up the process.
+Nothing here imports from it, we use its patterns and logic to speed up our build.
 
 WSL only. Python lives in `.venv`; `make` puts it on PATH for you, so there is nothing to activate.
+
+## Do not
+
+- Write code before `plan.md` exists and the user has approved it.
+- Approve your own work or merge on your own judgement. That decision is the
+  user's, and it is the only part of this process that cannot be recovered
+  afterwards.
+- Edit a closed work item's artifacts to match what the code became.
+- Verbatim copy Hermes code without auditing it against our paradigm and our project.
+- Paginate tools that load content the agent must read fully: Models will read page 1 and skip the rest.” Pagination on an instruction is an invitation to ignore it.
+- Infer process identity from argv substrings
+- Read source code in a test
+
+## Please do
+
+- When you simplify a procedure, name the step that is still load-bearing and say why.
+- Use names, not pointers for anything long-lived: Anything long-lived a user returns to should be addressed by a unique natural key with a database constraint behind it
+- Use .env for secrets (API keys, tokens, passwords, etc...)
+- Use config for behaviours (Timeouts, thresholds, feature flags, display preferences go in the config file; bridge internally to an env var if a mechanism needs one, but the user-facing setting is the config key)
+- Know which config loader you are inside
+- Isolate by process, and delete the state-reset fixtures when testing
+- Say exactly what each async operation survives
+- compose tool descriptions that reference other tools at definition-build time from the resolved set, ensuring no cross-reference is ever a literal
+- When it comes to the system prompt, enforce a state contract that makes the principle "the system prompt is byte-stable for the life of a conversation" directly checkable, maintaining compression as the single named exception and using deferred invalidation as the default for any action that mutates prompt state
 
 ## Glossary
 
@@ -19,7 +43,42 @@ WSL only. Python lives in `.venv`; `make` puts it on PATH for you, so there is n
 - AI-native SDLC: A reimagined SDLC that works around ai agents with a 6 stage loop,
   AI agents run through the loop and Humans stand above the loop instigating, directing and governing
 
-## Important meta context
+## The hermes-agent paradigm and our own paradigm shift
+
+In the current state of AI, most AI agents are amnesiacs. Agent skills are a step forward, an AI skill is pure knowledge
+it is nothing more, it is an extension of a prompt and however hard you try to describe a procedure inside
+an ai skill, it is flawed in its non-deterministic probabilistic nature.
+
+The hermes-agent paradigm is to be a self-improving agent framework engineered with a closed learning loop.
+
+- It maintains persistent memory to learn the user's project and preferences (with honcho)
+- It maintains procedural memory, accumulating knowledge by creating itself its own skills
+  in order to never forget how it previously solved a problem
+- It has multiple features dedicated to make a doers life easier
+
+We find multiple flaws with the “hermes way” of doing things:
+
+- agent-authored skills get messy at scale and must adopt a single-tenant infrastructure;
+- Because skills are only institutional knowledge, they aren’t self-sufficient;
+- Only the AI agent is supposed to learn, the Humans are out of the question.
+
+We want to empower our agent, with two things:
+
+- Persistent memory: The same way that hermes-agent uses honcho, with our twist
+  - we keep in memory what we decided, based on a known set of guidelines
+- Plugins, in our own way:
+  - skills belong in a plugin (the knowledge now becomes catered to the procedure)
+  - a plugin has a deterministic DAG-like procedure
+  - a plugin can interact with foreign environments (mcp, database, webhooks, apis)
+  - a plugin handles the agent input and serves an output (link, md file)
+  - That way an agent using a plugin becomes an agent following an SOP. Think of it like a zapier automation.
+
+In life, you can distinguish knowledge and behavior.
+Learning does not mean knowing, Learning actually describes that, given the same conditions you will produce a different behavior
+For hermes-agent project, learning means “an ai writes a skill, meant to be only knowledge, as if it was a procedure and updating it in a way that changes behavior”
+For sadana, learning means “a human creates a plugin, updates the plugin to change behavior”
+
+## Core Philosophy & Strategy
 
 sadana-harness is a reconstruction. `../hermes-agent` is a working agent
 runtime — 2.3M lines over 27,000 commits you will take inspiration from.
@@ -49,7 +108,7 @@ Three consequences you might encounter:
 
 - Early steps might have no callers yet, deliberately
 - The order is evidence, not preference
-- What should we build first" is already answered
+- "What should we build first" is already answered
 
 ### During phase 2:
 
@@ -57,17 +116,18 @@ We will focus on the features that will actually make the paradigm-shift.
 
 ### During phase 3:
 
-We will iterate on our MVP, sand off the rough edges, focus on
+We will iterate on our MVP, sand off the rough edges, and focus on stability, performance and user experience toward PMF.
 
-### Our methodology for learning from the reference
+## Layout and ownership informations
 
-**We copy decisions** Read the reference to learn how a problem was solved and what it cost,
-then try to write our own answer. You are encouraged to copy their codebase if that represents a shortcut,
-they have had this codebase for years, the only problem is that it is catered for different end goals.
+Caution, docs/reference/ (the hermes index) is generated and must never be hand-edited
 
-**If you decide to copy their work** Really ask yourself how this will interfere with our paradigm,
-watch out for tightly coupled, hidden assumptions in hermes-agent's codebase that will silently break when
-transplanted into our codebase with our different paradigm.
+A Make target is one line. The moment it needs branching, environment setup or
+error handling it becomes a script in `scripts/`, and the target calls that.
+
+Lint and format belong to pre-commit; ruff's arguments live in
+`pyproject.toml`. Never add ruff or formatting flags to the Makefile, and
+never add mypy to pre-commit — `make typecheck` owns static types.
 
 ## How work flows
 
@@ -98,7 +158,18 @@ actually ran: `Changed during planning`, `Concerns`, `Risks`, `Findings`.
 
 Never write a plausible trace for work you did not do.
 
-## Verifying your work
+### Built-in skills cheat sheet
+
+Use these built-in skills when relevant:
+
+- **/loop [interval] [prompt]**: Use to schedule recurring tasks or periodic monitoring.
+  - _Example:_ `/loop 20m check the deployment` or `/loop check status every 1h`
+- **/debug [issue description]**: Use when encountering unexpected behavior, tool failures, or errors in the current session to enable and inspect session logs.
+  - _Example:_ `/debug deployment command keeps failing with connection refused`
+- **/batch [instruction]**: Use to execute large-scale codebase migrations or multi-file refactors by decomposing the work into parallel background agents.
+  - _Example:_ `/batch migrate old-config to new-config across all services`
+
+### Verifying your work
 
 - Chain: `make chain` (must end "CHAIN OK")
 - Lint: `make lint` (must end "LINT OK")
@@ -155,7 +226,7 @@ editing it afterwards destroys the only thing it was for.
 
 `../hermes-agent` is read-only. Writes to it are denied.
 
-The index is `docs/reference/hermes_core_blocks.csv` — 2,368 rows,
+The index is `docs/reference/hermes_core_blocks_kind.csv` — 2,368 rows,
 `block,tier,kind,filename,path`, one per file in hermes's core, across 21
 purpose blocks.
 
@@ -166,21 +237,16 @@ purpose blocks.
 files in that index is your job — never ask the user which files are in a
 block.
 
-## Layout and ownership
+### Our methodology for learning from the reference
 
-    src/sadana/      the package
-    tests/           unit · integration · contract · eval
-    scripts/         run_tests.sh, artifact.py
-    docs/tasks/      one directory per work item
-    docs/reference/  the hermes index — generated, never hand-edited
-    .claude/         skills, hooks, settings
+**We copy decisions** Read the reference to learn how a problem was solved and what it cost,
+then try to write our own answer. Copying is encouraged when it saves time,
+they have had this codebase for years, the only problem is that it is catered for different end goals.
+However, you are responsible for auditing the copied code to ensure it matches our paradigm and does not introduce hidden dependencies or assumptions
 
-A Make target is one line. The moment it needs branching, environment setup or
-error handling it becomes a script in `scripts/`, and the target calls that.
-
-Lint and format belong to pre-commit; ruff's arguments live in
-`pyproject.toml`. Never add ruff or formatting flags to the Makefile, and
-never add mypy to pre-commit — `make typecheck` owns static types.
+**If you decide to copy their work** Really ask yourself how this will interfere with our paradigm,
+watch out for tightly coupled, hidden assumptions in hermes-agent's codebase that will silently break when
+transplanted into our codebase with our different paradigm.
 
 ## Research Subagents
 
@@ -198,13 +264,3 @@ Add an entry the second time a mistake repeats. Two so far:
 - **Do not activate `.venv`.** The Makefile puts it on PATH. A session that
   activates it and then runs a bare command is testing an environment CI will
   not reproduce.
-
-## Do not
-
-- Write code before `plan.md` exists and the user has approved it.
-- Approve your own work or merge on your own judgement. That decision is the
-  user's, and it is the only part of this process that cannot be recovered
-  afterwards.
-- Edit a closed work item's artifacts to match what the code became.
-- Copy hermes code. Read it, understand why it is shaped that way, then decide
-  for this project.
