@@ -17,8 +17,9 @@ import asyncio
 import hashlib
 import json
 import re
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass, replace
+from enum import Enum
 from typing import Literal
 
 from sadana import config, model_access
@@ -535,3 +536,335 @@ async def complete(
             finish_reason=outcome.finish_reason,
             usage=outcome.usage,
         )
+
+
+# ── CONV-05: turn loop ───────────────────────────────────────────────────
+# Its full contract is `docs/tasks/C7-turn-loop/spec.md`.
+
+
+class PromptDriftError(Exception):
+    """A turn's ``system_prompt``/``tool_surface`` don't hash to the
+    caller's own ``prompt_sha256``. Always a bug — this never becomes an
+    ``ExitReason``."""
+
+
+class ExitReason(Enum):
+    COMPLETED = "completed"
+    BUDGET_EXHAUSTED = "budget_exhausted"
+    WALL_CLOCK_EXHAUSTED = "wall_clock_exhausted"
+    PERSISTENCE_FAILED = "persistence_failed"
+    PROVIDER_FAILED = "provider_failed"
+    CONTEXT_OVERFLOW_UNHANDLED = "context_overflow_unhandled"
+    INTERRUPTED = "interrupted"
+    INVALID_TOOL_CALLS = "invalid_tool_calls"
+
+
+@dataclass(frozen=True)
+class TurnKey:
+    """Defined here, not sooner — C2's own spec.md named this work item
+    as the first with a real turn-boundary caller."""
+
+    conversation: ConversationKey
+    turn_seq: int
+
+
+@dataclass(frozen=True)
+class TurnResult:
+    """What one ``run_turn`` call did. Carries ``turn_key`` only, not a
+    second, redundant ``conversation_key`` field — ``turn_key`` already
+    names the conversation."""
+
+    turn_key: TurnKey
+    final_text: str | None
+    exit_reason: ExitReason
+    detail: str | None
+    model_calls: int
+    usage: model_access.Usage
+    appended: range
+
+
+def turn_prompt_hash(system_prompt: str, tool_surface: ToolSurface) -> str:
+    """``sha256(system_prompt + the tool surface's canonical JSON)`` — the
+    same canonicalization ``surface_hash()`` already uses, so the two stay
+    consistent with each other. This, not ``system_prompt`` alone, is what
+    a turn's byte-stability check covers."""
+    canonical = json.dumps(list(tool_surface), sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256((system_prompt + canonical).encode("utf-8")).hexdigest()
+
+
+def _deduplicate_tool_calls(tool_calls: tuple[dict, ...]) -> tuple[dict, ...]:
+    """Drop a later call sharing the same ``(name, arguments)`` as an
+    earlier one in the same batch, keeping the first occurrence. Adapted
+    from hermes ``run_agent.py:5103``, simplified: hermes canonicalizes
+    still-raw argument *strings* inside a ``try/except``; here,
+    ``arguments`` is already a parsed dict (C6's own guarantee), so
+    canonicalizing it for comparison is a plain, always-safe
+    ``json.dumps()`` call."""
+    seen: set[tuple[str, str]] = set()
+    unique = []
+    for tc in tool_calls:
+        canonical_args = json.dumps(tc["arguments"], sort_keys=True, separators=(",", ":"))
+        key = (tc["name"], canonical_args)
+        if key not in seen:
+            seen.add(key)
+            unique.append(tc)
+    return tuple(unique)
+
+
+async def _noop_persist(messages: tuple[Message, ...]) -> None:
+    """The default ``persist``: durability doesn't exist yet (CONV-08's
+    job) so this does nothing and always succeeds."""
+    return None
+
+
+def _message_to_wire(message: Message) -> dict:
+    """Convert one ``Message`` into the dict shape ``model_access.Request.messages``
+    (and so ``complete()``) expects — the actual wire format a provider
+    receives. An assistant message's ``tool_calls`` carry already-parsed
+    ``arguments`` (``Completion``'s own shape); the wire format needs them
+    re-serialized to a JSON string, since that is what a real
+    OpenAI-compatible API expects on the way out."""
+    wire: dict = {"role": message.role}
+    if message.content is not None:
+        wire["content"] = message.content
+    if message.role == "assistant" and message.tool_calls:
+        wire["tool_calls"] = [
+            {
+                "id": tc["id"],
+                "type": "function",
+                "function": {"name": tc["name"], "arguments": json.dumps(tc["arguments"])},
+            }
+            for tc in message.tool_calls
+        ]
+    if message.role == "tool" and message.tool_call_id is not None:
+        wire["tool_call_id"] = message.tool_call_id
+    return wire
+
+
+def _add_usage(a: model_access.Usage, b: model_access.Usage) -> model_access.Usage:
+    return model_access.Usage(
+        prompt_tokens=a.prompt_tokens + b.prompt_tokens,
+        completion_tokens=a.completion_tokens + b.completion_tokens,
+    )
+
+
+def _cap_tool_result(text: str, turn_chars_used: int, result_cap: int, turn_cap: int) -> tuple[str, int]:
+    """Cap ``text`` against the per-result limit, then again against the
+    turn's running total. Returns the (possibly capped) text and the
+    updated running total. A capped result says it was capped."""
+    if len(text) > result_cap:
+        text = text[:result_cap] + f"\n[capped: over the {result_cap}-char per-result limit]"
+    remaining = turn_cap - turn_chars_used
+    if remaining <= 0:
+        text = f"[capped: the turn's {turn_cap}-char tool-result budget is already used up]"
+    elif len(text) > remaining:
+        text = text[:remaining] + f"\n[capped: over the turn's {turn_cap}-char tool-result budget]"
+    return text, turn_chars_used + len(text)
+
+
+def _append_invalid_results(
+    conversation: ConversationKey,
+    messages: tuple[Message, ...],
+    invalid: tuple[dict, ...],
+    turn_chars_used: int,
+    result_cap: int,
+    turn_cap: int,
+) -> tuple[tuple[Message, ...], int]:
+    """Append a capped ``tool_error`` result for each invalid call — shared
+    by both TOOL_ROUND branches (the all-invalid exit and the mixed
+    continue), the same logic rather than two copies to keep in sync."""
+    for tc in invalid:
+        error_text, turn_chars_used = _cap_tool_result(
+            f"tool_error: unknown tool {tc['name']!r}", turn_chars_used, result_cap, turn_cap
+        )
+        messages, _ = append(conversation, messages, Message(role="tool", tool_call_id=tc["id"], content=error_text))
+    return messages, turn_chars_used
+
+
+_SUMMARY_REQUEST_TEXT = (
+    "You've reached the maximum number of tool-calling iterations allowed. "
+    "Please provide a final response summarizing what you've found and "
+    "accomplished so far, without calling any more tools."
+)
+
+
+async def run_turn(
+    *,
+    conversation: ConversationKey,
+    turn_seq: int,
+    messages: tuple[Message, ...],
+    user_input: str,
+    system_prompt: str,
+    prompt_sha256: str,
+    tool_surface: ToolSurface,
+    iteration_budget: IterationBudget,
+    wall_clock_budget: WallClockBudget | None,
+    now: float,
+    provider: str,
+    model: str,
+    dispatch: Callable[[str, dict], Awaitable[str]],
+    compress: Callable[[tuple[Message, ...], str], Awaitable[str | None]],
+    persist: Callable[[tuple[Message, ...]], Awaitable[None]] = _noop_persist,
+) -> tuple[TurnResult, tuple[Message, ...], IterationBudget, str]:
+    """Run one turn: ask the model, carry out whatever it asks for, ask
+    again if needed, until one of ``ExitReason``'s eight members ends it.
+    Returns ``(TurnResult, updated messages, updated iteration_budget,
+    current system_prompt)`` — four values with different lifetimes and
+    different callers, kept separate rather than folded into one
+    dataclass. Full contract: ``docs/tasks/C7-turn-loop/spec.md``."""
+    # REPAIR — the only mutation allowed before PROLOGUE.
+    messages = repair(messages)
+
+    # PROLOGUE
+    if turn_prompt_hash(system_prompt, tool_surface) != prompt_sha256:
+        raise PromptDriftError(f"system_prompt/tool_surface hash does not match prompt_sha256={prompt_sha256!r}")
+    messages, _ = append(conversation, messages, Message(role="user", content=user_input))
+    turn_start_seq = len(messages) - 1
+
+    model_calls = 0
+    usage_total = model_access.Usage()
+    result_cap = config.env_int("SADANA_CONVERSATION_TOOL_RESULT_CHARS", 100_000)
+    turn_cap = config.env_int("SADANA_CONVERSATION_TOOL_TURN_BUDGET_CHARS", 200_000)
+    if result_cap < 0:
+        raise ValueError(f"SADANA_CONVERSATION_TOOL_RESULT_CHARS={result_cap} must not be negative")
+    if turn_cap < 0:
+        raise ValueError(f"SADANA_CONVERSATION_TOOL_TURN_BUDGET_CHARS={turn_cap} must not be negative")
+    turn_chars_used = 0
+
+    exit_reason: ExitReason | None = None
+    detail: str | None = None
+    final_text: str | None = None
+
+    try:
+        while True:
+            new_budget = consume_iteration(iteration_budget)
+            if new_budget is None:
+                exit_reason = ExitReason.BUDGET_EXHAUSTED
+                detail = f"iteration budget exhausted ({iteration_budget.max_total})"
+                break
+            iteration_budget = new_budget
+
+            if wall_clock_budget is not None and wall_clock_remaining(wall_clock_budget, now) <= 0:
+                exit_reason = ExitReason.WALL_CLOCK_EXHAUSTED
+                detail = "wall clock budget exhausted"
+                break
+
+            try:
+                completion = await complete(
+                    system=system_prompt,
+                    messages=tuple(_message_to_wire(m) for m in messages),
+                    tools=tool_surface,
+                    provider=provider,
+                    model=model,
+                )
+            except ContextOverflow as e:
+                model_calls += 1
+                new_prompt = await compress(messages, system_prompt)
+                if new_prompt is None:
+                    exit_reason = ExitReason.CONTEXT_OVERFLOW_UNHANDLED
+                    detail = str(e)
+                    break
+                system_prompt = new_prompt
+                continue
+            except ProviderFailure as e:
+                model_calls += 1
+                exit_reason = ExitReason.PROVIDER_FAILED
+                detail = str(e)
+                break
+
+            model_calls += 1
+            usage_total = _add_usage(usage_total, completion.usage)
+
+            if not completion.tool_calls:
+                messages, _ = append(conversation, messages, Message(role="assistant", content=completion.content))
+                exit_reason = ExitReason.COMPLETED
+                final_text = completion.content
+                break
+
+            # TOOL_ROUND (spec.md's own numbered steps)
+            deduped = _deduplicate_tool_calls(completion.tool_calls)
+            valid_names = {d["function"]["name"] for d in tool_surface}
+            valid = tuple(tc for tc in deduped if tc["name"] in valid_names)
+            invalid = tuple(tc for tc in deduped if tc["name"] not in valid_names)
+
+            if not valid:
+                messages, _ = append(
+                    conversation,
+                    messages,
+                    Message(role="assistant", content=completion.content, tool_calls=deduped),
+                )
+                messages, turn_chars_used = _append_invalid_results(
+                    conversation, messages, invalid, turn_chars_used, result_cap, turn_cap
+                )
+                exit_reason = ExitReason.INVALID_TOOL_CALLS
+                detail = f"no valid tool call in a batch of {len(deduped)}"
+                break
+
+            messages, _ = append(
+                conversation,
+                messages,
+                Message(role="assistant", content=completion.content, tool_calls=deduped),
+            )
+            try:
+                await persist(messages)
+            except Exception as e:
+                exit_reason = ExitReason.PERSISTENCE_FAILED
+                detail = str(e)
+                break
+
+            messages, turn_chars_used = _append_invalid_results(
+                conversation, messages, invalid, turn_chars_used, result_cap, turn_cap
+            )
+
+            for tc in valid:
+                try:
+                    raw_result = await dispatch(tc["name"], tc["arguments"])
+                    result_text = str(raw_result)
+                except Exception as e:
+                    result_text = f"tool_error: {e}"
+                result_text, turn_chars_used = _cap_tool_result(result_text, turn_chars_used, result_cap, turn_cap)
+                messages, _ = append(
+                    conversation, messages, Message(role="tool", tool_call_id=tc["id"], content=result_text)
+                )
+            # loop back to MODEL_CALL
+    except asyncio.CancelledError:
+        exit_reason = ExitReason.INTERRUPTED
+        detail = "turn cancelled"
+
+    assert exit_reason is not None  # every break/except path above sets it
+
+    # EPILOGUE — the one named exception to "no model call outside MODEL_CALL".
+    if exit_reason == ExitReason.BUDGET_EXHAUSTED and final_text is None:
+        summary_messages, _ = append(conversation, messages, Message(role="user", content=_SUMMARY_REQUEST_TEXT))
+        try:
+            completion = await complete(
+                system=system_prompt,
+                messages=tuple(_message_to_wire(m) for m in summary_messages),
+                tools=(),
+                provider=provider,
+                model=model,
+            )
+            model_calls += 1
+            usage_total = _add_usage(usage_total, completion.usage)
+            messages, _ = append(conversation, summary_messages, Message(role="assistant", content=completion.content))
+            final_text = completion.content
+        except (ContextOverflow, ProviderFailure):
+            pass  # best-effort — exit_reason stays BUDGET_EXHAUSTED, final_text stays None
+        except asyncio.CancelledError:
+            # Same guarantee the main loop already makes: no exception escapes
+            # run_turn uncancelled. Overrides BUDGET_EXHAUSTED — the caller
+            # explicitly asked to stop, which is more informative than "ran
+            # out of budget" for a summary attempt that never got to finish.
+            exit_reason = ExitReason.INTERRUPTED
+            detail = "turn cancelled during epilogue summary"
+
+    result = TurnResult(
+        turn_key=TurnKey(conversation=conversation, turn_seq=turn_seq),
+        final_text=final_text,
+        exit_reason=exit_reason,
+        detail=detail,
+        model_calls=model_calls,
+        usage=usage_total,
+        appended=range(turn_start_seq, len(messages)),
+    )
+    return result, messages, iteration_budget, system_prompt

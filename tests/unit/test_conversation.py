@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 
 import pytest
 
@@ -11,13 +12,18 @@ from sadana.conversation import (
     Completion,
     ContextOverflow,
     DuplicateToolError,
+    ExitReason,
     IterationBudget,
     Message,
     MessageKey,
+    PromptDriftError,
     ProviderFailure,
     ToolSpec,
+    ToolSurface,
     TranscriptInvariantError,
+    TurnKey,
     WallClockBudget,
+    _deduplicate_tool_calls,  # private, tested directly per spec.md
     append,
     build_surface,
     coalesce_tool_call_id,
@@ -29,7 +35,9 @@ from sadana.conversation import (
     pending_tool_call_ids,
     repair,
     repair_tool_call_arguments,
+    run_turn,
     surface_hash,
+    turn_prompt_hash,
     uniquify_tool_call_ids,
     wall_clock_budget_from_config,
     wall_clock_remaining,
@@ -499,3 +507,396 @@ def test_complete_deduplicates_shared_ids_via_uniquify(monkeypatch: pytest.Monke
     result = asyncio.run(complete(system="sys", messages=(), tools=(), provider="p", model="m"))
     ids = [tc["id"] for tc in result.tool_calls]
     assert ids == ["dup", "dup_d2"]
+
+
+# ── turn loop ────────────────────────────────────────────────────────────
+
+_SYSTEM_PROMPT = "You are a helpful assistant."
+
+
+async def _fake_dispatch_ok(name: str, arguments: dict) -> str:
+    return f"ran {name}"
+
+
+async def _fake_compress_none(messages: tuple[Message, ...], system_prompt: str) -> str | None:
+    return None
+
+
+def _tool_call_response(*names: str) -> model_access.Response:
+    return model_access.Response(
+        content=None,
+        tool_calls=tuple({"function": {"name": n, "arguments": "{}"}} for n in names),
+        finish_reason="tool_calls",
+        usage=model_access.Usage(),
+    )
+
+
+def _text_response(text: str) -> model_access.Response:
+    return model_access.Response(content=text, tool_calls=(), finish_reason="stop", usage=model_access.Usage())
+
+
+def _run(surface: ToolSurface, **overrides):
+    kwargs = {
+        "conversation": "c1",
+        "turn_seq": 0,
+        "messages": (),
+        "user_input": "hello",
+        "system_prompt": _SYSTEM_PROMPT,
+        "prompt_sha256": turn_prompt_hash(_SYSTEM_PROMPT, surface),
+        "tool_surface": surface,
+        "iteration_budget": IterationBudget(max_total=10),
+        "wall_clock_budget": None,
+        "now": 0.0,
+        "provider": "p",
+        "model": "m",
+        "dispatch": _fake_dispatch_ok,
+        "compress": _fake_compress_none,
+    }
+    kwargs.update(overrides)
+    return asyncio.run(run_turn(**kwargs))
+
+
+@pytest.mark.unit
+def test_run_turn_completed_returns_final_text(monkeypatch: pytest.MonkeyPatch) -> None:
+    surface = build_surface([_spec("noop", "noop")])
+    monkeypatch.setattr(model_access, "send", lambda request: _text_response("hi there"))
+
+    result, messages, _budget, _prompt = _run(surface)
+
+    assert result.exit_reason == ExitReason.COMPLETED
+    assert result.final_text == "hi there"
+    assert result.model_calls == 1
+    assert result.turn_key == TurnKey(conversation="c1", turn_seq=0)
+    assert result.appended == range(0, len(messages))
+    assert messages[-1].role == "assistant"
+    assert messages[-1].content == "hi there"
+
+
+@pytest.mark.unit
+def test_run_turn_budget_exhausted_summary_call(monkeypatch: pytest.MonkeyPatch) -> None:
+    surface = build_surface([_spec("noop", "noop")])
+    monkeypatch.setattr(model_access, "send", lambda request: _text_response("summary text"))
+
+    result, _messages, budget, _prompt = _run(surface, iteration_budget=IterationBudget(max_total=0))
+
+    assert result.exit_reason == ExitReason.BUDGET_EXHAUSTED
+    assert result.final_text == "summary text"
+    assert result.model_calls == 1  # only the epilogue summary call
+    assert budget.max_total == 0
+
+
+@pytest.mark.unit
+def test_run_turn_wall_clock_exhausted(monkeypatch: pytest.MonkeyPatch) -> None:
+    surface = build_surface([_spec("noop", "noop")])
+
+    def fail_send(request: model_access.Request) -> model_access.Outcome:
+        raise AssertionError("model_access.send should not be called")
+
+    monkeypatch.setattr(model_access, "send", fail_send)
+
+    result, _messages, _budget, _prompt = _run(surface, wall_clock_budget=WallClockBudget(deadline=100.0), now=200.0)
+
+    assert result.exit_reason == ExitReason.WALL_CLOCK_EXHAUSTED
+    assert result.model_calls == 0
+
+
+@pytest.mark.unit
+def test_run_turn_provider_failed(monkeypatch: pytest.MonkeyPatch) -> None:
+    surface = build_surface([_spec("noop", "noop")])
+    monkeypatch.setattr(model_access, "send", lambda request: model_access.Abort("bad request"))
+
+    result, _messages, _budget, _prompt = _run(surface)
+
+    assert result.exit_reason == ExitReason.PROVIDER_FAILED
+    assert result.model_calls == 1  # a completed-but-failed attempt still counts, same as ContextOverflow
+
+
+@pytest.mark.unit
+def test_run_turn_context_overflow_unhandled(monkeypatch: pytest.MonkeyPatch) -> None:
+    surface = build_surface([_spec("noop", "noop")])
+    monkeypatch.setattr(model_access, "send", lambda request: model_access.NeedsContextCompression("too big"))
+
+    result, _messages, _budget, _prompt = _run(surface)
+
+    assert result.exit_reason == ExitReason.CONTEXT_OVERFLOW_UNHANDLED
+
+
+@pytest.mark.unit
+def test_run_turn_context_overflow_retries_with_compressed_prompt(monkeypatch: pytest.MonkeyPatch) -> None:
+    surface = build_surface([_spec("noop", "noop")])
+    outcomes = iter([model_access.NeedsContextCompression("too big"), _text_response("ok now")])
+    calls = []
+
+    def fake_send(request: model_access.Request) -> model_access.Outcome:
+        calls.append(request)
+        return next(outcomes)
+
+    monkeypatch.setattr(model_access, "send", fake_send)
+
+    async def compress_to_shorter(messages: tuple[Message, ...], system_prompt: str) -> str | None:
+        return "shorter prompt"
+
+    result, _messages, _budget, prompt = _run(surface, compress=compress_to_shorter)
+
+    assert result.exit_reason == ExitReason.COMPLETED
+    assert result.final_text == "ok now"
+    assert prompt == "shorter prompt"
+    assert len(calls) == 2
+
+
+@pytest.mark.unit
+def test_run_turn_interrupted(monkeypatch: pytest.MonkeyPatch) -> None:
+    surface = build_surface([_spec("noop", "noop")])
+    monkeypatch.setattr(model_access, "send", lambda request: _tool_call_response("noop"))
+
+    async def slow_dispatch(name: str, arguments: dict) -> str:
+        await asyncio.sleep(10)
+        return "never"
+
+    async def scenario():
+        task = asyncio.ensure_future(
+            run_turn(
+                conversation="c1",
+                turn_seq=0,
+                messages=(),
+                user_input="hello",
+                system_prompt=_SYSTEM_PROMPT,
+                prompt_sha256=turn_prompt_hash(_SYSTEM_PROMPT, surface),
+                tool_surface=surface,
+                iteration_budget=IterationBudget(max_total=10),
+                wall_clock_budget=None,
+                now=0.0,
+                provider="p",
+                model="m",
+                dispatch=slow_dispatch,
+                compress=_fake_compress_none,
+            )
+        )
+        # Real (short) sleep, not a fake clock: gives asyncio.to_thread's
+        # real thread-pool round trip time to complete so the task is
+        # actually inside slow_dispatch's own sleep before cancellation —
+        # there is no fake event-loop clock in stdlib asyncio to drive
+        # this deterministically instead. The assertion below does not
+        # depend on how long that takes, only that INTERRUPTED is reached.
+        await asyncio.sleep(0.1)
+        task.cancel()
+        return await task
+
+    result, _messages, _budget, _prompt = asyncio.run(scenario())
+
+    assert result.exit_reason == ExitReason.INTERRUPTED
+
+
+@pytest.mark.unit
+def test_run_turn_invalid_tool_calls_all_invalid(monkeypatch: pytest.MonkeyPatch) -> None:
+    surface = build_surface([_spec("noop", "noop")])
+    monkeypatch.setattr(model_access, "send", lambda request: _tool_call_response("nonexistent"))
+
+    result, messages, _budget, _prompt = _run(surface)
+
+    assert result.exit_reason == ExitReason.INVALID_TOOL_CALLS
+    assert pending_tool_call_ids(messages) == frozenset()
+
+
+@pytest.mark.unit
+def test_run_turn_mixed_valid_invalid_continues(monkeypatch: pytest.MonkeyPatch) -> None:
+    surface = build_surface([_spec("noop", "noop")])
+    outcomes = iter([_tool_call_response("noop", "nonexistent"), _text_response("done")])
+    monkeypatch.setattr(model_access, "send", lambda request: next(outcomes))
+
+    result, _messages, _budget, _prompt = _run(surface)
+
+    assert result.exit_reason == ExitReason.COMPLETED
+    assert result.final_text == "done"
+    assert result.model_calls == 2
+
+
+@pytest.mark.unit
+def test_run_turn_persistence_failed(monkeypatch: pytest.MonkeyPatch) -> None:
+    surface = build_surface([_spec("noop", "noop")])
+    monkeypatch.setattr(model_access, "send", lambda request: _tool_call_response("noop"))
+
+    dispatch_called = []
+
+    async def dispatch_tracker(name: str, arguments: dict) -> str:
+        dispatch_called.append(name)
+        return "ok"
+
+    async def failing_persist(messages: tuple[Message, ...]) -> None:
+        raise RuntimeError("disk full")
+
+    result, _messages, _budget, _prompt = _run(surface, dispatch=dispatch_tracker, persist=failing_persist)
+
+    assert result.exit_reason == ExitReason.PERSISTENCE_FAILED
+    assert dispatch_called == []  # persist runs before any handler
+
+
+@pytest.mark.unit
+def test_run_turn_dispatch_raises_produces_tool_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    surface = build_surface([_spec("noop", "noop")])
+    outcomes = iter([_tool_call_response("noop"), _text_response("done")])
+    monkeypatch.setattr(model_access, "send", lambda request: next(outcomes))
+
+    async def raising_dispatch(name: str, arguments: dict) -> str:
+        raise ValueError("boom")
+
+    result, messages, _budget, _prompt = _run(surface, dispatch=raising_dispatch)
+
+    assert result.exit_reason == ExitReason.COMPLETED  # the turn continued past the error
+    tool_messages = [m for m in messages if m.role == "tool"]
+    assert tool_messages[0].content.startswith("tool_error:")
+
+
+@pytest.mark.unit
+def test_run_turn_caps_oversized_tool_result(monkeypatch: pytest.MonkeyPatch) -> None:
+    surface = build_surface([_spec("noop", "noop")])
+    outcomes = iter([_tool_call_response("noop"), _text_response("done")])
+    monkeypatch.setattr(model_access, "send", lambda request: next(outcomes))
+    monkeypatch.setenv("SADANA_CONVERSATION_TOOL_RESULT_CHARS", "50")
+
+    async def big_dispatch(name: str, arguments: dict) -> str:
+        return "x" * 1000
+
+    result, messages, _budget, _prompt = _run(surface, dispatch=big_dispatch)
+
+    tool_messages = [m for m in messages if m.role == "tool"]
+    assert len(tool_messages[0].content) < 1000
+    assert "capped" in tool_messages[0].content
+
+
+@pytest.mark.unit
+def test_run_turn_caps_per_turn_budget_independently(monkeypatch: pytest.MonkeyPatch) -> None:
+    surface = build_surface([_spec("noop", "noop")])
+    first = model_access.Response(
+        content=None,
+        tool_calls=(
+            {"function": {"name": "noop", "arguments": "{}"}},
+            {"function": {"name": "noop", "arguments": '{"x": 1}'}},
+        ),
+        finish_reason="tool_calls",
+        usage=model_access.Usage(),
+    )
+    outcomes = iter([first, _text_response("done")])
+    monkeypatch.setattr(model_access, "send", lambda request: next(outcomes))
+    monkeypatch.setenv("SADANA_CONVERSATION_TOOL_RESULT_CHARS", "1000")
+    monkeypatch.setenv("SADANA_CONVERSATION_TOOL_TURN_BUDGET_CHARS", "150")
+
+    async def medium_dispatch(name: str, arguments: dict) -> str:
+        return "y" * 100
+
+    result, messages, _budget, _prompt = _run(surface, dispatch=medium_dispatch)
+
+    tool_messages = [m for m in messages if m.role == "tool"]
+    assert len(tool_messages) == 2
+    assert len(tool_messages[0].content) == 100  # fits under both caps
+    assert "capped" in tool_messages[1].content  # pushed over the turn cap
+
+
+@pytest.mark.unit
+def test_run_turn_caps_invalid_tool_error_message(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A tool name comes from the model/provider — untrusted input, same as
+    a dispatch result. An adversarial or misbehaving provider naming an
+    enormous, nonexistent tool must not inject unbounded content into the
+    transcript via the error message either."""
+    surface = build_surface([_spec("noop", "noop")])
+    huge_name = "x" * 1000
+    monkeypatch.setattr(model_access, "send", lambda request: _tool_call_response(huge_name))
+    monkeypatch.setenv("SADANA_CONVERSATION_TOOL_RESULT_CHARS", "50")
+
+    result, messages, _budget, _prompt = _run(surface)
+
+    assert result.exit_reason == ExitReason.INVALID_TOOL_CALLS
+    tool_messages = [m for m in messages if m.role == "tool"]
+    assert len(tool_messages[0].content) < 1000
+    assert "capped" in tool_messages[0].content
+
+
+@pytest.mark.unit
+def test_run_turn_negative_result_cap_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    surface = build_surface([_spec("noop", "noop")])
+    monkeypatch.setenv("SADANA_CONVERSATION_TOOL_RESULT_CHARS", "-1")
+    with pytest.raises(ValueError):
+        _run(surface)
+
+
+@pytest.mark.unit
+def test_run_turn_negative_turn_cap_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    surface = build_surface([_spec("noop", "noop")])
+    monkeypatch.setenv("SADANA_CONVERSATION_TOOL_TURN_BUDGET_CHARS", "-1")
+    with pytest.raises(ValueError):
+        _run(surface)
+
+
+@pytest.mark.unit
+def test_run_turn_interrupted_during_epilogue_summary(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The CancelledError guard in the main loop doesn't automatically cover
+    EPILOGUE's own extra complete() call for a budget-exhaustion summary —
+    that needs its own guard, added after the cold review caught the gap."""
+    surface = build_surface([_spec("noop", "noop")])
+
+    def slow_send(request: model_access.Request) -> model_access.Outcome:
+        time.sleep(0.3)  # blocks the to_thread worker only, not the event loop
+        return _text_response("too late")
+
+    monkeypatch.setattr(model_access, "send", slow_send)
+
+    async def scenario():
+        task = asyncio.ensure_future(
+            run_turn(
+                conversation="c1",
+                turn_seq=0,
+                messages=(),
+                user_input="hello",
+                system_prompt=_SYSTEM_PROMPT,
+                prompt_sha256=turn_prompt_hash(_SYSTEM_PROMPT, surface),
+                tool_surface=surface,
+                iteration_budget=IterationBudget(max_total=0),  # straight to the epilogue summary call
+                wall_clock_budget=None,
+                now=0.0,
+                provider="p",
+                model="m",
+                dispatch=_fake_dispatch_ok,
+                compress=_fake_compress_none,
+            )
+        )
+        await asyncio.sleep(0.1)  # let it reach the epilogue's own complete() call
+        task.cancel()
+        return await task
+
+    result, _messages, _budget, _prompt = asyncio.run(scenario())
+
+    assert result.exit_reason == ExitReason.INTERRUPTED
+
+
+@pytest.mark.unit
+def test_turn_prompt_hash_changes_with_tool_surface() -> None:
+    surface_a = build_surface([_spec("a", "alpha")])
+    surface_b = build_surface([_spec("b", "beta")])
+    assert turn_prompt_hash("same prompt", surface_a) != turn_prompt_hash("same prompt", surface_b)
+
+
+@pytest.mark.unit
+def test_run_turn_raises_prompt_drift_error() -> None:
+    surface = build_surface([_spec("noop", "noop")])
+    with pytest.raises(PromptDriftError):
+        _run(surface, prompt_sha256="wrong-hash")
+
+
+@pytest.mark.unit
+def test_deduplicate_tool_calls_drops_duplicate() -> None:
+    calls = (
+        {"id": "1", "name": "a", "arguments": {"x": 1}},
+        {"id": "2", "name": "a", "arguments": {"x": 1}},
+    )
+    result = _deduplicate_tool_calls(calls)
+    assert len(result) == 1
+    assert result[0]["id"] == "1"
+
+
+@pytest.mark.unit
+def test_deduplicate_tool_calls_leaves_unique_unchanged() -> None:
+    calls = (
+        {"id": "1", "name": "a", "arguments": {"x": 1}},
+        {"id": "2", "name": "a", "arguments": {"x": 2}},
+    )
+    assert _deduplicate_tool_calls(calls) == calls
