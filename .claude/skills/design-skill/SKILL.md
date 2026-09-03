@@ -172,3 +172,7 @@ alone fails, and it should.
 - Store state you could derive.
 - Start writing code. Separate stage, separate skill — the chain gate will
   stop you, and it should.
+
+## Please do
+
+- Check if the spec.md established a rule that binds blocks beyond this work item. If so, quote it to the user and draft a CLAUDE.md amendment for them to approve. It should be clear, machine readable and live in one concise line.
