@@ -2,24 +2,35 @@
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
+from sadana import model_access
 from sadana.conversation import (
+    Completion,
+    ContextOverflow,
     DuplicateToolError,
     IterationBudget,
     Message,
     MessageKey,
+    ProviderFailure,
     ToolSpec,
     TranscriptInvariantError,
     WallClockBudget,
     append,
     build_surface,
+    coalesce_tool_call_id,
+    complete,
     consume_iteration,
+    deterministic_call_id,
     filter_surface,
     iteration_budget_from_config,
     pending_tool_call_ids,
     repair,
+    repair_tool_call_arguments,
     surface_hash,
+    uniquify_tool_call_ids,
     wall_clock_budget_from_config,
     wall_clock_remaining,
 )
@@ -311,3 +322,180 @@ def test_wall_clock_budget_from_config_raises_for_negative(monkeypatch: pytest.M
     monkeypatch.setenv("SADANA_CONVERSATION_RUN_BUDGET_SECONDS", "-1")
     with pytest.raises(ValueError):
         wall_clock_budget_from_config(now=0.0)
+
+
+# ── provider port: repair_tool_call_arguments() ─────────────────────────
+
+
+@pytest.mark.unit
+def test_repair_tool_call_arguments_parses_well_formed_json() -> None:
+    assert repair_tool_call_arguments('{"a": 1}') == {"a": 1}
+
+
+@pytest.mark.unit
+def test_repair_tool_call_arguments_strips_trailing_comma() -> None:
+    assert repair_tool_call_arguments('{"a": 1,}') == {"a": 1}
+
+
+@pytest.mark.unit
+def test_repair_tool_call_arguments_closes_unclosed_bracket() -> None:
+    assert repair_tool_call_arguments('{"a": 1') == {"a": 1}
+
+
+@pytest.mark.unit
+def test_repair_tool_call_arguments_escapes_control_char() -> None:
+    # Trailing comma AND a raw control char: pass 0 (strict=False) fails on
+    # the comma; pass 1 strips it; the remaining control char still fails
+    # strict json.loads until pass 4 escapes it.
+    raw = '{"a": "x\x01y",}'
+    assert repair_tool_call_arguments(raw) == {"a": "x\x01y"}
+
+
+@pytest.mark.unit
+def test_repair_tool_call_arguments_falls_back_to_empty_dict() -> None:
+    assert repair_tool_call_arguments("not json at all {{{") == {}
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("raw", ["[1, 2, 3]", "5", '"a string"', "null", "true"])
+def test_repair_tool_call_arguments_rejects_valid_non_object_json(raw: str) -> None:
+    """Syntactically valid JSON that isn't an object must not count as a
+    successful repair — the function's contract is always a dict."""
+    assert repair_tool_call_arguments(raw) == {}
+
+
+# ── provider port: id resolution ────────────────────────────────────────
+
+
+@pytest.mark.unit
+def test_deterministic_call_id_is_deterministic() -> None:
+    first = deterministic_call_id("foo", '{"a": 1}', 0)
+    second = deterministic_call_id("foo", '{"a": 1}', 0)
+    assert first == second
+    assert first.startswith("call_")
+
+
+@pytest.mark.unit
+def test_deterministic_call_id_differs_by_index() -> None:
+    assert deterministic_call_id("foo", "{}", 0) != deterministic_call_id("foo", "{}", 1)
+
+
+@pytest.mark.unit
+def test_coalesce_tool_call_id_prefers_call_id_then_id() -> None:
+    assert coalesce_tool_call_id({"call_id": "c1", "id": "i1"}) == "c1"
+    assert coalesce_tool_call_id({"id": "i1"}) == "i1"
+
+
+@pytest.mark.unit
+def test_coalesce_tool_call_id_splits_composite() -> None:
+    assert coalesce_tool_call_id({"id": "c1|resp1"}) == "c1"
+
+
+@pytest.mark.unit
+def test_coalesce_tool_call_id_returns_empty_when_absent() -> None:
+    assert coalesce_tool_call_id({}) == ""
+
+
+@pytest.mark.unit
+def test_uniquify_tool_call_ids_suffixes_duplicates() -> None:
+    calls = ({"id": "dup", "name": "a"}, {"id": "dup", "name": "b"})
+    result = uniquify_tool_call_ids(calls)
+    assert [tc["id"] for tc in result] == ["dup", "dup_d2"]
+
+
+# ── provider port: complete() ────────────────────────────────────────────
+
+
+def _raw_tool_call(name: str, arguments: str, *, id_: str | None = None) -> dict:
+    tc: dict = {"function": {"name": name, "arguments": arguments}}
+    if id_ is not None:
+        tc["id"] = id_
+    return tc
+
+
+@pytest.mark.unit
+def test_complete_returns_completion_for_response(monkeypatch: pytest.MonkeyPatch) -> None:
+    usage = model_access.Usage(prompt_tokens=1, completion_tokens=2)
+    response = model_access.Response(content="hi", tool_calls=(), finish_reason="stop", usage=usage)
+    monkeypatch.setattr(model_access, "send", lambda request: response)
+
+    result = asyncio.run(complete(system="sys", messages=(), tools=(), provider="p", model="m"))
+    assert result == Completion(content="hi", tool_calls=(), finish_reason="stop", usage=usage)
+
+
+@pytest.mark.unit
+def test_complete_retries_transparently(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen_attempts = []
+    usage = model_access.Usage()
+    response = model_access.Response(content="ok", tool_calls=(), finish_reason="stop", usage=usage)
+
+    def fake_send(request: model_access.Request) -> model_access.Outcome:
+        seen_attempts.append(request.attempt)
+        if len(seen_attempts) == 1:
+            return model_access.Retry(next_attempt=1)
+        return response
+
+    monkeypatch.setattr(model_access, "send", fake_send)
+
+    result = asyncio.run(complete(system="sys", messages=(), tools=(), provider="p", model="m"))
+    assert result.content == "ok"
+    assert seen_attempts == [0, 1]
+
+
+@pytest.mark.unit
+def test_complete_raises_context_overflow(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(model_access, "send", lambda request: model_access.NeedsContextCompression("too big"))
+    with pytest.raises(ContextOverflow):
+        asyncio.run(complete(system="sys", messages=(), tools=(), provider="p", model="m"))
+
+
+@pytest.mark.unit
+def test_complete_raises_provider_failure_for_needs_credential(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(model_access, "send", lambda request: model_access.NeedsCredentialOrProviderChange("no key"))
+    with pytest.raises(ProviderFailure):
+        asyncio.run(complete(system="sys", messages=(), tools=(), provider="p", model="m"))
+
+
+@pytest.mark.unit
+def test_complete_raises_provider_failure_for_abort(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(model_access, "send", lambda request: model_access.Abort("unclassifiable"))
+    with pytest.raises(ProviderFailure):
+        asyncio.run(complete(system="sys", messages=(), tools=(), provider="p", model="m"))
+
+
+@pytest.mark.unit
+def test_complete_raises_provider_failure_for_degenerate(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(model_access, "send", lambda request: model_access.Degenerate("empty"))
+    with pytest.raises(ProviderFailure):
+        asyncio.run(complete(system="sys", messages=(), tools=(), provider="p", model="m"))
+
+
+@pytest.mark.unit
+def test_complete_resolves_missing_ids_with_different_indices(monkeypatch: pytest.MonkeyPatch) -> None:
+    raw_calls = (_raw_tool_call("same", "{}"), _raw_tool_call("same", "{}"))
+    response = model_access.Response(
+        content=None, tool_calls=raw_calls, finish_reason="tool_calls", usage=model_access.Usage()
+    )
+    monkeypatch.setattr(model_access, "send", lambda request: response)
+
+    result = asyncio.run(complete(system="sys", messages=(), tools=(), provider="p", model="m"))
+    ids = [tc["id"] for tc in result.tool_calls]
+    assert len(ids) == 2
+    assert ids[0] != ids[1]
+    assert all(i.startswith("call_") for i in ids)
+
+
+@pytest.mark.unit
+def test_complete_deduplicates_shared_ids_via_uniquify(monkeypatch: pytest.MonkeyPatch) -> None:
+    raw_calls = (
+        _raw_tool_call("a", "{}", id_="dup"),
+        _raw_tool_call("b", "{}", id_="dup"),
+    )
+    response = model_access.Response(
+        content=None, tool_calls=raw_calls, finish_reason="tool_calls", usage=model_access.Usage()
+    )
+    monkeypatch.setattr(model_access, "send", lambda request: response)
+
+    result = asyncio.run(complete(system="sys", messages=(), tools=(), provider="p", model="m"))
+    ids = [tc["id"] for tc in result.tool_calls]
+    assert ids == ["dup", "dup_d2"]
