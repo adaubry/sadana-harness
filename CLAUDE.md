@@ -36,6 +36,7 @@ WSL only. Python lives in `.venv`; `make` puts it on PATH for you, so there is n
 - A conversation's message history is mutated only through conversation.append/conversation.repair — never by direct list or tuple mutation elsewhere
 - Model a resource that can be consumed or exhausted (a budget, an allowance) as an immutable value with a consume() function returning a new value or None — never a mutable counter guarded by a lock
 - A resource already modeled as a self-exhausting consume() value needs no additional external ceiling on a caller-chosen amount — its own exhaustion is the enforcement. Add a ceiling only to catch a genuinely different scenario (e.g. unbounded recursion depth), never to double-guard the one the resource already bounds.
+- A module that touches real I/O (disk, network, the clock) is its own file, separate from a block's pure-function module, regardless of line count.
 
 ## Glossary
 
