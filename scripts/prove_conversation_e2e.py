@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import os
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
@@ -116,14 +117,23 @@ async def main() -> None:
         system_message="This is a proof-of-concept conversation for sadana-harness's CONV-09 evidence.",
         iteration_budget=IterationBudget(max_total=5),
     )
+    # The source of truth for how many children this run has spawned —
+    # not `conversation.next_child_seq` itself, which take_turn()'s own
+    # threading can't be told about mid-turn. See dispatch()'s docstring.
+    next_child_seq = conversation.next_child_seq
 
     async def dispatch(name: str, arguments: dict) -> str:
-        # Reads and writes the enclosing `conversation` directly — run_child's
-        # updated-parent value (next_child_seq advancing) needs to reach the
-        # next take_turn() call, and `nonlocal` says so in one word instead
-        # of a one-element list standing in for the same thing.
-        nonlocal conversation
-        parent = conversation
+        # take_turn() builds its own return value from the `conversation`
+        # it was called with — a stale local snapshot nothing running
+        # inside it (this function included) can retroactively change. So
+        # a spawn's only real effect on the parent (next_child_seq
+        # advancing — run_child's own docstring: nothing else differs)
+        # is tracked here as its own counter instead, and reconciled back
+        # onto `conversation` by main()'s own turn loop after each
+        # take_turn() call returns — the one place that's actually safe
+        # to do it. See docs/reference/dispatch_closure_state_bug.md.
+        nonlocal next_child_seq
+        parent = replace(conversation, next_child_seq=next_child_seq)
         now = 0.0  # wall-clock budget isn't exercised by this proof; a fixed value is fine.
 
         if name == "plugin_a_entry":
@@ -137,7 +147,7 @@ async def main() -> None:
                 tools=frozenset(),
                 budget=IterationBudget(max_total=3),
             )
-            result, child, conversation = await run_child(
+            result, child, updated_parent = await run_child(
                 parent,
                 spec,
                 stable_prompt=STABLE_PROMPT,
@@ -147,6 +157,7 @@ async def main() -> None:
                 compress=_compress,
                 now=now,
             )
+            next_child_seq = updated_parent.next_child_seq
 
             _assert_child_isolated(child, parent)
             # tool_surface == () is the strongest possible "excludes every
@@ -169,7 +180,7 @@ async def main() -> None:
                 tools=frozenset(),
                 budget=IterationBudget(max_total=3),
             )
-            result, child, conversation = await run_child(
+            result, child, updated_parent = await run_child(
                 parent,
                 spec,
                 stable_prompt=STABLE_PROMPT,
@@ -179,6 +190,7 @@ async def main() -> None:
                 compress=_compress,
                 now=now,
             )
+            next_child_seq = updated_parent.next_child_seq
 
             _assert_child_isolated(child, parent)
 
@@ -200,6 +212,7 @@ async def main() -> None:
         compress=_compress,
         now=0.0,
     )
+    conversation = replace(conversation, next_child_seq=next_child_seq)
     print(f"exit_reason={result1.exit_reason} final_text={result1.final_text!r}")
     assert result1.exit_reason == ExitReason.COMPLETED, f"turn 1: expected COMPLETED, got {result1.exit_reason}"
     assert conversation.prompt_sha256 == initial_hash, "prompt_sha256 drifted after turn 1"
@@ -215,6 +228,7 @@ async def main() -> None:
         compress=_compress,
         now=0.0,
     )
+    conversation = replace(conversation, next_child_seq=next_child_seq)
     print(f"exit_reason={result2.exit_reason} final_text={result2.final_text!r}")
     assert result2.exit_reason == ExitReason.COMPLETED, f"turn 2: expected COMPLETED, got {result2.exit_reason}"
     assert conversation.prompt_sha256 == initial_hash, "prompt_sha256 drifted after turn 2"
@@ -230,6 +244,7 @@ async def main() -> None:
         compress=_compress,
         now=0.0,
     )
+    conversation = replace(conversation, next_child_seq=next_child_seq)
     print(f"exit_reason={result3.exit_reason} final_text={result3.final_text!r}")
     assert result3.exit_reason == ExitReason.COMPLETED, f"turn 3: expected COMPLETED, got {result3.exit_reason}"
     assert conversation.prompt_sha256 == initial_hash, "prompt_sha256 drifted after turn 3"
@@ -248,6 +263,7 @@ async def main() -> None:
         compress=_compress,
         now=0.0,
     )
+    conversation = replace(conversation, next_child_seq=next_child_seq)
     print(f"exit_reason={result4.exit_reason} detail={result4.detail!r}")
     assert result4.exit_reason == ExitReason.BUDGET_EXHAUSTED, (
         f"turn 4: expected BUDGET_EXHAUSTED, got {result4.exit_reason} — "

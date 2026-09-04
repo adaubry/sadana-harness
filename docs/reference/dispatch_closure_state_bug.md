@@ -86,12 +86,22 @@ call returns.
 return value — the channel this bug does not touch — so every assertion
 CONV-09 actually makes passed correctly, every time. The only field the
 bug corrupts is `next_child_seq`, and nothing in the script asserts that
-field directly. Its only externally visible effect is on the *next* child
-spawned under the *same* `node_name`: it would get the same key a prior
-child already used, instead of a new one. `plugin_a_entry` and
-`plugin_b_entry` are each called exactly once, under different
-`node_name`s, in the one real run this proof produced — so the collision
-this bug causes never had an input that could trigger it.
+field directly.
+
+The bug's actual effect is broader than "only visible on a repeated
+`node_name`": `next_child_seq` never advances at all, so *every* spawn
+after the very first is silently numbered wrong (always 0, never 1, 2,
+...) — confirmed once the fix landed (see "Resolution" below) by
+re-running the original two-plugin scenario and observing the second
+child's key change from `.../plugin_b_child/0` to the correct
+`.../plugin_b_child/1`. What stayed genuinely invisible in CONV-09's one
+real run is only the *consequence* of that wrongness — two different
+`node_name`s both (incorrectly) numbered 0 never collide with each other,
+because the full key includes the name. `plugin_a_entry` and
+`plugin_b_entry` are each called exactly once, under different names, in
+that run — so the *collision* this bug causes never had an input that
+could trigger it, even though the numbering itself was wrong the whole
+time.
 
 ## What fixing it would fix — and what it wouldn't, on its own
 
@@ -127,3 +137,33 @@ interface question — how does a value produced inside `dispatch()` reach
 the turn loop that's calling it? — for whichever future work item builds
 real plugin dispatch (PLUGIN-SYSTEM, or a DAG engine), not something this
 proof script's fix should be mistaken for having settled.
+
+## Resolution (CONV-10-dispatch-parent-propagation)
+
+Both concrete fixes named above under "Fixes" and "Does not fix, on its
+own" are applied, together, in `scripts/prove_conversation_e2e.py`:
+`next_child_seq` is tracked as its own plain counter in `main()`, never
+routed through `conversation` at all; `dispatch()` overlays that counter
+onto a `replace()`d snapshot of `conversation` when building each
+`run_child()` call's `parent` argument; `main()`'s own turn loop
+reconciles the counter back onto `conversation` after every `take_turn()`
+call, so the final value is honest too.
+
+Two things this fix does **not** change, stated here so this document
+keeps being accurate rather than needing a second correction later:
+
+- **The underlying interface gap — "does not address at all," above —
+  is exactly as open as it was.** This fix is a script-local answer for
+  one proof script's own bookkeeping, not a general one. It says nothing
+  about how a real plugin's dispatch handler would report an updated
+  parent back to its own caller; that question is untouched.
+- **The fix changes this script's own observable output, not just its
+  correctness.** Re-running the original two-plugin scenario produces a
+  different second-child key (`.../plugin_b_child/1`, not `/0`) — because
+  the bug's actual effect was "every spawn's number is always wrong,"
+  not only "a name reuse produces a collision" (see the corrected
+  account above). CONV-09's own captured Evidence and closed decision are
+  unaffected and unedited — nothing that run's own assertions checked
+  ever depended on this field — but a fresh real run of the same script
+  would no longer reproduce that exact printed line, and that is
+  expected, not a regression.
