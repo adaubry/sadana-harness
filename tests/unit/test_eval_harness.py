@@ -1,0 +1,147 @@
+"""Tests for sadana.eval_harness: run_task(), save_result(), load_result()."""
+
+from __future__ import annotations
+
+import asyncio
+from collections.abc import Callable
+from pathlib import Path
+
+import pytest
+
+from sadana import model_access
+from sadana.conversation import ConversationTemplate, ExitReason, IterationBudget, Message, TemplateRecipe, TurnResult
+from sadana.eval_harness import Task, TaskRun, load_result, run_task, run_task_key, save_result
+
+_TEMPLATE = ConversationTemplate(
+    name="eval-test",
+    recipe=TemplateRecipe(stable_prompt="You are a test fixture.", catalog=(), tool_specs=()),
+)
+
+
+def _text_response(text: str) -> model_access.Response:
+    return model_access.Response(content=text, tool_calls=(), finish_reason="stop", usage=model_access.Usage())
+
+
+def _exact_match_grader(expected: str) -> Callable[[TurnResult, tuple[Message, ...]], float]:
+    def grade(result: TurnResult, _messages: tuple[Message, ...]) -> float:
+        return 1.0 if result.final_text == expected else 0.0
+
+    return grade
+
+
+@pytest.mark.unit
+def test_run_task_completed_and_graded(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(model_access, "send", lambda request: _text_response("PASS"))
+    task = Task(task_id="smoke", prompt="say PASS", grade=_exact_match_grader("PASS"))
+
+    run = asyncio.run(
+        run_task(
+            task,
+            _TEMPLATE,
+            provider="p",
+            model="m",
+            iteration_budget=IterationBudget(max_total=5),
+            now=100.0,
+        )
+    )
+
+    assert run.task_id == "smoke"
+    assert run.exit_reason == ExitReason.COMPLETED
+    assert run.final_text == "PASS"
+    assert run.score == 1.0
+    assert run.timestamp == 100.0
+
+
+@pytest.mark.unit
+def test_run_task_wrong_answer_scores_zero(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(model_access, "send", lambda request: _text_response("nope"))
+    task = Task(task_id="smoke", prompt="say PASS", grade=_exact_match_grader("PASS"))
+
+    run = asyncio.run(
+        run_task(task, _TEMPLATE, provider="p", model="m", iteration_budget=IterationBudget(max_total=5), now=0.0)
+    )
+
+    assert run.exit_reason == ExitReason.COMPLETED
+    assert run.score == 0.0
+
+
+@pytest.mark.unit
+def test_run_task_non_completed_exit_still_graded(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(model_access, "send", lambda request: _text_response("irrelevant"))
+    grader_saw: list[ExitReason] = []
+
+    def grade(result: TurnResult, _messages: tuple[Message, ...]) -> float:
+        grader_saw.append(result.exit_reason)
+        return 0.0
+
+    task = Task(task_id="exhausted", prompt="go", grade=grade)
+
+    run = asyncio.run(
+        run_task(
+            task,
+            _TEMPLATE,
+            provider="p",
+            model="m",
+            iteration_budget=IterationBudget(max_total=0),  # exhausted before the first model call
+            now=0.0,
+        )
+    )
+
+    assert run.exit_reason == ExitReason.BUDGET_EXHAUSTED
+    assert grader_saw == [ExitReason.BUDGET_EXHAUSTED]  # the grader ran, not skipped, on a non-COMPLETED exit
+
+
+@pytest.mark.unit
+def test_run_task_key_is_readable_and_distinct_per_call() -> None:
+    assert run_task_key("smoke", 1.0) != run_task_key("smoke", 2.0)
+    assert run_task_key("smoke", 1.0) != run_task_key("other", 1.0)
+
+
+@pytest.mark.unit
+def test_save_result_then_load_result_round_trips(tmp_path: Path) -> None:
+    run = TaskRun(
+        task_id="smoke",
+        score=0.75,
+        exit_reason=ExitReason.COMPLETED,
+        final_text="PASS",
+        provider="openrouter",
+        model="deepseek/deepseek-v4-flash-0731",
+        timestamp=1234.5,
+        detail=None,
+    )
+
+    path = save_result(run, tmp_path / "results")
+
+    assert path.exists()
+    assert path.parent == tmp_path / "results"
+    assert load_result(path) == run
+
+
+@pytest.mark.unit
+def test_save_result_two_runs_of_same_task_do_not_collide(tmp_path: Path) -> None:
+    results_dir = tmp_path / "results"
+    first = TaskRun(
+        task_id="smoke",
+        score=0.0,
+        exit_reason=ExitReason.COMPLETED,
+        final_text="a",
+        provider="p",
+        model="m",
+        timestamp=1.0,
+    )
+    second = TaskRun(
+        task_id="smoke",
+        score=1.0,
+        exit_reason=ExitReason.COMPLETED,
+        final_text="b",
+        provider="p",
+        model="m",
+        timestamp=2.0,
+    )
+
+    path1 = save_result(first, results_dir)
+    path2 = save_result(second, results_dir)
+
+    assert path1 != path2
+    assert load_result(path1) == first
+    assert load_result(path2) == second
