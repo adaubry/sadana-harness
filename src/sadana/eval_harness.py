@@ -15,12 +15,13 @@ yet to make that worth building.
 from __future__ import annotations
 
 import json
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from sadana import config
 from sadana.conversation import (
+    Conversation,
     ConversationKey,
     ConversationTemplate,
     ExitReason,
@@ -79,6 +80,10 @@ def run_task_key(task_id: str, now: float) -> ConversationKey:
     return f"eval/{task_id}/{now}"
 
 
+def _no_tools_dispatch_factory(_conversation: Conversation) -> Callable[[str, dict], Awaitable[str]]:
+    return _no_tools_dispatch
+
+
 async def run_task(
     task: Task,
     template: ConversationTemplate,
@@ -88,23 +93,34 @@ async def run_task(
     iteration_budget: IterationBudget,
     now: float,
     key: ConversationKey | None = None,
+    dispatch_factory: Callable[[Conversation], Callable[[str, dict], Awaitable[str]]] = _no_tools_dispatch_factory,
 ) -> TaskRun:
     """Builds a fresh `Conversation` from `template`, takes exactly one
     turn with `task.prompt`, grades the result with `task.grade`, returns
     a `TaskRun`. A turn that doesn't `COMPLETED` is still graded and
-    recorded — `task.grade` decides what that's worth, not this function."""
+    recorded — `task.grade` decides what that's worth, not this function.
+
+    `dispatch_factory` receives the *actual* `Conversation` this call
+    builds and returns the real dispatch handler — a factory, not a bare
+    dispatch callable, specifically so a task whose dispatch needs to
+    call `run_child(parent=...)` gets the real parent this function built,
+    not an independently-constructed guess at what it would be (EVAL-02's
+    own build caught this: a caller building its own `Conversation` via a
+    second `create_conversation()` call, hoping it matches, is a silent
+    divergence risk the moment this function's own call ever changes)."""
     conversation, _template = create_conversation(
         template,
         key=key if key is not None else run_task_key(task.task_id, now),
         system_message="",
         iteration_budget=iteration_budget,
     )
+    dispatch = dispatch_factory(conversation)
     result, updated = await take_turn(
         conversation,
         user_input=task.prompt,
         provider=provider,
         model=model,
-        dispatch=_no_tools_dispatch,
+        dispatch=dispatch,
         compress=_compress_noop,
         now=now,
     )

@@ -3,13 +3,22 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 
 import pytest
 
 from sadana import model_access
-from sadana.conversation import ConversationTemplate, ExitReason, IterationBudget, Message, TemplateRecipe, TurnResult
+from sadana.conversation import (
+    Conversation,
+    ConversationTemplate,
+    ExitReason,
+    IterationBudget,
+    Message,
+    TemplateRecipe,
+    ToolSpec,
+    TurnResult,
+)
 from sadana.eval_harness import Task, TaskRun, load_result, run_task, run_task_key, save_result
 
 _TEMPLATE = ConversationTemplate(
@@ -89,6 +98,75 @@ def test_run_task_non_completed_exit_still_graded(monkeypatch: pytest.MonkeyPatc
 
     assert run.exit_reason == ExitReason.BUDGET_EXHAUSTED
     assert grader_saw == [ExitReason.BUDGET_EXHAUSTED]  # the grader ran, not skipped, on a non-COMPLETED exit
+
+
+def _tool_call_response(name: str) -> model_access.Response:
+    return model_access.Response(
+        content=None,
+        tool_calls=({"function": {"name": name, "arguments": "{}"}},),
+        finish_reason="tool_calls",
+        usage=model_access.Usage(),
+    )
+
+
+@pytest.mark.unit
+def test_run_task_with_real_dispatch_reaches_the_grader(monkeypatch: pytest.MonkeyPatch) -> None:
+    """EVAL-02's own reason to exist: a task whose template mounts a tool
+    and whose dispatch actually handles it — the grader sees the tool's
+    result via the message history, not a placeholder. Also proves
+    `dispatch_factory` receives the real `Conversation` `run_task()`
+    built, not one the caller guessed at independently."""
+    template = ConversationTemplate(
+        name="eval-tool-test",
+        recipe=TemplateRecipe(
+            stable_prompt="You are a test fixture.",
+            catalog=(),
+            tool_specs=(
+                ToolSpec(
+                    key="noop_tool",
+                    name="noop_tool",
+                    parameters={"type": "object", "properties": {}},
+                    describe=lambda _resolved: "does nothing",
+                ),
+            ),
+        ),
+    )
+    responses = iter([_tool_call_response("noop_tool"), _text_response("done")])
+    monkeypatch.setattr(model_access, "send", lambda request: next(responses))
+
+    factory_saw_key: list[str] = []
+
+    def dispatch_factory(conversation: Conversation) -> Callable[[str, dict], Awaitable[str]]:
+        factory_saw_key.append(conversation.key)
+
+        async def dispatch(name: str, arguments: dict) -> str:
+            assert name == "noop_tool"
+            return "TOOL_RAN_OK"
+
+        return dispatch
+
+    def grade(_result: TurnResult, messages: tuple[Message, ...]) -> float:
+        tool_messages = [m for m in messages if m.role == "tool"]
+        return 1.0 if any(m.content == "TOOL_RAN_OK" for m in tool_messages) else 0.0
+
+    task = Task(task_id="tool_dispatch", prompt="call the tool", grade=grade)
+
+    run = asyncio.run(
+        run_task(
+            task,
+            template,
+            provider="p",
+            model="m",
+            iteration_budget=IterationBudget(max_total=5),
+            now=0.0,
+            key="explicit-key",
+            dispatch_factory=dispatch_factory,
+        )
+    )
+
+    assert run.exit_reason == ExitReason.COMPLETED
+    assert run.score == 1.0
+    assert factory_saw_key == ["explicit-key"]  # the factory got the real conversation, not a guess
 
 
 @pytest.mark.unit
