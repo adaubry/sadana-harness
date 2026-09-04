@@ -35,6 +35,7 @@ WSL only. Python lives in `.venv`; `make` puts it on PATH for you, so there is n
 - Prove a block's first real external round trip with a standalone script outside `make test`; paste its output as Deploy-stage Evidence rather than relaxing testing-conventions' network ban in the unit suite
 - A conversation's message history is mutated only through conversation.append/conversation.repair — never by direct list or tuple mutation elsewhere
 - Model a resource that can be consumed or exhausted (a budget, an allowance) as an immutable value with a consume() function returning a new value or None — never a mutable counter guarded by a lock
+- A resource already modeled as a self-exhausting consume() value needs no additional external ceiling on a caller-chosen amount — its own exhaustion is the enforcement. Add a ceiling only to catch a genuinely different scenario (e.g. unbounded recursion depth), never to double-guard the one the resource already bounds.
 
 ## Glossary
 

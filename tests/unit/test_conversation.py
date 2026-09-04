@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import time
+from pathlib import Path
 
 import pytest
 
 from sadana import model_access
 from sadana.conversation import (
+    ChildDepthExceeded,
+    ChildSpec,
     Completion,
     ContextOverflow,
     ConversationTemplate,
@@ -20,15 +24,21 @@ from sadana.conversation import (
     PluginCatalogEntry,
     PromptDriftError,
     ProviderFailure,
+    SkillLoadError,
+    SkillRef,
     TemplateRecipe,
     ToolSpec,
     ToolSurface,
     TranscriptInvariantError,
     TurnKey,
     WallClockBudget,
+    _child_key,  # private, tested directly per spec.md
+    _conversation_depth,  # private, tested directly per spec.md
     _deduplicate_tool_calls,  # private, tested directly per spec.md
     append,
     build_surface,
+    child_iteration_budget_from_config,
+    child_max_depth_from_config,
     coalesce_tool_call_id,
     complete,
     consume_iteration,
@@ -37,9 +47,11 @@ from sadana.conversation import (
     deterministic_call_id,
     filter_surface,
     iteration_budget_from_config,
+    load_skill,
     pending_tool_call_ids,
     repair,
     repair_tool_call_arguments,
+    run_child,
     run_turn,
     surface_hash,
     take_turn,
@@ -1115,3 +1127,337 @@ def test_rotate_prompt_is_the_only_epoch_mutating_path(monkeypatch: pytest.Monke
         )
     )
     assert updated.prompt_epoch == 0
+
+
+# ── child conversation ───────────────────────────────────────────────────
+
+
+def _write_skill(
+    tmp_path: Path,
+    *,
+    plugin: str = "p1",
+    skill: str = "s1",
+    name: str | None = None,
+    description: str | None = "Does one focused thing.",
+    body: str = "Do the thing, then stop.",
+) -> Path:
+    skill_dir = tmp_path / "plugins" / plugin / "skills" / skill
+    skill_dir.mkdir(parents=True)
+    lines = [f"name: {skill if name is None else name}"]
+    if description is not None:
+        lines.append(f"description: {description}")
+    (skill_dir / "SKILL.md").write_text("---\n" + "\n".join(lines) + f"\n---\n{body}")
+    return tmp_path / "plugins"
+
+
+def _install_skill(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, body: str = "Skill instructions.") -> SkillRef:
+    root = _write_skill(tmp_path, body=body)
+    monkeypatch.setenv("SADANA_PLUGINS_DIR", str(root))
+    return SkillRef(plugin="p1", skill="s1")
+
+
+@pytest.mark.unit
+def test_load_skill_returns_body_for_valid_skill(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    ref = _install_skill(tmp_path, monkeypatch, body="Do the thing, then stop.")
+    assert load_skill(ref) == "Do the thing, then stop."
+
+
+@pytest.mark.unit
+def test_load_skill_raises_for_missing_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SADANA_PLUGINS_DIR", str(tmp_path / "plugins"))
+    with pytest.raises(SkillLoadError):
+        load_skill(SkillRef(plugin="nope", skill="nope"))
+
+
+@pytest.mark.unit
+def test_load_skill_raises_for_missing_frontmatter_delimiter(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    skill_dir = tmp_path / "plugins" / "p1" / "skills" / "s1"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text("no frontmatter here")
+    monkeypatch.setenv("SADANA_PLUGINS_DIR", str(tmp_path / "plugins"))
+    with pytest.raises(SkillLoadError):
+        load_skill(SkillRef(plugin="p1", skill="s1"))
+
+
+@pytest.mark.unit
+def test_load_skill_raises_for_unclosed_frontmatter(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    skill_dir = tmp_path / "plugins" / "p1" / "skills" / "s1"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text("---\nname: s1\ndescription: x\nno closing delimiter")
+    monkeypatch.setenv("SADANA_PLUGINS_DIR", str(tmp_path / "plugins"))
+    with pytest.raises(SkillLoadError):
+        load_skill(SkillRef(plugin="p1", skill="s1"))
+
+
+@pytest.mark.unit
+def test_load_skill_raises_for_name_mismatch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    root = _write_skill(tmp_path, name="a-different-name")
+    monkeypatch.setenv("SADANA_PLUGINS_DIR", str(root))
+    with pytest.raises(SkillLoadError):
+        load_skill(SkillRef(plugin="p1", skill="s1"))
+
+
+@pytest.mark.unit
+def test_load_skill_raises_for_missing_description(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    root = _write_skill(tmp_path, description=None)
+    monkeypatch.setenv("SADANA_PLUGINS_DIR", str(root))
+    with pytest.raises(SkillLoadError):
+        load_skill(SkillRef(plugin="p1", skill="s1"))
+
+
+@pytest.mark.unit
+def test_load_skill_raises_for_description_too_long(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    root = _write_skill(tmp_path, description="x" * 1025)
+    monkeypatch.setenv("SADANA_PLUGINS_DIR", str(root))
+    with pytest.raises(SkillLoadError):
+        load_skill(SkillRef(plugin="p1", skill="s1"))
+
+
+@pytest.mark.unit
+def test_child_key_embeds_parent_and_node_name() -> None:
+    assert _child_key("root", "search", 3) == "root/child/search/3"
+
+
+@pytest.mark.unit
+def test_conversation_depth_zero_for_bare_key() -> None:
+    assert _conversation_depth("root") == 0
+
+
+@pytest.mark.unit
+def test_conversation_depth_counts_child_hops() -> None:
+    once = _child_key("root", "a", 0)
+    twice = _child_key(once, "b", 0)
+    assert _conversation_depth(once) == 1
+    assert _conversation_depth(twice) == 2
+
+
+@pytest.mark.unit
+def test_child_iteration_budget_from_config_defaults_to_20(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("SADANA_CONVERSATION_CHILD_MAX_ITERATIONS", raising=False)
+    assert child_iteration_budget_from_config().max_total == 20
+
+
+@pytest.mark.unit
+def test_child_iteration_budget_from_config_reads_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SADANA_CONVERSATION_CHILD_MAX_ITERATIONS", "7")
+    assert child_iteration_budget_from_config().max_total == 7
+
+
+@pytest.mark.unit
+def test_child_iteration_budget_from_config_raises_for_negative(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SADANA_CONVERSATION_CHILD_MAX_ITERATIONS", "-1")
+    with pytest.raises(ValueError):
+        child_iteration_budget_from_config()
+
+
+@pytest.mark.unit
+def test_child_max_depth_from_config_defaults_to_2(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("SADANA_CONVERSATION_CHILD_MAX_DEPTH", raising=False)
+    assert child_max_depth_from_config() == 2
+
+
+@pytest.mark.unit
+def test_child_max_depth_from_config_reads_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SADANA_CONVERSATION_CHILD_MAX_DEPTH", "5")
+    assert child_max_depth_from_config() == 5
+
+
+@pytest.mark.unit
+def test_child_max_depth_from_config_raises_for_negative(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SADANA_CONVERSATION_CHILD_MAX_DEPTH", "-1")
+    with pytest.raises(ValueError):
+        child_max_depth_from_config()
+
+
+def _child_spec(ref: SkillRef, **overrides) -> ChildSpec:
+    kwargs = {
+        "node_name": "task",
+        "skill": ref,
+        "input": "do the thing",
+        "tools": frozenset({"noop"}),
+    }
+    kwargs.update(overrides)
+    return ChildSpec(**kwargs)
+
+
+def _spawn(parent, spec: ChildSpec, **overrides):
+    kwargs = {
+        "stable_prompt": _SYSTEM_PROMPT,
+        "provider": "p",
+        "model": "m",
+        "dispatch": _fake_dispatch_ok,
+        "compress": _fake_compress_none,
+        "now": 0.0,
+    }
+    kwargs.update(overrides)
+    return asyncio.run(run_child(parent, spec, **kwargs))
+
+
+@pytest.mark.unit
+def test_run_child_key_embeds_parent_and_node_name(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    ref = _install_skill(tmp_path, monkeypatch)
+    parent, _t = create_conversation(_template(), "parent", "hi", iteration_budget=_budget())
+    monkeypatch.setattr(model_access, "send", lambda request: _text_response("done"))
+
+    result, _child, _updated_parent = _spawn(parent, _child_spec(ref))
+
+    assert result.turn_key.conversation == "parent/child/task/0"
+
+
+@pytest.mark.unit
+def test_run_child_two_spawns_produce_distinct_sequential_keys(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    ref = _install_skill(tmp_path, monkeypatch)
+    parent, _t = create_conversation(_template(), "parent", "hi", iteration_budget=_budget())
+    monkeypatch.setattr(model_access, "send", lambda request: _text_response("done"))
+
+    first_result, _c1, after_first = _spawn(parent, _child_spec(ref))
+    second_result, _c2, _after_second = _spawn(after_first, _child_spec(ref))
+
+    assert first_result.turn_key.conversation == "parent/child/task/0"
+    assert second_result.turn_key.conversation == "parent/child/task/1"
+
+
+@pytest.mark.unit
+def test_run_child_restricts_tool_surface_to_spec_tools(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    ref = _install_skill(tmp_path, monkeypatch)
+    recipe = _recipe(tool_specs=(_spec("allowed", "allowed"), _spec("blocked", "blocked")))
+    parent, _t = create_conversation(_template(recipe=recipe), "parent", "hi", iteration_budget=_budget())
+    monkeypatch.setattr(model_access, "send", lambda request: _tool_call_response("blocked"))
+
+    calls: list[str] = []
+
+    async def recording_dispatch(name: str, arguments: dict) -> str:
+        calls.append(name)
+        return "unreachable"
+
+    result, _child, _p = _spawn(parent, _child_spec(ref, tools=frozenset({"allowed"})), dispatch=recording_dispatch)
+
+    assert result.exit_reason == ExitReason.INVALID_TOOL_CALLS
+    assert calls == []
+
+
+@pytest.mark.unit
+def test_run_child_uses_given_budget_verbatim_even_over_config_default(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ref = _install_skill(tmp_path, monkeypatch)
+    monkeypatch.setenv("SADANA_CONVERSATION_CHILD_MAX_ITERATIONS", "3")
+    parent, _t = create_conversation(_template(), "parent", "hi", iteration_budget=_budget())
+    monkeypatch.setattr(model_access, "send", lambda request: _text_response("done"))
+
+    _result, child, _p = _spawn(parent, _child_spec(ref, budget=IterationBudget(max_total=999)))
+
+    assert child.iteration_budget.max_total == 999
+
+
+@pytest.mark.unit
+def test_run_child_uses_config_default_budget_when_none_given(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    ref = _install_skill(tmp_path, monkeypatch)
+    monkeypatch.setenv("SADANA_CONVERSATION_CHILD_MAX_ITERATIONS", "7")
+    parent, _t = create_conversation(_template(), "parent", "hi", iteration_budget=_budget())
+    monkeypatch.setattr(model_access, "send", lambda request: _text_response("done"))
+
+    _result, child, _p = _spawn(parent, _child_spec(ref))
+
+    assert child.iteration_budget.max_total == 7
+
+
+@pytest.mark.unit
+def test_run_child_wall_clock_budget_is_the_same_object_as_parent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ref = _install_skill(tmp_path, monkeypatch)
+    wall_clock = WallClockBudget(deadline=123.0)
+    parent, _t = create_conversation(
+        _template(), "parent", "hi", iteration_budget=_budget(), wall_clock_budget=wall_clock
+    )
+    monkeypatch.setattr(model_access, "send", lambda request: _text_response("done"))
+
+    _result, child, _p = _spawn(parent, _child_spec(ref))
+
+    assert child.wall_clock_budget is wall_clock
+
+
+@pytest.mark.unit
+def test_run_child_uses_given_model_over_parents(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    ref = _install_skill(tmp_path, monkeypatch)
+    parent, _t = create_conversation(_template(), "parent", "hi", iteration_budget=_budget())
+    sent: list[model_access.Request] = []
+
+    def record_send(request: model_access.Request) -> model_access.Response:
+        sent.append(request)
+        return _text_response("done")
+
+    monkeypatch.setattr(model_access, "send", record_send)
+
+    _spawn(parent, _child_spec(ref, model="cheap-model"), model="parent-model")
+
+    assert sent[-1].model == "cheap-model"
+
+
+@pytest.mark.unit
+def test_run_child_inherits_parents_model_when_none_given(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    ref = _install_skill(tmp_path, monkeypatch)
+    parent, _t = create_conversation(_template(), "parent", "hi", iteration_budget=_budget())
+    sent: list[model_access.Request] = []
+
+    def record_send(request: model_access.Request) -> model_access.Response:
+        sent.append(request)
+        return _text_response("done")
+
+    monkeypatch.setattr(model_access, "send", record_send)
+
+    _spawn(parent, _child_spec(ref), model="parent-model")
+
+    assert sent[-1].model == "parent-model"
+
+
+@pytest.mark.unit
+def test_run_child_raises_child_depth_exceeded_before_calling_provider_or_dispatch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ref = _install_skill(tmp_path, monkeypatch)
+    monkeypatch.setenv("SADANA_CONVERSATION_CHILD_MAX_DEPTH", "1")
+    # A parent whose own key already sits at depth 1 — one more hop would reach 2.
+    parent, _t = create_conversation(_template(), "root/child/nodeA/0", "hi", iteration_budget=_budget())
+
+    def fail_send(request: model_access.Request) -> model_access.Response:
+        raise AssertionError("model_access.send should not be called")
+
+    async def fail_dispatch(name: str, arguments: dict) -> str:
+        raise AssertionError("dispatch should not be called")
+
+    monkeypatch.setattr(model_access, "send", fail_send)
+
+    with pytest.raises(ChildDepthExceeded):
+        _spawn(parent, _child_spec(ref), dispatch=fail_dispatch)
+
+
+@pytest.mark.unit
+def test_run_child_never_mutates_parent_messages_only_bumps_next_child_seq(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ref = _install_skill(tmp_path, monkeypatch)
+    parent, _t = create_conversation(_template(), "parent", "hi", iteration_budget=_budget())
+    monkeypatch.setattr(model_access, "send", lambda request: _text_response("done"))
+
+    _result, _child, updated_parent = _spawn(parent, _child_spec(ref))
+
+    assert updated_parent.messages == parent.messages == ()
+    assert updated_parent.next_child_seq == parent.next_child_seq + 1
+    assert dataclasses.replace(updated_parent, next_child_seq=parent.next_child_seq) == parent
+
+
+@pytest.mark.unit
+def test_run_child_system_prompt_is_byte_identical_regardless_of_input(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ref = _install_skill(tmp_path, monkeypatch)
+    parent, _t = create_conversation(_template(), "parent", "hi", iteration_budget=_budget())
+    monkeypatch.setattr(model_access, "send", lambda request: _text_response("done"))
+
+    _r1, child_a, _p1 = _spawn(parent, _child_spec(ref, node_name="a", input="first task"))
+    _r2, child_b, _p2 = _spawn(parent, _child_spec(ref, node_name="b", input="a completely different task"))
+
+    assert child_a.system_prompt == child_b.system_prompt
+    assert child_a.prompt_sha256 == child_b.prompt_sha256

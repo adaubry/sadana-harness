@@ -20,6 +20,7 @@ import re
 from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass, replace
 from enum import Enum
+from pathlib import Path
 from typing import Literal
 
 from sadana import config, model_access
@@ -952,6 +953,7 @@ class Conversation:
     next_turn_seq: int
     iteration_budget: IterationBudget
     wall_clock_budget: WallClockBudget | None
+    next_child_seq: int = 0  # CONV-07's own counter; see run_child below.
 
 
 def _render_context(system_message: str, catalog: tuple[PluginCatalogEntry, ...]) -> str:
@@ -1066,3 +1068,242 @@ async def take_turn(
         iteration_budget=iteration_budget,
     )
     return result, updated
+
+
+# ── CONV-07: child conversation ──────────────────────────────────────────
+# Its full contract is `docs/tasks/C9-child-conversation/spec.md`.
+
+
+@dataclass(frozen=True)
+class SkillRef:
+    """A name, not a path — see spec.md's Design section. A plugin's real
+    on-disk location can move (re-install, version bump) independently of
+    anything holding a reference to it, so this holds the two names that
+    resolve to one, fresh, every call."""
+
+    plugin: str
+    skill: str
+
+
+class SkillLoadError(Exception):
+    """A skill's SKILL.md is missing, malformed, or its declared name
+    doesn't match what was asked for."""
+
+
+def _plugins_root() -> Path:
+    """Where installed plugins live. ``SADANA_PLUGINS_DIR`` if set, else
+    under the existing state directory. Deliberately not prefixed
+    ``SADANA_CONVERSATION_...`` despite config.py's own convention note:
+    this value's real owner is a PLUGINS block that doesn't exist yet, and
+    prefixing it as conversation-owned would just mean renaming it out
+    from under that block later. Resolved fresh on every call, never
+    cached — same posture as ``config.get_paths()``."""
+    return config.env_path("SADANA_PLUGINS_DIR", default=config.get_paths().state_dir / "plugins")
+
+
+def _skill_path(ref: SkillRef) -> Path:
+    """``<plugins_root>/<plugin>/skills/<skill>`` — the layout the
+    requester's own plugin-repo shape already commits to, used one level
+    early. Only what populates ``_plugins_root()`` needs to change when a
+    real installer exists; this function and every caller of it don't."""
+    return _plugins_root() / ref.plugin / "skills" / ref.skill
+
+
+def _parse_skill_md(text: str) -> tuple[dict[str, str], str]:
+    """Split a SKILL.md's ``---``-delimited frontmatter from its body.
+    Hand-rolled rather than a YAML dependency: the frontmatter this
+    project reads is two flat string fields (``name``, ``description``),
+    and this project has zero runtime dependencies today. Raises
+    ``SkillLoadError`` if the delimiters are missing or unclosed."""
+    if not text.startswith("---\n"):
+        raise SkillLoadError("SKILL.md is missing its frontmatter delimiter")
+    end = text.find("\n---", 4)
+    if end == -1:
+        raise SkillLoadError("SKILL.md's frontmatter is never closed")
+    header = text[4:end]
+    body = text[end + 4 :].lstrip("\n")
+    frontmatter: dict[str, str] = {}
+    for line in header.splitlines():
+        if not line.strip():
+            continue
+        key, _, value = line.partition(":")
+        frontmatter[key.strip()] = value.strip()
+    return frontmatter, body
+
+
+_SKILL_DESCRIPTION_MAX_CHARS = 1024  # agentskills.io's own ceiling.
+
+
+def load_skill(ref: SkillRef) -> str:
+    """Read ``ref``'s SKILL.md, validate its frontmatter, and return the
+    body — the text a child's system prompt is built from. Raises
+    ``SkillLoadError`` when the file is absent, its frontmatter is
+    missing/malformed, its declared ``name`` doesn't match ``ref.skill``,
+    or its ``description`` is absent or over 1024 characters."""
+    path = _skill_path(ref) / "SKILL.md"
+    if not path.exists():
+        raise SkillLoadError(f"no SKILL.md at {path}")
+    frontmatter, body = _parse_skill_md(path.read_text())
+
+    name = frontmatter.get("name")
+    if name != ref.skill:
+        raise SkillLoadError(f"SKILL.md at {path} declares name {name!r}, expected {ref.skill!r}")
+
+    description = frontmatter.get("description")
+    if not description:
+        raise SkillLoadError(f"SKILL.md at {path} is missing a description")
+    if len(description) > _SKILL_DESCRIPTION_MAX_CHARS:
+        raise SkillLoadError(
+            f"SKILL.md at {path} has a {len(description)}-char description "
+            f"(over the {_SKILL_DESCRIPTION_MAX_CHARS}-char limit)"
+        )
+    return body
+
+
+class ChildDepthExceeded(Exception):
+    """A spawn's derived depth exceeds the configured maximum. Raised
+    before any budget, transcript, or model-call state is touched — same
+    posture as ``PromptDriftError``: a structural refusal, not a run
+    outcome, so it is never an ``ExitReason``."""
+
+
+def _child_key(parent: ConversationKey, node_name: str, seq: int) -> ConversationKey:
+    """A child's key always embeds its parent's key and the node that
+    spawned it — the lineage is in the name (blueprint §4.1), not a
+    foreign key anything has to join."""
+    return f"{parent}/child/{node_name}/{seq}"
+
+
+def _conversation_depth(key: ConversationKey) -> int:
+    """How many ``run_child`` hops produced ``key``, recovered by
+    counting ``"child"`` path segments rather than stored anywhere — a
+    stored counter could only ever agree with, never usefully disagree
+    from, what the key ``_child_key`` built already encodes. Caveat, not
+    enforced: a ``node_name`` that is itself exactly ``"child"`` would be
+    miscounted by one; ``node_name`` is short and caller-chosen, and
+    nothing external supplies one today."""
+    return sum(1 for segment in key.split("/") if segment == "child")
+
+
+def child_iteration_budget_from_config() -> IterationBudget:
+    """Reads ``SADANA_CONVERSATION_CHILD_MAX_ITERATIONS`` (default 20,
+    matching blueprint §5.7). Same negative-value ``ValueError`` posture
+    as ``iteration_budget_from_config``. Only the default a caller falls
+    back to when ``ChildSpec.budget`` is ``None`` — a caller-supplied
+    value is never clamped against this."""
+    max_total = config.env_int("SADANA_CONVERSATION_CHILD_MAX_ITERATIONS", 20)
+    if max_total < 0:
+        raise ValueError(f"SADANA_CONVERSATION_CHILD_MAX_ITERATIONS={max_total} must not be negative")
+    return IterationBudget(max_total=max_total)
+
+
+def child_max_depth_from_config() -> int:
+    """Reads ``SADANA_CONVERSATION_CHILD_MAX_DEPTH`` (default 2, matching
+    blueprint §5.7). Unlike the iteration budget, this is a real ceiling
+    with no per-spawn override: depth bounds recursive spawning across
+    many children, a scenario no self-exhausting budget catches on its
+    own."""
+    max_depth = config.env_int("SADANA_CONVERSATION_CHILD_MAX_DEPTH", 2)
+    if max_depth < 0:
+        raise ValueError(f"SADANA_CONVERSATION_CHILD_MAX_DEPTH={max_depth} must not be negative")
+    return max_depth
+
+
+@dataclass(frozen=True)
+class ChildSpec:
+    """One bounded sub-task a caller wants run. ``budget`` and ``model``
+    default to ``None`` — inherit/config-default — but ``tools`` has no
+    default: a caller must say what a child may touch."""
+
+    node_name: str
+    skill: SkillRef
+    input: str
+    tools: frozenset[str]
+    budget: IterationBudget | None = None
+    model: str | None = None
+
+
+# What run_child returns for its single turn. Not a new type: TurnResult
+# already carries the child's own key (turn_key.conversation) — see
+# spec.md's Rejected alternatives.
+ChildResult = TurnResult
+
+
+_CHILD_TASK_FRAMING = (
+    "You are a focused subagent, launched to complete one bounded task "
+    "and then stop. Make a reasonable choice and proceed rather than "
+    "asking a clarifying question. When you are done, report plainly: "
+    "what you did, what you found, what (if anything) changed, and any "
+    "issues you ran into. Nothing else reads your intermediate steps, "
+    "so make your final answer stand on its own."
+)
+
+
+async def run_child(
+    parent: Conversation,
+    spec: ChildSpec,
+    *,
+    stable_prompt: str,
+    provider: str,
+    model: str,
+    dispatch: Callable[[str, dict], Awaitable[str]],
+    compress: Callable[[tuple[Message, ...], str], Awaitable[str | None]],
+    persist: Callable[[tuple[Message, ...]], Awaitable[None]] = _noop_persist,
+    now: float,
+) -> tuple[ChildResult, Conversation, Conversation]:
+    """Run one closed, single-skill sub-task to completion.
+
+    Returns ``(the child's turn result, the child's own updated
+    Conversation, the parent's updated Conversation)`` — three values
+    with three different lifetimes, kept separate rather than folded into
+    one dataclass, the same call ``run_turn``'s own docstring already
+    made. ``parent.messages`` is never read from or written to beyond
+    this; the only difference between ``parent`` and the returned updated
+    parent is ``next_child_seq``. Raises ``ChildDepthExceeded`` before
+    anything else if the spawn would nest too deep; raises
+    ``SkillLoadError`` (via ``load_skill``) before anything else if
+    ``spec.skill`` doesn't resolve to a valid SKILL.md.
+
+    ``stable_prompt`` is a plain caller-supplied string, the same posture
+    ``create_conversation``'s ``system_message`` already has — this
+    module never discovers it from ``parent.template_name``, since
+    ``Conversation`` deliberately holds only the name, never the
+    template (C8's own design).
+    """
+    depth = _conversation_depth(parent.key) + 1
+    if depth > child_max_depth_from_config():
+        raise ChildDepthExceeded(f"spawning {spec.node_name!r} would reach depth {depth}")
+
+    seq = parent.next_child_seq
+    updated_parent = replace(parent, next_child_seq=seq + 1)
+    child_key = _child_key(parent.key, spec.node_name, seq)
+
+    skill_body = load_skill(spec.skill)
+    system_prompt = "\n\n".join(part for part in (stable_prompt, skill_body, _CHILD_TASK_FRAMING) if part)
+    tool_surface = filter_surface(parent.tool_surface, spec.tools)
+    prompt_sha256 = turn_prompt_hash(system_prompt, tool_surface)
+
+    child = Conversation(
+        key=child_key,
+        template_name=parent.template_name,
+        system_prompt=system_prompt,
+        prompt_sha256=prompt_sha256,
+        prompt_epoch=0,
+        tool_surface=tool_surface,
+        messages=(),
+        next_turn_seq=0,
+        iteration_budget=spec.budget if spec.budget is not None else child_iteration_budget_from_config(),
+        wall_clock_budget=parent.wall_clock_budget,
+    )
+
+    result, updated_child = await take_turn(
+        child,
+        user_input=spec.input,
+        provider=provider,
+        model=spec.model if spec.model is not None else model,
+        dispatch=dispatch,
+        compress=compress,
+        persist=persist,
+        now=now,
+    )
+    return result, updated_child, updated_parent
