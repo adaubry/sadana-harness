@@ -138,6 +138,22 @@ implement a different plan. A deviation you announce is a plan amendment; a
 deviation you hide is what `verification.md` will have to explain later, and
 by then it costs more.
 
+Once every numbered step is done: run `/ponytail-review` and `/simplify`
+against your own diff. Sort what comes back — worth taking now, a future
+work item's problem, or something `spec.md` already settled — and act on
+the first bucket in this same diff:
+
+- **Worth taking now** — it removes a bet, drops mutable state, or moves a
+  step off the common path. Apply it here.
+- **A future work item's problem** — it would change behaviour. Note it in
+  a sentence when you report the work; don't act on it now, and don't let
+  it expand this diff.
+- **Already settled** — it contradicts something `spec.md` § Rejected
+  alternatives already decided. One line noting the spec held, move on.
+
+Then run `make verify` and report both: what the self-check found and did,
+and the verify output.
+
 When the code is done, the Test stage takes over. That is a separate skill
 and a separate artifact.
 
@@ -148,4 +164,6 @@ and a separate artifact.
 - Read a whole reference block instead of the files that matter.
 - List files without their tests.
 - Claim "tests pass" as proof.
+- Report the work done without having run the self-check and `make
+  verify`, in that order.
 - Let the implementation drift back to something `spec.md` rejected.
