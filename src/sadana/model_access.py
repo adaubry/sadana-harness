@@ -17,11 +17,12 @@ registered but not wired; calling ``send()`` against it raises
 
 from __future__ import annotations
 
+import asyncio
 import importlib.util
 import os
 import sys
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -264,6 +265,32 @@ def send(request: Request) -> Outcome:
     return classify(status, body, attempt=request.attempt, max_retries=max_retries)
 
 
+async def resolve(
+    request: Request,
+) -> Response | NeedsCredentialOrProviderChange | NeedsContextCompression | Degenerate | Abort:
+    """Call `send()` for `request`, looping while it returns `Retry`, and
+    return the first non-`Retry` outcome. The shared mechanical retry loop
+    every caller of this module needs — CLAUDE.md: a retry loop over a
+    provider's `Retry` outcome lives once, here, never duplicated per
+    caller. Stays unaware of any caller's own exception types: each caller
+    translates the returned outcome itself.
+
+    `async`, wrapping each individual attempt in its own
+    `asyncio.to_thread` — not one call around the whole loop — so a
+    pending cancellation is still observable between attempts, the same
+    property the loop this replaced already had. Collapsing the bounded
+    retry sequence into a single thread-pool call would make a mid-turn
+    cancellation wait out every remaining attempt (each a real network
+    round trip) before it could be delivered."""
+    attempt = request.attempt
+    while True:
+        outcome = await asyncio.to_thread(send, replace(request, attempt=attempt))
+        if isinstance(outcome, Retry):
+            attempt = outcome.next_attempt
+            continue
+        return outcome
+
+
 # ── Context window ───────────────────────────────────────────────────────
 #
 # One static fact for the one model this work item wires — not hermes's
@@ -329,12 +356,31 @@ def _can_carry_cache_marker(message: dict) -> bool:
     return isinstance(content, str)
 
 
-def _eligible_trailing_indexes(messages: list[dict], count: int) -> list[int]:
-    """The last `count` non-system message indexes that can carry a marker,
-    walking backward and stopping as soon as enough are found — cost scales
-    with `count`, not with the conversation's total length."""
+def _system_message_index(messages: list[dict]) -> int | None:
+    """The index of the (first) message with role "system", or None. Never
+    *assumed* to be 0 — see `mark_cache_boundary`'s own history: locating
+    it by position instead of by role once silently lost the stable-prefix
+    marker whenever a caller's system message wasn't first. Checked first,
+    though: this module's one real caller always puts it there, so this
+    avoids a full scan on the path that actually runs today."""
+    if messages and messages[0].get("role") == "system":
+        return 0
+    for i, message in enumerate(messages):
+        if message.get("role") == "system":
+            return i
+    return None
+
+
+def _eligible_trailing_indexes(messages: list[dict], count: int, *, exclude: int | None) -> list[int]:
+    """The last `count` message indexes that can carry a marker, walking
+    backward and stopping as soon as enough are found — cost scales with
+    `count`, not with the conversation's total length. `exclude` (the
+    system message's own index, if any) is skipped rather than assumed to
+    sit at a fixed position."""
     found: list[int] = []
-    for i in range(len(messages) - 1, 0, -1):
+    for i in range(len(messages) - 1, -1, -1):
+        if i == exclude:
+            continue
         if _can_carry_cache_marker(messages[i]):
             found.append(i)
             if len(found) == count:
@@ -353,19 +399,9 @@ def mark_cache_boundary(messages: tuple[dict, ...], hint: CacheHint) -> tuple[di
 
     result = list(messages)
 
-    # ponytail: assumes result[0] is the system message (true for this
-    # module's one real caller, conversation.py's complete(), which always
-    # prepends it there) — _eligible_trailing_indexes mirrors this by
-    # starting its scan at index 1. A second caller handing this a list
-    # where the system message isn't first would silently lose the
-    # stable-prefix marker and let the real system message get picked up
-    # as a trailing-eligible one instead — a silent caching regression,
-    # not a crash. Upgrade path: locate the system message by role instead
-    # of by index, once a second caller exists to justify it. Deferred to
-    # the work item that closes the CONTEXT block (see
-    # docs/tasks/C10-context-lifecycle/review.md's Decision).
-    system = result[0]
-    if system.get("role") == "system":
+    system_index = _system_message_index(result)
+    if system_index is not None:
+        system = result[system_index]
         content = system.get("content")
         if isinstance(content, str) and 0 < hint.stable_prefix_len <= len(content):
             prefix = content[: hint.stable_prefix_len]
@@ -375,10 +411,10 @@ def mark_cache_boundary(messages: tuple[dict, ...], hint: CacheHint) -> tuple[di
                 # Non-empty suffix only: an empty second part puts an empty
                 # text block on the wire, which the API rejects.
                 parts.append({"type": "text", "text": suffix})
-            result[0] = {**system, "content": parts}
+            result[system_index] = {**system, "content": parts}
 
     if hint.trailing_marks > 0:
-        for idx in _eligible_trailing_indexes(result, hint.trailing_marks):
+        for idx in _eligible_trailing_indexes(result, hint.trailing_marks, exclude=system_index):
             message = result[idx]
             content = message.get("content")
             if isinstance(content, str):

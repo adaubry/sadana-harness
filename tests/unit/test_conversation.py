@@ -41,12 +41,14 @@ from sadana.conversation import (
     child_iteration_budget_from_config,
     child_max_depth_from_config,
     coalesce_tool_call_id,
+    compact,
     complete,
     consume_iteration,
     create_conversation,
     defer_invalidation,
     deterministic_call_id,
     filter_surface,
+    find_compaction_boundary,
     iteration_budget_from_config,
     load_skill,
     pending_tool_call_ids,
@@ -183,6 +185,70 @@ def test_repair_does_not_mutate_input() -> None:
     repaired = repair(messages)
     assert messages == original
     assert repaired is not messages
+
+
+# ── compaction: find_compaction_boundary / compact ───────────────────────
+
+
+def _user(content: str) -> Message:
+    return Message(role="user", content=content)
+
+
+@pytest.mark.unit
+def test_find_compaction_boundary_keeps_the_requested_tail_count() -> None:
+    messages = tuple(_user(str(i)) for i in range(10))
+    assert find_compaction_boundary(messages, keep_tail_count=3) == 7
+
+
+@pytest.mark.unit
+def test_find_compaction_boundary_returns_zero_when_history_is_already_short() -> None:
+    messages = tuple(_user(str(i)) for i in range(3))
+    assert find_compaction_boundary(messages, keep_tail_count=5) == 0
+
+
+@pytest.mark.unit
+def test_find_compaction_boundary_never_orphans_a_tool_row() -> None:
+    # A naive cut at len-keep_tail_count would land inside the tool group
+    # (right on the first tool result), stranding it without its assistant
+    # call. The real boundary must back up to the assistant message.
+    messages = (
+        _user("earlier"),
+        _assistant_call("call_1", "call_2"),
+        _tool_result("call_1"),
+        _tool_result("call_2"),
+        _user("later"),
+    )
+    boundary = find_compaction_boundary(messages, keep_tail_count=3)
+    assert boundary == 1
+    tail = messages[boundary:]
+    assert tail[0].role == "assistant" and tail[0].tool_calls
+
+
+@pytest.mark.unit
+def test_find_compaction_boundary_with_zero_tail_compacts_everything() -> None:
+    # keep_tail_count=0 means the naive cut lands exactly at len(messages) —
+    # an out-of-bounds index into messages[index] if not guarded.
+    messages = (_user("one"), _user("two"))
+    assert find_compaction_boundary(messages, keep_tail_count=0) == 2
+
+
+@pytest.mark.unit
+def test_compact_replaces_the_old_portion_with_one_summary_message() -> None:
+    messages = tuple(_user(str(i)) for i in range(5))
+    result = compact(messages, tail_start=3, summary_text="summary of 0-2")
+
+    assert len(result) == 3
+    assert result[0].is_summary is True
+    assert result[0].content == "summary of 0-2"
+    assert result[1:] == messages[3:]
+
+
+@pytest.mark.unit
+def test_compact_does_not_mutate_input() -> None:
+    messages = tuple(_user(str(i)) for i in range(5))
+    original = messages
+    compact(messages, tail_start=2, summary_text="s")
+    assert messages == original
 
 
 # ── tool surface ─────────────────────────────────────────────────────────
@@ -735,9 +801,19 @@ def test_run_turn_context_overflow_unhandled(monkeypatch: pytest.MonkeyPatch) ->
 
 
 @pytest.mark.unit
-def test_run_turn_context_overflow_retries_with_compressed_prompt(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_run_turn_context_overflow_recovers_via_real_compaction(monkeypatch: pytest.MonkeyPatch) -> None:
+    """End to end through the real context.turn_complete: a ContextOverflow
+    triggers a real second model call that summarizes the history, and the
+    turn then retries and completes — no monkeypatching of turn_complete
+    itself, since it's real behavior now, not a seam to stub."""
     surface = build_surface([_spec("noop", "noop")])
-    outcomes = iter([model_access.NeedsContextCompression("too big"), _text_response("ok now")])
+    outcomes = iter(
+        [
+            model_access.NeedsContextCompression("too big"),
+            _text_response("a summary of what happened"),  # the summarization call
+            _text_response("ok now"),  # the retried original turn
+        ]
+    )
     calls = []
 
     def fake_send(request: model_access.Request) -> model_access.Outcome:
@@ -745,20 +821,26 @@ def test_run_turn_context_overflow_retries_with_compressed_prompt(monkeypatch: p
         return next(outcomes)
 
     monkeypatch.setattr(model_access, "send", fake_send)
+    monkeypatch.setenv("SADANA_CONTEXT_COMPACTION_TAIL_MESSAGES", "0")
 
-    def fake_turn_complete(
-        state: ContextState, _messages: tuple[Message, ...], _system_prompt: str
-    ) -> tuple[ContextState, str | None]:
-        return state, "shorter prompt"
-
-    monkeypatch.setattr(context, "turn_complete", fake_turn_complete)
-
-    result, _messages, _budget, prompt = _run(surface)
+    result, messages, _budget, prompt = _run(surface)
 
     assert result.exit_reason == ExitReason.COMPLETED
     assert result.final_text == "ok now"
-    assert prompt == "shorter prompt"
-    assert len(calls) == 2
+    assert prompt == _SYSTEM_PROMPT  # compaction never touches system_prompt
+    # 2, not 3: turn_complete's own summarization call is a real third call
+    # to send() (proven by `calls` below), but it's internal to CONTEXT —
+    # run_turn's own model_calls counter only tracks the calls it directly
+    # makes (the failed attempt, and the successful retry).
+    assert result.model_calls == 2
+    assert len(calls) == 3
+    summaries = [m for m in messages if m.is_summary]
+    assert len(summaries) == 1
+    assert summaries[0].content == "a summary of what happened"
+    # turn_start_seq (captured in PROLOGUE, before compaction could shrink
+    # messages out from under it) is clamped — appended stays a valid,
+    # non-negative range rather than starting past its own end.
+    assert 0 <= result.appended.start <= result.appended.stop == len(messages)
 
 
 @pytest.mark.unit
@@ -814,6 +896,23 @@ def test_run_turn_invalid_tool_calls_all_invalid(monkeypatch: pytest.MonkeyPatch
 
     assert result.exit_reason == ExitReason.INVALID_TOOL_CALLS
     assert pending_tool_call_ids(messages) == frozenset()
+
+
+@pytest.mark.unit
+def test_run_turn_spills_an_oversized_invalid_tool_name_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Cold review caught that _append_invalid_results bypassed
+    after_tool_result entirely — an unbounded, model-supplied tool name
+    could be silently truncated with the rest lost, the exact thing
+    result-spilling exists to prevent. Fixed: this path now spills too."""
+    surface = build_surface([_spec("noop", "noop")])
+    monkeypatch.setattr(model_access, "send", lambda request: _tool_call_response("x" * 1000))
+    monkeypatch.setenv("SADANA_CONTEXT_RESULT_SPILL_CHARS", "50")
+
+    result, messages, _budget, _prompt = _run(surface)
+
+    assert result.exit_reason == ExitReason.INVALID_TOOL_CALLS
+    tool_messages = [m for m in messages if m.role == "tool"]
+    assert "full result saved to" in tool_messages[0].content
 
 
 @pytest.mark.unit
@@ -876,7 +975,7 @@ def test_run_turn_calls_after_tool_result_before_appending(monkeypatch: pytest.M
     outcomes = iter([_tool_call_response("noop"), _text_response("done")])
     monkeypatch.setattr(model_access, "send", lambda request: next(outcomes))
 
-    def fake_after_tool_result(_state: ContextState, result: Message) -> Message:
+    async def fake_after_tool_result(_state: ContextState, result: Message) -> Message:
         return dataclasses.replace(result, content=f"reshaped:{result.content}")
 
     monkeypatch.setattr(context, "after_tool_result", fake_after_tool_result)
@@ -902,6 +1001,53 @@ def test_run_turn_caps_oversized_tool_result(monkeypatch: pytest.MonkeyPatch) ->
     tool_messages = [m for m in messages if m.role == "tool"]
     assert len(tool_messages[0].content) < 1000
     assert "capped" in tool_messages[0].content
+
+
+@pytest.mark.unit
+def test_run_turn_spills_before_truncating_an_oversized_result(monkeypatch: pytest.MonkeyPatch) -> None:
+    """after_tool_result runs on the raw result before _cap_tool_result —
+    a result over the spill threshold gets a real reference, never a
+    truncated-and-lost 'capped' marker, even though it's also over the
+    (much lower) truncation cap."""
+    surface = build_surface([_spec("noop", "noop")])
+    outcomes = iter([_tool_call_response("noop"), _text_response("done")])
+    monkeypatch.setattr(model_access, "send", lambda request: next(outcomes))
+    monkeypatch.setenv("SADANA_CONTEXT_RESULT_SPILL_CHARS", "50")
+    # Truncation cap left at its high default — the reference note spilling
+    # leaves behind is far shorter than the raw 1000-char result, so it
+    # never needs the truncation cap's help; this is the case that proves
+    # spilling ran first.
+
+    async def big_dispatch(name: str, arguments: dict) -> str:
+        return "x" * 1000
+
+    result, messages, _budget, _prompt = _run(surface, dispatch=big_dispatch)
+
+    tool_messages = [m for m in messages if m.role == "tool"]
+    assert "full result saved to" in tool_messages[0].content
+    assert "capped" not in tool_messages[0].content
+
+
+@pytest.mark.unit
+def test_run_turn_truncates_when_under_the_spill_threshold(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A result under the spill threshold but over the truncation cap is
+    still truncated exactly as before spilling existed — the reordering
+    doesn't change this case."""
+    surface = build_surface([_spec("noop", "noop")])
+    outcomes = iter([_tool_call_response("noop"), _text_response("done")])
+    monkeypatch.setattr(model_access, "send", lambda request: next(outcomes))
+    monkeypatch.setenv("SADANA_CONVERSATION_TOOL_RESULT_CHARS", "50")
+    # Spill threshold left at its high default — well above the 1000-char
+    # result below, so after_tool_result stays identity.
+
+    async def big_dispatch(name: str, arguments: dict) -> str:
+        return "x" * 1000
+
+    result, messages, _budget, _prompt = _run(surface, dispatch=big_dispatch)
+
+    tool_messages = [m for m in messages if m.role == "tool"]
+    assert "capped" in tool_messages[0].content
+    assert "full result saved to" not in tool_messages[0].content
 
 
 @pytest.mark.unit
@@ -1156,18 +1302,24 @@ def test_take_turn_completed_updates_conversation(monkeypatch: pytest.MonkeyPatc
 
 
 @pytest.mark.unit
-def test_take_turn_compression_rotates_prompt_and_stays_self_consistent(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_take_turn_compaction_never_rotates_the_prompt_and_stays_self_consistent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Real compaction (C11) never touches system_prompt — unlike the old
+    injected compress() seam this replaced, there is no rotation, no epoch
+    bump. Proven end to end through the real context.turn_complete, not a
+    monkeypatched stand-in."""
     conversation, _t = create_conversation(_template(), "c1", "hi", iteration_budget=_budget())
+    monkeypatch.setenv("SADANA_CONTEXT_COMPACTION_TAIL_MESSAGES", "0")
 
-    outcomes = iter([model_access.NeedsContextCompression("too big"), _text_response("ok now")])
+    outcomes = iter(
+        [
+            model_access.NeedsContextCompression("too big"),
+            _text_response("a summary"),
+            _text_response("ok now"),
+        ]
+    )
     monkeypatch.setattr(model_access, "send", lambda request: next(outcomes))
-
-    def fake_turn_complete(
-        state: ContextState, _messages: tuple[Message, ...], _system_prompt: str
-    ) -> tuple[ContextState, str | None]:
-        return state, "a shorter prompt"
-
-    monkeypatch.setattr(context, "turn_complete", fake_turn_complete)
 
     result, updated = asyncio.run(
         take_turn(
@@ -1181,12 +1333,11 @@ def test_take_turn_compression_rotates_prompt_and_stays_self_consistent(monkeypa
     )
 
     assert result.exit_reason == ExitReason.COMPLETED
-    assert updated.prompt_epoch == 1
+    assert updated.prompt_epoch == 0
+    assert updated.system_prompt == conversation.system_prompt
     assert updated.prompt_sha256 == turn_prompt_hash(updated.system_prompt, updated.tool_surface)
+    assert any(m.is_summary for m in updated.messages)
 
-    # Second call's mocked `send` completes immediately — turn_complete is
-    # only ever invoked from the ContextOverflow branch, so it's never
-    # called again here; the patch above staying in place is inert.
     monkeypatch.setattr(model_access, "send", lambda request: _text_response("second reply"))
     result2, _updated2 = asyncio.run(
         take_turn(

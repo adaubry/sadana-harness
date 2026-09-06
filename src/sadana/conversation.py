@@ -56,6 +56,7 @@ class Message:
     content: str | None = None
     tool_calls: tuple[dict, ...] = ()
     tool_call_id: str | None = None  # only meaningful when role == "tool"
+    is_summary: bool = False  # True only for a message compact() produced
 
 
 class TranscriptInvariantError(Exception):
@@ -142,6 +143,36 @@ def repair(messages: tuple[Message, ...]) -> tuple[Message, ...]:
     for call_id in declared_order:
         repaired = repaired + (Message(role="tool", content=_REPAIR_MARKER, tool_call_id=call_id),)
     return repaired
+
+
+# ── C11: compaction ──────────────────────────────────────────────────────
+# Its full contract is `docs/tasks/C11-context-completion/spec.md`.
+
+
+def find_compaction_boundary(messages: tuple[Message, ...], keep_tail_count: int) -> int:
+    """The largest safe cut index: ``messages[index:]`` holds at least
+    ``keep_tail_count`` messages when the history is long enough, and never
+    starts on an orphaned ``tool`` row — walked backward past any leading
+    ``tool``-role messages, the same idiom ``pending_tool_call_ids``/
+    ``repair`` already use, so a compaction cut can never separate an
+    assistant message's ``tool_calls`` from any of its answers. Pure, no
+    I/O; trusted as-is by ``compact()``."""
+    index = max(0, len(messages) - keep_tail_count)
+    while 0 < index < len(messages) and messages[index].role == "tool":
+        index -= 1
+    return index
+
+
+def compact(messages: tuple[Message, ...], tail_start: int, summary_text: str) -> tuple[Message, ...]:
+    """The one sanctioned way to replace, rather than grow, a
+    conversation's history — CLAUDE.md: mutated only through
+    ``append``/``repair``/``compact``. Used once, when CONTEXT decides an
+    oversized conversation needs shortening. ``tail_start`` must already be
+    a safe boundary (never inside a tool_calls group) — get one from
+    ``find_compaction_boundary``, never compute it ad hoc; this function
+    trusts it rather than re-validating shape it didn't produce, the same
+    posture ``append`` already has toward a caller-supplied ``Message``."""
+    return (Message(role="user", content=summary_text, is_summary=True),) + messages[tail_start:]
 
 
 # ── CONV-02: tool surface ────────────────────────────────────────────────
@@ -509,42 +540,37 @@ async def complete(
 ) -> Completion:
     """Ask a model for a response. Retries a transient failure
     transparently — the caller never sees ``model_access.Retry`` — and
-    raises exactly one of two named failures otherwise. No retry cap of
-    its own: ``model_access.classify()`` already enforces
+    raises exactly one of two named failures otherwise. Retrying itself is
+    ``model_access.resolve()``'s job now, not this function's own loop —
+    CLAUDE.md: a retry loop over a provider's ``Retry`` outcome lives once,
+    in MODEL-ACCESS, never duplicated per caller. No retry cap of its own:
+    ``model_access.classify()`` already enforces
     ``SADANA_MODEL_ACCESS_MAX_RETRIES`` and returns ``Abort`` once
-    exceeded, so this loop's termination is already guaranteed.
+    exceeded, so ``resolve()``'s own termination is already guaranteed.
 
     ``cache_hint``, when given, is applied to the wire messages via
-    ``model_access.mark_cache_boundary`` before every attempt this call
-    makes — including a retry, so a retried attempt still carries the
-    marker."""
+    ``model_access.mark_cache_boundary`` before the request is built —
+    including a retry, so a retried attempt still carries the marker."""
     request_messages = ({"role": "system", "content": system},) + messages
     if cache_hint is not None:
         request_messages = model_access.mark_cache_boundary(request_messages, cache_hint)
-    attempt = 0
-    while True:
-        request = model_access.Request(
-            messages=request_messages, provider=provider, model=model, tools=tools, attempt=attempt
-        )
-        outcome = await asyncio.to_thread(model_access.send, request)
+    request = model_access.Request(messages=request_messages, provider=provider, model=model, tools=tools)
+    outcome = await model_access.resolve(request)
 
-        if isinstance(outcome, model_access.Retry):
-            attempt = outcome.next_attempt
-            continue
-        if isinstance(outcome, model_access.NeedsContextCompression):
-            raise ContextOverflow(outcome.detail)
-        if isinstance(
-            outcome,
-            model_access.NeedsCredentialOrProviderChange | model_access.Abort | model_access.Degenerate,
-        ):
-            raise ProviderFailure(outcome.detail)
+    if isinstance(outcome, model_access.NeedsContextCompression):
+        raise ContextOverflow(outcome.detail)
+    if isinstance(
+        outcome,
+        model_access.NeedsCredentialOrProviderChange | model_access.Abort | model_access.Degenerate,
+    ):
+        raise ProviderFailure(outcome.detail)
 
-        return Completion(
-            content=outcome.content,
-            tool_calls=_resolve_tool_calls(outcome.tool_calls),
-            finish_reason=outcome.finish_reason,
-            usage=outcome.usage,
-        )
+    return Completion(
+        content=outcome.content,
+        tool_calls=_resolve_tool_calls(outcome.tool_calls),
+        finish_reason=outcome.finish_reason,
+        usage=outcome.usage,
+    )
 
 
 # ── CONV-05: turn loop ───────────────────────────────────────────────────
@@ -672,22 +698,32 @@ def _cap_tool_result(text: str, turn_chars_used: int, result_cap: int, turn_cap:
     return text, turn_chars_used + len(text)
 
 
-def _append_invalid_results(
+async def _append_invalid_results(
     conversation: ConversationKey,
     messages: tuple[Message, ...],
     invalid: tuple[dict, ...],
     turn_chars_used: int,
     result_cap: int,
     turn_cap: int,
+    context_state: context.ContextState,
 ) -> tuple[tuple[Message, ...], int]:
     """Append a capped ``tool_error`` result for each invalid call — shared
     by both TOOL_ROUND branches (the all-invalid exit and the mixed
-    continue), the same logic rather than two copies to keep in sync."""
+    continue), the same logic rather than two copies to keep in sync.
+
+    Routes through ``context.after_tool_result`` first, same as the valid-
+    dispatch loop: ``tc["name"]`` is model-supplied and not bounded by
+    anything here, so this content is just as eligible for spilling as a
+    real dispatch result — cold review caught that this path bypassed the
+    checkpoint entirely, a real gap against requirement 2 (never silently
+    truncated with the rest permanently lost)."""
     for tc in invalid:
-        error_text, turn_chars_used = _cap_tool_result(
-            f"tool_error: unknown tool {tc['name']!r}", turn_chars_used, result_cap, turn_cap
+        raw = Message(role="tool", tool_call_id=tc["id"], content=f"tool_error: unknown tool {tc['name']!r}")
+        tool_result = await context.after_tool_result(context_state, raw)
+        capped_text, turn_chars_used = _cap_tool_result(
+            tool_result.content or "", turn_chars_used, result_cap, turn_cap
         )
-        messages, _ = append(conversation, messages, Message(role="tool", tool_call_id=tc["id"], content=error_text))
+        messages, _ = append(conversation, messages, replace(tool_result, content=capped_text))
     return messages, turn_chars_used
 
 
@@ -779,12 +815,23 @@ async def run_turn(
                 )
             except ContextOverflow as e:
                 model_calls += 1
-                context_state, new_prompt = context.turn_complete(context_state, messages, system_prompt)
-                if new_prompt is None:
+                tail_start = find_compaction_boundary(messages, context.compaction_tail_messages_from_config())
+                turn_complete_result = await context.turn_complete(
+                    context_state, messages, system_prompt, tail_start, provider, model
+                )
+                context_state = turn_complete_result.context_state
+                handled = False
+                if turn_complete_result.new_summary_text is not None:
+                    messages = compact(messages, tail_start, turn_complete_result.new_summary_text)
+                    turn_start_seq = min(turn_start_seq, len(messages))
+                    handled = True
+                if turn_complete_result.new_system_prompt is not None:
+                    system_prompt = turn_complete_result.new_system_prompt
+                    handled = True
+                if not handled:
                     exit_reason = ExitReason.CONTEXT_OVERFLOW_UNHANDLED
                     detail = str(e)
                     break
-                system_prompt = new_prompt
                 continue
             except ProviderFailure as e:
                 model_calls += 1
@@ -814,8 +861,8 @@ async def run_turn(
                     messages,
                     Message(role="assistant", content=completion.content, tool_calls=deduped),
                 )
-                messages, turn_chars_used = _append_invalid_results(
-                    conversation, messages, invalid, turn_chars_used, result_cap, turn_cap
+                messages, turn_chars_used = await _append_invalid_results(
+                    conversation, messages, invalid, turn_chars_used, result_cap, turn_cap, context_state
                 )
                 exit_reason = ExitReason.INVALID_TOOL_CALLS
                 detail = f"no valid tool call in a batch of {len(deduped)}"
@@ -833,8 +880,8 @@ async def run_turn(
                 detail = str(e)
                 break
 
-            messages, turn_chars_used = _append_invalid_results(
-                conversation, messages, invalid, turn_chars_used, result_cap, turn_cap
+            messages, turn_chars_used = await _append_invalid_results(
+                conversation, messages, invalid, turn_chars_used, result_cap, turn_cap, context_state
             )
 
             for tc in valid:
@@ -843,11 +890,19 @@ async def run_turn(
                     result_text = str(raw_result)
                 except Exception as e:
                     result_text = f"tool_error: {e}"
-                result_text, turn_chars_used = _cap_tool_result(result_text, turn_chars_used, result_cap, turn_cap)
-                tool_result = context.after_tool_result(
+                # after_tool_result runs on the raw result first (it may
+                # spill an oversized one to disk, leaving a short
+                # reference) — _cap_tool_result is the final safety-net
+                # cap on whatever it decided to leave in context, not the
+                # other way around: capping first would truncate the very
+                # data spilling exists to preserve.
+                tool_result = await context.after_tool_result(
                     context_state, Message(role="tool", tool_call_id=tc["id"], content=result_text)
                 )
-                messages, _ = append(conversation, messages, tool_result)
+                capped_text, turn_chars_used = _cap_tool_result(
+                    tool_result.content or "", turn_chars_used, result_cap, turn_cap
+                )
+                messages, _ = append(conversation, messages, replace(tool_result, content=capped_text))
             # loop back to MODEL_CALL
     except asyncio.CancelledError:
         exit_reason = ExitReason.INTERRUPTED

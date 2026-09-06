@@ -2,35 +2,36 @@
 ``docs/tasks/B2-cycle-contract/spec.md`` fixed, called only by CONVERSATION,
 never given a reference to its caller's loop state.
 
-Two of the four have real behavior here (this work item's own scope, see
-``docs/tasks/C10-context-lifecycle/spec.md``): ``after_response`` accumulates
-usage into ``ContextState``; ``before_send`` decides the cache-boundary hint
-(what actually lands on the wire is MODEL-ACCESS's job, not this module's —
-see CLAUDE.md's rule on provider wire-format knowledge). ``after_tool_result``
-and ``turn_complete`` are real call sites that stay honest no-ops (identity /
-``None``) — real result-spilling and real compaction are named follow-up
-work, not built here.
+All four have real behavior now. C10 (`docs/tasks/C10-context-lifecycle/spec.md`)
+built ``after_response`` (usage accounting) and ``before_send`` (the
+cache-boundary hint — what actually lands on the wire is MODEL-ACCESS's job,
+not this module's, per CLAUDE.md's rule on provider wire-format knowledge).
+C11 (`docs/tasks/C11-context-completion/spec.md`) builds the other two:
+``turn_complete`` performs real compaction (a genuine second model call
+summarizing the portion of history being dropped), and ``after_tool_result``
+spills an oversized tool result to disk, leaving a short reference behind.
 
 Only ``after_response`` and ``turn_complete`` may write ``ContextState``, per
 B2's own rule: an aborted turn cannot drift the accounting, and a retry that
 calls ``before_send`` twice in one turn cannot double-count anything, because
 ``before_send`` never writes.
 
-No runtime import of ``conversation.py`` or ``model_access.py`` — ``Message``
-and ``Usage`` are referenced only under ``TYPE_CHECKING``, so nothing here
-ever risks an import cycle with either module.
-"""
+No runtime import of ``conversation.py`` — ``Message`` is referenced only
+under ``TYPE_CHECKING``, so nothing here ever risks a cycle with it (it
+imports this module). ``model_access`` and the new ``result_spill`` module
+are real, non-cyclic dependencies: neither imports ``context.py`` or
+``conversation.py`` back."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import asyncio
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
 
-from sadana import config
+from sadana import config, model_access, result_spill
 
 if TYPE_CHECKING:
     from sadana.conversation import Message
-    from sadana.model_access import Usage
 
 
 @dataclass(frozen=True)
@@ -51,6 +52,25 @@ class CacheHint:
 
     stable_prefix_len: int
     trailing_marks: int
+
+
+@dataclass(frozen=True)
+class TurnCompleteResult:
+    """``turn_complete``'s return value. Both fields are independently
+    optional, on purpose — a system-prompt rewrite and a history
+    compaction are decoupled mechanisms with different lifecycles (every
+    production harness checked keeps them separate), not a forced either/or.
+    Both ``None`` carries the same meaning the removed callback's bare
+    ``None`` already had: "not compressed". ``new_system_prompt`` stays
+    unused by this module's own real behavior — compaction never touches
+    the system prompt — but the field exists so a real future need for it
+    doesn't reopen this type a second time; `rotate_prompt()`/
+    `PromptRotationReason` (C7/C8) stay real, available machinery for
+    exactly that case."""
+
+    context_state: ContextState
+    new_system_prompt: str | None = None
+    new_summary_text: str | None = None
 
 
 def trailing_marks_from_config() -> int:
@@ -91,7 +111,7 @@ def before_send(history: tuple[Message, ...], stable_prompt_len: int) -> CacheHi
     return CacheHint(stable_prefix_len=stable_prompt_len, trailing_marks=trailing_marks_from_config())
 
 
-def after_response(state: ContextState, usage: Usage) -> ContextState:
+def after_response(state: ContextState, usage: model_access.Usage) -> ContextState:
     """Folds one completed exchange's real usage figures into the running
     total. The only checkpoint, besides ``turn_complete``, allowed to
     write ``ContextState``."""
@@ -101,20 +121,113 @@ def after_response(state: ContextState, usage: Usage) -> ContextState:
     )
 
 
-def after_tool_result(state: ContextState, result: Message) -> Message:
-    """Identity today. Real call site for a future result-spilling item —
-    named as a non-goal of this one, not built here."""
+def result_spill_threshold_from_config() -> int:
+    """The char count above which a tool result gets spilled to disk
+    instead of kept inline. Defaults to the same 100,000 chars
+    `SADANA_CONVERSATION_TOOL_RESULT_CHARS` already defaults to, so
+    spilling handles everything that would otherwise be silently
+    truncated — that cap becomes a pure safety net once this exists."""
+    return config.env_int("SADANA_CONTEXT_RESULT_SPILL_CHARS", 100_000)
+
+
+async def after_tool_result(state: ContextState, result: Message) -> Message:
+    """Identity at or under the spill threshold. Above it, the full
+    result is saved to disk (`result_spill.write_and_reference`,
+    `asyncio.to_thread`-wrapped — matches `conversation_store.py`'s own
+    precedent for wrapping even local disk I/O) and replaced with a short
+    reference. ``state`` isn't read or written — spilling isn't part of
+    the running account `after_response`/`turn_complete` keep."""
     del state
-    return result
+    content = result.content or ""
+    if len(content) <= result_spill_threshold_from_config():
+        return result
+    reference = await asyncio.to_thread(result_spill.write_and_reference, result.tool_call_id or "result", content)
+    # dataclasses.replace on an EXISTING Message needs no import of the
+    # class itself, unlike constructing a brand-new one (see
+    # turn_complete's own docstring on why it never does that).
+    return replace(result, content=reference)
 
 
-def turn_complete(
+def compaction_tail_messages_from_config() -> int:
+    """How many of the most recent messages a compaction event must never
+    touch. The one policy number this checkpoint owns, matching
+    `trailing_marks_from_config()`'s own precedent — the *mechanics* of
+    finding a safe cut at or before this many messages back is
+    CONVERSATION's job (`find_compaction_boundary`), not this module's."""
+    return config.env_int("SADANA_CONTEXT_COMPACTION_TAIL_MESSAGES", 10)
+
+
+def _render_for_summary(message: Message) -> str:
+    """One line of plain text for one message, for a summarization
+    prompt only — never stored, never shown to a user, just what the
+    summarizing model reads."""
+    line = f"{message.role}: {message.content or ''}"
+    for call in message.tool_calls:
+        fn = call.get("function") or {}
+        line += f" [called {fn.get('name', '?')}]"
+    return line
+
+
+def _build_summarization_prompt(old_portion: tuple[Message, ...], system_prompt: str) -> str:
+    """Two framings, not one: refining an existing summary is a different
+    ask than summarizing raw conversation for the first time — asking a
+    model to "summarize" its own prior summary as if it were fresh
+    conversation is exactly the summary-of-a-summary degradation this
+    checkpoint exists to avoid (spec.md's own reference-corpus finding)."""
+    refining = bool(old_portion) and old_portion[0].is_summary
+    rendered = "\n".join(_render_for_summary(m) for m in old_portion)
+    if refining:
+        instruction = (
+            "The first entry below is your own summary of an even-earlier part "
+            "of this conversation. Produce an updated summary that folds in "
+            "everything that happened since, without re-describing what the "
+            "existing summary already covers as if it were new."
+        )
+    else:
+        instruction = (
+            "Summarize the conversation below so it can continue without this "
+            "part in view. Keep what's still relevant to finishing the task; "
+            "drop what's resolved or no longer needed."
+        )
+    return (
+        f"{instruction}\n\n"
+        f"Conversation context (system prompt): {system_prompt}\n\n"
+        f"--- conversation to summarize ---\n{rendered}\n--- end ---"
+    )
+
+
+async def turn_complete(
     state: ContextState,
     history: tuple[Message, ...],
     system_prompt: str,
-) -> tuple[ContextState, str | None]:
-    """``None`` today carries the same meaning the removed ``compress``
-    callback's ``None`` already had: "not compressed". Real compaction is a
-    named non-goal of this work item, not built here."""
-    del history, system_prompt
-    return state, None
+    tail_start: int,
+    provider: str,
+    model: str,
+) -> TurnCompleteResult:
+    """Real compaction: summarizes `history[:tail_start]` via a genuine
+    second model call — B2's own framing, "just another caller of
+    `send()`". `tail_start` is a boundary CONVERSATION's own
+    `find_compaction_boundary` already computed; this function trusts it
+    and never decides where it is safe to cut.
+
+    Returns `new_summary_text=None` (both fields `None`, since compaction
+    never touches `system_prompt`) on any failure — an empty-content
+    response, or any outcome besides a real `Response` — leaving the
+    conversation unhandled exactly as today, with no static fallback
+    summary (spec.md's own Rejected alternatives: this project's scale
+    doesn't justify a second, non-LLM compaction mechanism yet).
+
+    Never constructs a `Message` — returns plain text; `conversation.py`'s
+    own `compact()` builds the actual summary message, so this module
+    never needs a real, cycle-creating import of `Message`."""
+    old_portion = history[:tail_start]
+    if not old_portion:
+        return TurnCompleteResult(context_state=state)
+
+    prompt = _build_summarization_prompt(old_portion, system_prompt)
+    request = model_access.Request(messages=({"role": "user", "content": prompt},), provider=provider, model=model)
+    outcome = await model_access.resolve(request)
+
+    if not isinstance(outcome, model_access.Response) or not outcome.content:
+        return TurnCompleteResult(context_state=state)
+    return TurnCompleteResult(context_state=state, new_summary_text=outcome.content)

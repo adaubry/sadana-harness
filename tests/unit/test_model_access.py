@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
 from sadana import model_access
@@ -23,6 +25,7 @@ from sadana.model_access import (
     list_providers,
     mark_cache_boundary,
     register_provider,
+    resolve,
     send,
 )
 
@@ -385,3 +388,126 @@ def test_mark_cache_boundary_never_mutates_input() -> None:
 @pytest.mark.unit
 def test_mark_cache_boundary_empty_messages_is_a_no_op() -> None:
     assert mark_cache_boundary((), CacheHint(stable_prefix_len=0, trailing_marks=1)) == ()
+
+
+@pytest.mark.unit
+def test_mark_cache_boundary_finds_system_message_not_at_index_zero() -> None:
+    messages = (
+        {"role": "user", "content": "hi"},
+        {"role": "system", "content": "stable part" + "volatile"},
+    )
+    hint = CacheHint(stable_prefix_len=len("stable part"), trailing_marks=0)
+
+    marked = mark_cache_boundary(messages, hint)
+
+    assert marked[0] == messages[0]
+    assert marked[1]["content"] == [
+        {"type": "text", "text": "stable part", "cache_control": {"type": "ephemeral"}},
+        {"type": "text", "text": "volatile"},
+    ]
+
+
+@pytest.mark.unit
+def test_mark_cache_boundary_excludes_system_message_from_trailing_marks() -> None:
+    messages = (
+        {"role": "user", "content": "one"},
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "two"},
+    )
+    hint = CacheHint(stable_prefix_len=0, trailing_marks=5)
+
+    marked = mark_cache_boundary(messages, hint)
+
+    # The system message never receives a trailing mark, however large the
+    # budget — only the two real non-system messages do.
+    assert marked[0]["content"] == [{"type": "text", "text": "one", "cache_control": {"type": "ephemeral"}}]
+    assert marked[1]["content"] == "sys"
+    assert marked[2]["content"] == [{"type": "text", "text": "two", "cache_control": {"type": "ephemeral"}}]
+
+
+@pytest.mark.unit
+def test_mark_cache_boundary_with_no_system_message_marks_only_trailing() -> None:
+    messages = ({"role": "user", "content": "one"}, {"role": "user", "content": "two"})
+    hint = CacheHint(stable_prefix_len=5, trailing_marks=1)
+
+    marked = mark_cache_boundary(messages, hint)
+
+    assert marked[0] == messages[0]
+    assert marked[1]["content"] == [{"type": "text", "text": "two", "cache_control": {"type": "ephemeral"}}]
+
+
+# ── resolve() ─────────────────────────────────────────────────────────────
+
+
+@pytest.mark.unit
+def test_resolve_retries_transparently_and_returns_final_response(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[int] = []
+
+    def fake_send(request: Request) -> model_access.Outcome:
+        calls.append(request.attempt)
+        if len(calls) < 3:
+            return Retry(next_attempt=len(calls))
+        return Response(content="ok", tool_calls=(), finish_reason="stop", usage=model_access.Usage())
+
+    monkeypatch.setattr(model_access, "send", fake_send)
+    request = Request(messages=(), provider="p", model="m")
+
+    outcome = asyncio.run(resolve(request))
+
+    assert isinstance(outcome, Response)
+    assert outcome.content == "ok"
+    assert calls == [0, 1, 2]
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "final_outcome",
+    [
+        NeedsCredentialOrProviderChange("no key"),
+        NeedsContextCompression("too big"),
+        Degenerate("empty"),
+        Abort("gave up"),
+    ],
+)
+def test_resolve_returns_each_non_retry_outcome_unchanged(
+    monkeypatch: pytest.MonkeyPatch, final_outcome: model_access.Outcome
+) -> None:
+    monkeypatch.setattr(model_access, "send", lambda request: final_outcome)
+    outcome = asyncio.run(resolve(Request(messages=(), provider="p", model="m")))
+    assert outcome is final_outcome
+
+
+@pytest.mark.unit
+def test_resolve_is_cancellable_between_attempts(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Cold review caught that collapsing the retry loop into one
+    asyncio.to_thread call around the whole sequence (instead of one per
+    attempt) would make a mid-turn cancellation wait out every remaining
+    attempt before it could be delivered, since the background thread
+    running the whole loop can't be stopped once dispatched. Proof: after
+    cancellation, no further attempt is ever dispatched — not just that
+    the coroutine eventually raises CancelledError, which a single
+    giant to_thread call would also do without actually stopping."""
+    import time
+
+    attempts_started: list[int] = []
+
+    def fake_send(request: Request) -> model_access.Outcome:
+        attempts_started.append(request.attempt)
+        time.sleep(0.02)  # real, measurable per-attempt cost
+        return Retry(next_attempt=request.attempt + 1)  # retries forever unless cancelled
+
+    monkeypatch.setattr(model_access, "send", fake_send)
+
+    async def scenario() -> None:
+        task = asyncio.ensure_future(resolve(Request(messages=(), provider="p", model="m")))
+        await asyncio.sleep(0.05)  # real, short sleep: lets a couple of attempts run
+        task.cancel()
+        await task
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(scenario())
+
+    count_at_cancel = len(attempts_started)
+    assert count_at_cancel > 0  # at least one real attempt happened before cancellation
+    time.sleep(0.1)  # plenty of time for a leaked background loop to keep going, if one existed
+    assert len(attempts_started) == count_at_cancel  # no further attempt was ever dispatched
