@@ -24,13 +24,13 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
+from sadana import model_access  # noqa: E402
 from sadana.conversation import (  # noqa: E402
     ChildSpec,
     Conversation,
     ConversationTemplate,
     ExitReason,
     IterationBudget,
-    Message,
     PluginCatalogEntry,
     SkillRef,
     TemplateRecipe,
@@ -50,10 +50,6 @@ STABLE_PROMPT = (
 _ACK_MARKER = "ACKNOWLEDGED"
 
 FIXTURES_ROOT = Path(__file__).resolve().parent.parent / "tests" / "fixtures" / "plugins"
-
-
-async def _compress(_messages: tuple[Message, ...], _system_prompt: str) -> str | None:
-    return None  # compression isn't built yet (out of this block's scope); never triggered by these short turns.
 
 
 def _tool_specs() -> tuple[ToolSpec, ...]:
@@ -154,7 +150,6 @@ async def main() -> None:
                 provider=PROVIDER,
                 model=MODEL,
                 dispatch=dispatch,
-                compress=_compress,
                 now=now,
             )
             next_child_seq = updated_parent.next_child_seq
@@ -187,7 +182,6 @@ async def main() -> None:
                 provider=PROVIDER,
                 model=MODEL,
                 dispatch=dispatch,
-                compress=_compress,
                 now=now,
             )
             next_child_seq = updated_parent.next_child_seq
@@ -202,6 +196,19 @@ async def main() -> None:
     initial_hash = conversation.prompt_sha256
     print(f"initial prompt_sha256={initial_hash}")
 
+    # C10-context-lifecycle's own acceptance criterion: a real OpenRouter
+    # request body must actually carry cache_control on the system
+    # message's stable prefix. Wraps the real send() once, for turn 1 only,
+    # to capture the exact wire request without faking anything about it.
+    real_send = model_access.send
+    captured_requests: list[model_access.Request] = []
+
+    def _capturing_send(request: model_access.Request) -> model_access.Outcome:
+        captured_requests.append(request)
+        return real_send(request)
+
+    model_access.send = _capturing_send
+
     print("\n=== turn 1: plain exchange, no plugin ===")
     result1, conversation = await take_turn(
         conversation,
@@ -209,14 +216,24 @@ async def main() -> None:
         provider=PROVIDER,
         model=MODEL,
         dispatch=dispatch,
-        compress=_compress,
         now=0.0,
     )
+    model_access.send = real_send
     conversation = replace(conversation, next_child_seq=next_child_seq)
     print(f"exit_reason={result1.exit_reason} final_text={result1.final_text!r}")
     assert result1.exit_reason == ExitReason.COMPLETED, f"turn 1: expected COMPLETED, got {result1.exit_reason}"
     assert conversation.prompt_sha256 == initial_hash, "prompt_sha256 drifted after turn 1"
     print("[ok] turn 1 completed; prompt_sha256 unchanged")
+
+    system_message = captured_requests[0].messages[0]
+    print(f"    turn 1 real request system message content: {system_message['content']!r}")
+    assert isinstance(
+        system_message["content"], list
+    ), "expected the system message to be cache-marked (a list of parts)"
+    assert any(
+        isinstance(part, dict) and "cache_control" in part for part in system_message["content"]
+    ), "expected at least one cache_control marker on the real system message"
+    print("[ok] turn 1's real request body carries a cache_control marker on the system message")
 
     print("\n=== turn 2: plugin-a ===")
     result2, conversation = await take_turn(
@@ -225,7 +242,6 @@ async def main() -> None:
         provider=PROVIDER,
         model=MODEL,
         dispatch=dispatch,
-        compress=_compress,
         now=0.0,
     )
     conversation = replace(conversation, next_child_seq=next_child_seq)
@@ -241,7 +257,6 @@ async def main() -> None:
         provider=PROVIDER,
         model=MODEL,
         dispatch=dispatch,
-        compress=_compress,
         now=0.0,
     )
     conversation = replace(conversation, next_child_seq=next_child_seq)
@@ -260,7 +275,6 @@ async def main() -> None:
         provider=PROVIDER,
         model=MODEL,
         dispatch=dispatch,
-        compress=_compress,
         now=0.0,
     )
     conversation = replace(conversation, next_child_seq=next_child_seq)

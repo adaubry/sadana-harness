@@ -23,8 +23,12 @@ import sys
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from sadana import config
+
+if TYPE_CHECKING:
+    from sadana.context import CacheHint
 
 # (http_status, parsed_json_body). ``http_status`` is ``None`` for a
 # transport-level failure (timeout, connection error) that never reached a
@@ -279,3 +283,109 @@ _CONTEXT_WINDOWS: dict[tuple[str, str], int] = {
 
 def context_window(provider: str, model: str) -> int:
     return _CONTEXT_WINDOWS[(provider, model)]
+
+
+# ── Cache boundary ────────────────────────────────────────────────────────
+#
+# CLAUDE.md: provider-specific wire-format knowledge — what a given
+# transport's request shape accepts or silently drops — lives here, never in
+# CONTEXT or CONVERSATION. CONTEXT's `before_send` decides *whether and how
+# much*; this decides *how it looks on the wire* for the one route this
+# project actually has (OpenRouter, an envelope-style route whose
+# OpenAI-compatible request shape accepts a vendor `cache_control` extension
+# on a content-part dict — see `docs/tasks/C10-context-lifecycle/spec.md`'s
+# "What the reference corpus showed").
+#
+# A much smaller version of hermes's own `agent/prompt_caching.py`
+# `apply_anthropic_cache_control`: no 4-way breakpoint-budget arithmetic, no
+# native-Anthropic/LiteLLM/Alibaba branching, no TTL clamp table — this
+# project has exactly one provider and marks at most two spots, never
+# contending for a shared marker budget. Request-local and idempotent in the
+# same spirit as the reference: never mutates the caller's message dicts,
+# always returns a new tuple.
+
+_CACHE_MARKER = {"type": "ephemeral"}
+
+
+def _marked_text(text: str) -> dict:
+    """One text content-part carrying a fresh cache marker. A fresh
+    `dict(_CACHE_MARKER)` copy per part, never the shared module-level
+    dict by reference — two marked parts must never alias the same
+    mutable object."""
+    return {"type": "text", "text": text, "cache_control": dict(_CACHE_MARKER)}
+
+
+def _can_carry_cache_marker(message: dict) -> bool:
+    """True if a marker on this message's content is actually honored on the
+    wire, not silently dropped. Mirrors hermes's own `_can_carry_marker`
+    check, narrowed to the one route this project has: empty content (a
+    pure-tool_calls assistant turn, an empty tool result) never carries a
+    marker there, so placing one would silently waste it."""
+    content = message.get("content")
+    if not content:
+        return False
+    if isinstance(content, list):
+        return isinstance(content[-1], dict)
+    return isinstance(content, str)
+
+
+def _eligible_trailing_indexes(messages: list[dict], count: int) -> list[int]:
+    """The last `count` non-system message indexes that can carry a marker,
+    walking backward and stopping as soon as enough are found — cost scales
+    with `count`, not with the conversation's total length."""
+    found: list[int] = []
+    for i in range(len(messages) - 1, 0, -1):
+        if _can_carry_cache_marker(messages[i]):
+            found.append(i)
+            if len(found) == count:
+                break
+    found.reverse()
+    return found
+
+
+def mark_cache_boundary(messages: tuple[dict, ...], hint: CacheHint) -> tuple[dict, ...]:
+    """Return a new tuple of wire-format message dicts carrying
+    `cache_control` markers at `hint`'s boundary — the system message's
+    stable prefix, and the last `hint.trailing_marks` eligible non-system
+    messages. Never mutates `messages` or any dict inside it."""
+    if not messages:
+        return messages
+
+    result = list(messages)
+
+    # ponytail: assumes result[0] is the system message (true for this
+    # module's one real caller, conversation.py's complete(), which always
+    # prepends it there) — _eligible_trailing_indexes mirrors this by
+    # starting its scan at index 1. A second caller handing this a list
+    # where the system message isn't first would silently lose the
+    # stable-prefix marker and let the real system message get picked up
+    # as a trailing-eligible one instead — a silent caching regression,
+    # not a crash. Upgrade path: locate the system message by role instead
+    # of by index, once a second caller exists to justify it. Deferred to
+    # the work item that closes the CONTEXT block (see
+    # docs/tasks/C10-context-lifecycle/review.md's Decision).
+    system = result[0]
+    if system.get("role") == "system":
+        content = system.get("content")
+        if isinstance(content, str) and 0 < hint.stable_prefix_len <= len(content):
+            prefix = content[: hint.stable_prefix_len]
+            suffix = content[hint.stable_prefix_len :]
+            parts = [_marked_text(prefix)]
+            if suffix:
+                # Non-empty suffix only: an empty second part puts an empty
+                # text block on the wire, which the API rejects.
+                parts.append({"type": "text", "text": suffix})
+            result[0] = {**system, "content": parts}
+
+    if hint.trailing_marks > 0:
+        for idx in _eligible_trailing_indexes(result, hint.trailing_marks):
+            message = result[idx]
+            content = message.get("content")
+            if isinstance(content, str):
+                result[idx] = {**message, "content": [_marked_text(content)]}
+            elif isinstance(content, list):
+                new_content = list(content)
+                new_content[-1] = {**new_content[-1], "cache_control": dict(_CACHE_MARKER)}
+                result[idx] = {**message, "content": new_content}
+
+    return tuple(result)

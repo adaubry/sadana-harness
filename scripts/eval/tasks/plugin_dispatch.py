@@ -59,10 +59,6 @@ _TASK_KEY = "eval/plugin_dispatch/0"
 FIXTURES_ROOT = Path(__file__).resolve().parent.parent.parent.parent / "tests" / "fixtures" / "plugins"
 
 
-async def _compress_noop(_messages: tuple[Message, ...], _system_prompt: str) -> str | None:
-    return None
-
-
 def build_template() -> ConversationTemplate:
     recipe = TemplateRecipe(
         stable_prompt=STABLE_PROMPT,
@@ -112,7 +108,6 @@ def make_dispatch(parent: Conversation) -> Callable[[str, dict], Awaitable[str]]
             provider=PROVIDER,
             model=MODEL,
             dispatch=dispatch,
-            compress=_compress_noop,
             now=0.0,
         )
 

@@ -9,7 +9,8 @@ from pathlib import Path
 
 import pytest
 
-from sadana import model_access
+from sadana import context, model_access
+from sadana.context import CacheHint, ContextState
 from sadana.conversation import (
     ChildDepthExceeded,
     ChildSpec,
@@ -450,6 +451,54 @@ def test_complete_returns_completion_for_response(monkeypatch: pytest.MonkeyPatc
 
 
 @pytest.mark.unit
+def test_complete_applies_cache_hint_to_the_real_request(monkeypatch: pytest.MonkeyPatch) -> None:
+    response = model_access.Response(content="hi", tool_calls=(), finish_reason="stop", usage=model_access.Usage())
+    captured: list[model_access.Request] = []
+
+    def fake_send(request: model_access.Request) -> model_access.Outcome:
+        captured.append(request)
+        return response
+
+    monkeypatch.setattr(model_access, "send", fake_send)
+
+    asyncio.run(
+        complete(
+            system="stable" + "volatile",
+            messages=({"role": "user", "content": "hi"},),
+            tools=(),
+            provider="p",
+            model="m",
+            cache_hint=CacheHint(stable_prefix_len=len("stable"), trailing_marks=1),
+        )
+    )
+
+    request = captured[0]
+    assert request.messages[0]["content"] == [
+        {"type": "text", "text": "stable", "cache_control": {"type": "ephemeral"}},
+        {"type": "text", "text": "volatile"},
+    ]
+    assert request.messages[1]["content"] == [{"type": "text", "text": "hi", "cache_control": {"type": "ephemeral"}}]
+
+
+@pytest.mark.unit
+def test_complete_without_cache_hint_sends_messages_unmarked(monkeypatch: pytest.MonkeyPatch) -> None:
+    response = model_access.Response(content="hi", tool_calls=(), finish_reason="stop", usage=model_access.Usage())
+    captured: list[model_access.Request] = []
+
+    def fake_send(request: model_access.Request) -> model_access.Outcome:
+        captured.append(request)
+        return response
+
+    monkeypatch.setattr(model_access, "send", fake_send)
+
+    asyncio.run(
+        complete(system="sys", messages=({"role": "user", "content": "hi"},), tools=(), provider="p", model="m")
+    )
+
+    assert captured[0].messages == ({"role": "system", "content": "sys"}, {"role": "user", "content": "hi"})
+
+
+@pytest.mark.unit
 def test_complete_retries_transparently(monkeypatch: pytest.MonkeyPatch) -> None:
     seen_attempts = []
     usage = model_access.Usage()
@@ -536,10 +585,6 @@ async def _fake_dispatch_ok(name: str, arguments: dict) -> str:
     return f"ran {name}"
 
 
-async def _fake_compress_none(messages: tuple[Message, ...], system_prompt: str) -> str | None:
-    return None
-
-
 def _tool_call_response(*names: str) -> model_access.Response:
     return model_access.Response(
         content=None,
@@ -568,7 +613,8 @@ def _run(surface: ToolSurface, **overrides):
         "provider": "p",
         "model": "m",
         "dispatch": _fake_dispatch_ok,
-        "compress": _fake_compress_none,
+        "context_state": ContextState(),
+        "stable_prompt_len": len(_SYSTEM_PROMPT),
     }
     kwargs.update(overrides)
     return asyncio.run(run_turn(**kwargs))
@@ -588,6 +634,55 @@ def test_run_turn_completed_returns_final_text(monkeypatch: pytest.MonkeyPatch) 
     assert result.appended == range(0, len(messages))
     assert messages[-1].role == "assistant"
     assert messages[-1].content == "hi there"
+
+
+@pytest.mark.unit
+def test_run_turn_real_call_chain_marks_cache_boundary(monkeypatch: pytest.MonkeyPatch) -> None:
+    """End-to-end through run_turn's own before_send/complete wiring, not
+    just complete()'s own unit test above: a real turn's own system prompt
+    shows up cache-marked in the request model_access.send actually sees."""
+    surface = build_surface([_spec("noop", "noop")])
+    captured: list[model_access.Request] = []
+
+    def fake_send(request: model_access.Request) -> model_access.Outcome:
+        captured.append(request)
+        return _text_response("hi there")
+
+    monkeypatch.setattr(model_access, "send", fake_send)
+
+    _run(surface, stable_prompt_len=len(_SYSTEM_PROMPT))
+
+    assert captured[0].messages[0]["content"] == [
+        {"type": "text", "text": _SYSTEM_PROMPT, "cache_control": {"type": "ephemeral"}}
+    ]
+
+
+@pytest.mark.unit
+def test_take_turn_accumulates_usage_across_turns(monkeypatch: pytest.MonkeyPatch) -> None:
+    conversation, _t = create_conversation(_template(), "c1", "hi", iteration_budget=_budget())
+    assert conversation.context_state == ContextState()
+
+    usage1 = model_access.Usage(prompt_tokens=10, completion_tokens=2)
+    monkeypatch.setattr(
+        model_access,
+        "send",
+        lambda request: model_access.Response(content="one", tool_calls=(), finish_reason="stop", usage=usage1),
+    )
+    _result1, after_first = asyncio.run(
+        take_turn(conversation, user_input="first", provider="p", model="m", dispatch=_fake_dispatch_ok, now=0.0)
+    )
+    assert after_first.context_state == ContextState(total_prompt_tokens=10, total_completion_tokens=2)
+
+    usage2 = model_access.Usage(prompt_tokens=5, completion_tokens=1)
+    monkeypatch.setattr(
+        model_access,
+        "send",
+        lambda request: model_access.Response(content="two", tool_calls=(), finish_reason="stop", usage=usage2),
+    )
+    _result2, after_second = asyncio.run(
+        take_turn(after_first, user_input="second", provider="p", model="m", dispatch=_fake_dispatch_ok, now=0.0)
+    )
+    assert after_second.context_state == ContextState(total_prompt_tokens=15, total_completion_tokens=3)
 
 
 @pytest.mark.unit
@@ -651,10 +746,14 @@ def test_run_turn_context_overflow_retries_with_compressed_prompt(monkeypatch: p
 
     monkeypatch.setattr(model_access, "send", fake_send)
 
-    async def compress_to_shorter(messages: tuple[Message, ...], system_prompt: str) -> str | None:
-        return "shorter prompt"
+    def fake_turn_complete(
+        state: ContextState, _messages: tuple[Message, ...], _system_prompt: str
+    ) -> tuple[ContextState, str | None]:
+        return state, "shorter prompt"
 
-    result, _messages, _budget, prompt = _run(surface, compress=compress_to_shorter)
+    monkeypatch.setattr(context, "turn_complete", fake_turn_complete)
+
+    result, _messages, _budget, prompt = _run(surface)
 
     assert result.exit_reason == ExitReason.COMPLETED
     assert result.final_text == "ok now"
@@ -687,7 +786,8 @@ def test_run_turn_interrupted(monkeypatch: pytest.MonkeyPatch) -> None:
                 provider="p",
                 model="m",
                 dispatch=slow_dispatch,
-                compress=_fake_compress_none,
+                context_state=ContextState(),
+                stable_prompt_len=len(_SYSTEM_PROMPT),
             )
         )
         # Real (short) sleep, not a fake clock: gives asyncio.to_thread's
@@ -763,6 +863,28 @@ def test_run_turn_dispatch_raises_produces_tool_error(monkeypatch: pytest.Monkey
     assert result.exit_reason == ExitReason.COMPLETED  # the turn continued past the error
     tool_messages = [m for m in messages if m.role == "tool"]
     assert tool_messages[0].content.startswith("tool_error:")
+
+
+@pytest.mark.unit
+def test_run_turn_calls_after_tool_result_before_appending(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Proves the TOOL_ROUND append site actually routes through
+    context.after_tool_result rather than constructing the Message
+    directly — cold review caught that, unlike turn_complete, nothing
+    proved this call site is real rather than a silent no-op left over
+    from a revert."""
+    surface = build_surface([_spec("noop", "noop")])
+    outcomes = iter([_tool_call_response("noop"), _text_response("done")])
+    monkeypatch.setattr(model_access, "send", lambda request: next(outcomes))
+
+    def fake_after_tool_result(_state: ContextState, result: Message) -> Message:
+        return dataclasses.replace(result, content=f"reshaped:{result.content}")
+
+    monkeypatch.setattr(context, "after_tool_result", fake_after_tool_result)
+
+    _result, messages, _budget, _prompt = _run(surface)
+
+    tool_messages = [m for m in messages if m.role == "tool"]
+    assert tool_messages[0].content == "reshaped:ran noop"
 
 
 @pytest.mark.unit
@@ -874,7 +996,8 @@ def test_run_turn_interrupted_during_epilogue_summary(monkeypatch: pytest.Monkey
                 provider="p",
                 model="m",
                 dispatch=_fake_dispatch_ok,
-                compress=_fake_compress_none,
+                context_state=ContextState(),
+                stable_prompt_len=len(_SYSTEM_PROMPT),
             )
         )
         await asyncio.sleep(0.1)  # let it reach the epilogue's own complete() call
@@ -1018,7 +1141,6 @@ def test_take_turn_completed_updates_conversation(monkeypatch: pytest.MonkeyPatc
             provider="p",
             model="m",
             dispatch=_fake_dispatch_ok,
-            compress=_fake_compress_none,
             now=0.0,
         )
     )
@@ -1040,8 +1162,12 @@ def test_take_turn_compression_rotates_prompt_and_stays_self_consistent(monkeypa
     outcomes = iter([model_access.NeedsContextCompression("too big"), _text_response("ok now")])
     monkeypatch.setattr(model_access, "send", lambda request: next(outcomes))
 
-    async def compress_to_shorter(messages: tuple[Message, ...], system_prompt: str) -> str | None:
-        return "a shorter prompt"
+    def fake_turn_complete(
+        state: ContextState, _messages: tuple[Message, ...], _system_prompt: str
+    ) -> tuple[ContextState, str | None]:
+        return state, "a shorter prompt"
+
+    monkeypatch.setattr(context, "turn_complete", fake_turn_complete)
 
     result, updated = asyncio.run(
         take_turn(
@@ -1050,7 +1176,6 @@ def test_take_turn_compression_rotates_prompt_and_stays_self_consistent(monkeypa
             provider="p",
             model="m",
             dispatch=_fake_dispatch_ok,
-            compress=compress_to_shorter,
             now=0.0,
         )
     )
@@ -1059,6 +1184,9 @@ def test_take_turn_compression_rotates_prompt_and_stays_self_consistent(monkeypa
     assert updated.prompt_epoch == 1
     assert updated.prompt_sha256 == turn_prompt_hash(updated.system_prompt, updated.tool_surface)
 
+    # Second call's mocked `send` completes immediately — turn_complete is
+    # only ever invoked from the ContextOverflow branch, so it's never
+    # called again here; the patch above staying in place is inert.
     monkeypatch.setattr(model_access, "send", lambda request: _text_response("second reply"))
     result2, _updated2 = asyncio.run(
         take_turn(
@@ -1067,7 +1195,6 @@ def test_take_turn_compression_rotates_prompt_and_stays_self_consistent(monkeypa
             provider="p",
             model="m",
             dispatch=_fake_dispatch_ok,
-            compress=_fake_compress_none,
             now=0.0,
         )
     )
@@ -1086,7 +1213,6 @@ def test_take_turn_twice_accumulates_one_shared_history(monkeypatch: pytest.Monk
             provider="p",
             model="m",
             dispatch=_fake_dispatch_ok,
-            compress=_fake_compress_none,
             now=0.0,
         )
     )
@@ -1097,7 +1223,6 @@ def test_take_turn_twice_accumulates_one_shared_history(monkeypatch: pytest.Monk
             provider="p",
             model="m",
             dispatch=_fake_dispatch_ok,
-            compress=_fake_compress_none,
             now=0.0,
         )
     )
@@ -1122,7 +1247,6 @@ def test_rotate_prompt_is_the_only_epoch_mutating_path(monkeypatch: pytest.Monke
             provider="p",
             model="m",
             dispatch=_fake_dispatch_ok,
-            compress=_fake_compress_none,
             now=0.0,
         )
     )
@@ -1286,7 +1410,6 @@ def _spawn(parent, spec: ChildSpec, **overrides):
         "provider": "p",
         "model": "m",
         "dispatch": _fake_dispatch_ok,
-        "compress": _fake_compress_none,
         "now": 0.0,
     }
     kwargs.update(overrides)

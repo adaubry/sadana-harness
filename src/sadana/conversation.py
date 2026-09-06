@@ -23,7 +23,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Literal
 
-from sadana import config, model_access
+from sadana import config, context, model_access
 
 # A caller-supplied natural key, e.g. "support/ticket-4821". This module
 # does not mint or validate one, and does not enforce it is unique — that
@@ -505,14 +505,22 @@ async def complete(
     tools: tuple[dict, ...],
     provider: str,
     model: str,
+    cache_hint: context.CacheHint | None = None,
 ) -> Completion:
     """Ask a model for a response. Retries a transient failure
     transparently — the caller never sees ``model_access.Retry`` — and
     raises exactly one of two named failures otherwise. No retry cap of
     its own: ``model_access.classify()`` already enforces
     ``SADANA_MODEL_ACCESS_MAX_RETRIES`` and returns ``Abort`` once
-    exceeded, so this loop's termination is already guaranteed."""
+    exceeded, so this loop's termination is already guaranteed.
+
+    ``cache_hint``, when given, is applied to the wire messages via
+    ``model_access.mark_cache_boundary`` before every attempt this call
+    makes — including a retry, so a retried attempt still carries the
+    marker."""
     request_messages = ({"role": "system", "content": system},) + messages
+    if cache_hint is not None:
+        request_messages = model_access.mark_cache_boundary(request_messages, cache_hint)
     attempt = 0
     while True:
         request = model_access.Request(
@@ -582,6 +590,7 @@ class TurnResult:
     model_calls: int
     usage: model_access.Usage
     appended: range
+    context_state: context.ContextState
 
 
 def turn_prompt_hash(system_prompt: str, tool_surface: ToolSurface) -> str:
@@ -704,7 +713,8 @@ async def run_turn(
     provider: str,
     model: str,
     dispatch: Callable[[str, dict], Awaitable[str]],
-    compress: Callable[[tuple[Message, ...], str], Awaitable[str | None]],
+    context_state: context.ContextState,
+    stable_prompt_len: int,
     persist: Callable[[tuple[Message, ...]], Awaitable[None]] = _noop_persist,
 ) -> tuple[TurnResult, tuple[Message, ...], IterationBudget, str]:
     """Run one turn: ask the model, carry out whatever it asks for, ask
@@ -712,7 +722,14 @@ async def run_turn(
     Returns ``(TurnResult, updated messages, updated iteration_budget,
     current system_prompt)`` — four values with different lifetimes and
     different callers, kept separate rather than folded into one
-    dataclass. Full contract: ``docs/tasks/C7-turn-loop/spec.md``."""
+    dataclass. Full contract: ``docs/tasks/C7-turn-loop/spec.md``.
+
+    ``context_state``/``stable_prompt_len`` replace the old injected
+    ``compress`` callback (`docs/tasks/C10-context-lifecycle/spec.md`):
+    CONTEXT's own checkpoints are called directly instead of through a
+    caller-supplied seam. The turn's final ``context_state`` rides on the
+    returned ``TurnResult``, not as a fifth value here — see plan.md's own
+    refinement note."""
     # REPAIR — the only mutation allowed before PROLOGUE.
     messages = repair(messages)
 
@@ -750,6 +767,7 @@ async def run_turn(
                 detail = "wall clock budget exhausted"
                 break
 
+            cache_hint = context.before_send(history=messages, stable_prompt_len=stable_prompt_len)
             try:
                 completion = await complete(
                     system=system_prompt,
@@ -757,10 +775,11 @@ async def run_turn(
                     tools=tool_surface,
                     provider=provider,
                     model=model,
+                    cache_hint=cache_hint,
                 )
             except ContextOverflow as e:
                 model_calls += 1
-                new_prompt = await compress(messages, system_prompt)
+                context_state, new_prompt = context.turn_complete(context_state, messages, system_prompt)
                 if new_prompt is None:
                     exit_reason = ExitReason.CONTEXT_OVERFLOW_UNHANDLED
                     detail = str(e)
@@ -775,6 +794,7 @@ async def run_turn(
 
             model_calls += 1
             usage_total = _add_usage(usage_total, completion.usage)
+            context_state = context.after_response(context_state, completion.usage)
 
             if not completion.tool_calls:
                 messages, _ = append(conversation, messages, Message(role="assistant", content=completion.content))
@@ -824,9 +844,10 @@ async def run_turn(
                 except Exception as e:
                     result_text = f"tool_error: {e}"
                 result_text, turn_chars_used = _cap_tool_result(result_text, turn_chars_used, result_cap, turn_cap)
-                messages, _ = append(
-                    conversation, messages, Message(role="tool", tool_call_id=tc["id"], content=result_text)
+                tool_result = context.after_tool_result(
+                    context_state, Message(role="tool", tool_call_id=tc["id"], content=result_text)
                 )
+                messages, _ = append(conversation, messages, tool_result)
             # loop back to MODEL_CALL
     except asyncio.CancelledError:
         exit_reason = ExitReason.INTERRUPTED
@@ -838,15 +859,18 @@ async def run_turn(
     if exit_reason == ExitReason.BUDGET_EXHAUSTED and final_text is None:
         summary_messages, _ = append(conversation, messages, Message(role="user", content=_SUMMARY_REQUEST_TEXT))
         try:
+            cache_hint = context.before_send(history=summary_messages, stable_prompt_len=stable_prompt_len)
             completion = await complete(
                 system=system_prompt,
                 messages=tuple(_message_to_wire(m) for m in summary_messages),
                 tools=(),
                 provider=provider,
                 model=model,
+                cache_hint=cache_hint,
             )
             model_calls += 1
             usage_total = _add_usage(usage_total, completion.usage)
+            context_state = context.after_response(context_state, completion.usage)
             messages, _ = append(conversation, summary_messages, Message(role="assistant", content=completion.content))
             final_text = completion.content
         except (ContextOverflow, ProviderFailure):
@@ -867,6 +891,7 @@ async def run_turn(
         model_calls=model_calls,
         usage=usage_total,
         appended=range(turn_start_seq, len(messages)),
+        context_state=context_state,
     )
     return result, messages, iteration_budget, system_prompt
 
@@ -953,6 +978,8 @@ class Conversation:
     next_turn_seq: int
     iteration_budget: IterationBudget
     wall_clock_budget: WallClockBudget | None
+    stable_prompt_len: int
+    context_state: context.ContextState
     next_child_seq: int = 0  # CONV-07's own counter; see run_child below.
 
 
@@ -985,8 +1012,8 @@ def create_conversation(
     updated_template = replace(template, recipe=recipe, pending_recipe=None)
 
     tool_surface = build_surface(recipe.tool_specs)
-    context = _render_context(system_message, recipe.catalog)
-    system_prompt = "\n\n".join(part for part in (recipe.stable_prompt, context) if part)
+    context_tier = _render_context(system_message, recipe.catalog)
+    system_prompt = "\n\n".join(part for part in (recipe.stable_prompt, context_tier) if part)
     prompt_sha256 = turn_prompt_hash(system_prompt, tool_surface)
 
     conversation = Conversation(
@@ -1000,6 +1027,8 @@ def create_conversation(
         next_turn_seq=0,
         iteration_budget=iteration_budget,
         wall_clock_budget=wall_clock_budget,
+        stable_prompt_len=len(recipe.stable_prompt),
+        context_state=context.ContextState(),
     )
     return conversation, updated_template
 
@@ -1028,7 +1057,6 @@ async def take_turn(
     provider: str,
     model: str,
     dispatch: Callable[[str, dict], Awaitable[str]],
-    compress: Callable[[tuple[Message, ...], str], Awaitable[str | None]],
     persist: Callable[[tuple[Message, ...]], Awaitable[None]] = _noop_persist,
     now: float,
 ) -> tuple[TurnResult, Conversation]:
@@ -1037,8 +1065,8 @@ async def take_turn(
     ``conversation.system_prompt`` (compression rotated it mid-turn), the
     result goes through ``rotate_prompt`` first, so epoch and hash always
     move together through the one sanctioned path; ``messages``,
-    ``iteration_budget``, and ``next_turn_seq + 1`` are then folded in.
-    Never mutates ``conversation`` — returns a new value."""
+    ``iteration_budget``, ``context_state``, and ``next_turn_seq + 1`` are
+    then folded in. Never mutates ``conversation`` — returns a new value."""
     result, messages, iteration_budget, new_system_prompt = await run_turn(
         conversation=conversation.key,
         turn_seq=conversation.next_turn_seq,
@@ -1053,7 +1081,8 @@ async def take_turn(
         provider=provider,
         model=model,
         dispatch=dispatch,
-        compress=compress,
+        context_state=conversation.context_state,
+        stable_prompt_len=conversation.stable_prompt_len,
         persist=persist,
     )
 
@@ -1066,6 +1095,7 @@ async def take_turn(
         messages=messages,
         next_turn_seq=conversation.next_turn_seq + 1,
         iteration_budget=iteration_budget,
+        context_state=result.context_state,
     )
     return result, updated
 
@@ -1247,7 +1277,6 @@ async def run_child(
     provider: str,
     model: str,
     dispatch: Callable[[str, dict], Awaitable[str]],
-    compress: Callable[[tuple[Message, ...], str], Awaitable[str | None]],
     persist: Callable[[tuple[Message, ...]], Awaitable[None]] = _noop_persist,
     now: float,
 ) -> tuple[ChildResult, Conversation, Conversation]:
@@ -1294,6 +1323,8 @@ async def run_child(
         next_turn_seq=0,
         iteration_budget=spec.budget if spec.budget is not None else child_iteration_budget_from_config(),
         wall_clock_budget=parent.wall_clock_budget,
+        stable_prompt_len=len(stable_prompt),
+        context_state=context.ContextState(),
     )
 
     result, updated_child = await take_turn(
@@ -1302,7 +1333,6 @@ async def run_child(
         provider=provider,
         model=spec.model if spec.model is not None else model,
         dispatch=dispatch,
-        compress=compress,
         persist=persist,
         now=now,
     )

@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 
 from sadana import model_access
+from sadana.context import CacheHint
 from sadana.model_access import (
     Abort,
     Degenerate,
@@ -20,6 +21,7 @@ from sadana.model_access import (
     context_window,
     get_provider,
     list_providers,
+    mark_cache_boundary,
     register_provider,
     send,
 )
@@ -307,3 +309,79 @@ def test_send_calls_request_fn_and_classifies_its_result(monkeypatch: pytest.Mon
     outcome = send(request)
     assert isinstance(outcome, Response)
     assert outcome.content == "ok"
+
+
+# ── mark_cache_boundary ───────────────────────────────────────────────────
+
+
+@pytest.mark.unit
+def test_mark_cache_boundary_splits_system_prefix_with_nonempty_suffix() -> None:
+    messages = ({"role": "system", "content": "stable part" + "volatile tail"},)
+    hint = CacheHint(stable_prefix_len=len("stable part"), trailing_marks=0)
+
+    marked = mark_cache_boundary(messages, hint)
+
+    assert marked[0]["content"] == [
+        {"type": "text", "text": "stable part", "cache_control": {"type": "ephemeral"}},
+        {"type": "text", "text": "volatile tail"},
+    ]
+
+
+@pytest.mark.unit
+def test_mark_cache_boundary_marks_whole_system_message_when_prefix_is_everything() -> None:
+    messages = ({"role": "system", "content": "all stable"},)
+    hint = CacheHint(stable_prefix_len=len("all stable"), trailing_marks=0)
+
+    marked = mark_cache_boundary(messages, hint)
+
+    # No empty-suffix part on the wire (the API rejects an empty text block).
+    assert marked[0]["content"] == [{"type": "text", "text": "all stable", "cache_control": {"type": "ephemeral"}}]
+
+
+@pytest.mark.unit
+def test_mark_cache_boundary_marks_trailing_eligible_messages() -> None:
+    messages = (
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "one"},
+        {"role": "user", "content": "two"},
+        {"role": "user", "content": "three"},
+    )
+    hint = CacheHint(stable_prefix_len=0, trailing_marks=2)
+
+    marked = mark_cache_boundary(messages, hint)
+
+    assert marked[1]["content"] == "one"  # untouched — outside the trailing window
+    assert marked[2]["content"] == [{"type": "text", "text": "two", "cache_control": {"type": "ephemeral"}}]
+    assert marked[3]["content"] == [{"type": "text", "text": "three", "cache_control": {"type": "ephemeral"}}]
+
+
+@pytest.mark.unit
+def test_mark_cache_boundary_skips_empty_content_message() -> None:
+    messages = (
+        {"role": "system", "content": "sys"},
+        {"role": "assistant", "content": None, "tool_calls": ({"function": {"name": "f", "arguments": "{}"}},)},
+        {"role": "user", "content": "real content"},
+    )
+    hint = CacheHint(stable_prefix_len=0, trailing_marks=2)
+
+    marked = mark_cache_boundary(messages, hint)
+
+    # Only one eligible message exists; the empty-content assistant turn
+    # never receives a marker, even though the budget would allow two.
+    assert marked[1] == messages[1]
+    assert marked[2]["content"] == [{"type": "text", "text": "real content", "cache_control": {"type": "ephemeral"}}]
+
+
+@pytest.mark.unit
+def test_mark_cache_boundary_never_mutates_input() -> None:
+    original = ({"role": "system", "content": "stable"}, {"role": "user", "content": "hi"})
+    snapshot = ({"role": "system", "content": "stable"}, {"role": "user", "content": "hi"})
+
+    mark_cache_boundary(original, CacheHint(stable_prefix_len=6, trailing_marks=1))
+
+    assert original == snapshot
+
+
+@pytest.mark.unit
+def test_mark_cache_boundary_empty_messages_is_a_no_op() -> None:
+    assert mark_cache_boundary((), CacheHint(stable_prefix_len=0, trailing_marks=1)) == ()

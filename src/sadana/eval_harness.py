@@ -68,10 +68,6 @@ async def _no_tools_dispatch(name: str, arguments: dict) -> str:
     return f"tool_error: no tools available (unexpected call to {name!r} with {arguments!r})"
 
 
-async def _compress_noop(_messages: tuple[Message, ...], _system_prompt: str) -> str | None:
-    return None  # compression isn't built yet; matches every other caller's own precedent.
-
-
 def run_task_key(task_id: str, now: float) -> ConversationKey:
     """The default `key` a caller gets if it doesn't supply its own —
     readable, but not a uniqueness guarantee (spec.md's own Concerns:
@@ -121,7 +117,6 @@ async def run_task(
         provider=provider,
         model=model,
         dispatch=dispatch,
-        compress=_compress_noop,
         now=now,
     )
     score = task.grade(result, updated.messages)

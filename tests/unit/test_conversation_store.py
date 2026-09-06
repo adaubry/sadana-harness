@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from sadana import conversation_store, model_access
+from sadana.context import ContextState
 from sadana.conversation import (
     Conversation,
     ExitReason,
@@ -64,6 +65,8 @@ def _conversation(
         next_turn_seq=next_turn_seq,
         iteration_budget=iteration_budget or IterationBudget(max_total=10, used=3),
         wall_clock_budget=wall_clock_budget,
+        stable_prompt_len=len(_SYSTEM_PROMPT),
+        context_state=ContextState(),
         next_child_seq=next_child_seq,
     )
 
@@ -269,9 +272,6 @@ def _tool_call_response(*names: str) -> model_access.Response:
 
 
 def _run_turn(surface, *, dispatch, persist):
-    async def _compress(_messages: tuple[Message, ...], _system_prompt: str) -> str | None:
-        return None
-
     return asyncio.run(
         run_turn(
             conversation="c1",
@@ -287,7 +287,8 @@ def _run_turn(surface, *, dispatch, persist):
             provider="p",
             model="m",
             dispatch=dispatch,
-            compress=_compress,
+            context_state=ContextState(),
+            stable_prompt_len=len(_SYSTEM_PROMPT),
             persist=persist,
         )
     )

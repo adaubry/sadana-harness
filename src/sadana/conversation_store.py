@@ -25,7 +25,7 @@ from collections.abc import Awaitable, Callable, Iterator
 from dataclasses import replace
 from pathlib import Path
 
-from sadana import config
+from sadana import config, context
 from sadana.conversation import (
     Conversation,
     ConversationKey,
@@ -248,6 +248,15 @@ def load(conn: sqlite3.Connection, key: ConversationKey, *, now: float) -> Conve
         next_turn_seq=row["next_turn_seq"],
         iteration_budget=IterationBudget(max_total=row["iteration_max_total"], used=row["iteration_used"]),
         wall_clock_budget=wall_clock_budget,
+        # CONTEXT's own state is never persisted (docs/tasks/C10-context-lifecycle/spec.md's
+        # requirement 7): a resumed conversation's running usage total
+        # restarts at zero, and the whole stored system prompt is treated
+        # as the cacheable prefix — always correct (nothing here makes
+        # system_prompt partially volatile after creation), just narrower
+        # than the cross-conversation-reuse boundary create_conversation()
+        # used, since the originating recipe isn't stored.
+        stable_prompt_len=len(row["system_prompt"]),
+        context_state=context.ContextState(),
         next_child_seq=row["next_child_seq"],
     )
 
