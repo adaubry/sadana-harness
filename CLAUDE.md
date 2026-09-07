@@ -44,6 +44,7 @@ WSL only. Python lives in `.venv`; `make` puts it on PATH for you, so there is n
 - A classified outcome whose branches carry meaningfully different data — model_access.classify()'s Outcome today, more as they land — is a named, closed set of outcome types, never a raised exception. A result whose branches differ only by one field, like DagResult, doesn't need this shape.
 - plugins.py and plugin_manifest.py never import conversation.py — anything needing both lives in a separate module that imports conversation.py, keeping PLUGINS' leaf modules acyclic.
 - A plugin graph's node receives only its immediate predecessor's output, never the run's accumulated history.
+- A registry or dispatch seam for a family of pluggable backends earns its cost only once a second real member exists to register — build the single member as a direct call, not a lookup table of one, no matter how certain a second member seems.
 
 ## Glossary
 
