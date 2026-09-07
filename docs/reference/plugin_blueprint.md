@@ -1,7 +1,7 @@
 # PLUGINS block blueprint
 
-Status: draft for design. Written 2026-09-06, against `73ac4f0` (work order step 12).
-Cited by: (nothing yet — this is the block's first document.)
+Status: implemented. Written 2026-09-06, against `73ac4f0` (work order step 12); closed 2026-09-07 by `G3-real-plugin-under-eval`.
+Cited by: D1-D4, E1, F1, G1, G2, G3 (`docs/tasks/`).
 
 Design authority for the block that turns sadana's paradigm into a contract.
 Work items cite it by section (`§5.2`, `§10 Risk 2`) the way the CONVERSATION
@@ -430,6 +430,18 @@ later item is cheaper once it has landed.
 | 7   | Artifacts                 | Where a file lands, how a link is returned.                                                                                           |
 | 8   | Port the proof script     | `prove_conversation_e2e.py`'s hand-written DAG becomes two real plugins; the script shrinks to a driver. The block's deploy evidence. |
 | 9   | An eval that grades a DAG | A Task whose grading function reads `trace`. Closes Risk 4.                                                                           |
+
+**Closed.** Items 1-9 are done; the step-17 checkpoint (`§2.4`) — a real
+plugin's DAG running end to end, under approval — is met. Items 8 and 9
+landed together in `G3-real-plugin-under-eval`, by explicit decision: item
+9 needed item 8's real plugins to have anything real to grade, and neither
+was worth shipping without the other. `plugin-a`'s stand-in webhook step
+was upgraded to a genuine `call` node rather than ported as-is, since a
+compute stand-in would never have exercised approval at all — the step-17
+checkpoint's own wording is what settled that. Items 6 and 7 had already
+closed as `G1-call-node-run` and `G2-artifacts`; this block's own document
+is now a closed record, not a live design surface — a future change to
+this vocabulary is a new intent, not an edit here.
 
 ---
 

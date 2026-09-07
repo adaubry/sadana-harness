@@ -1,17 +1,24 @@
 #!/usr/bin/env python3
 """Standalone proof that a real, multi-turn conversation with two mounted
-plugins keeps every promise the CONVERSATION block's prior work items made.
+plugins keeps every promise the CONVERSATION block's prior work items made
+— and, since docs/tasks/G3-real-plugin-under-eval/spec.md, that both
+plugins are real, on-disk manifests walked through the actual dispatch
+mechanism, not a hand-written closure.
 
 Not a pytest test — testing-conventions bars the network and the model API
 from the unit suite. Run manually with a real OPENROUTER_API_KEY, paste its
 output into review.md's ## Evidence. See
-docs/tasks/CONV-09-deploy-evidence/spec.md for the full contract this
-script proves.
+docs/tasks/CONV-09-deploy-evidence/spec.md for the original contract and
+docs/tasks/G3-real-plugin-under-eval/spec.md for what changed here.
 
 Exercises: byte-stable system prompt across turns (spec.md req. 3), a
 spawned child conversation with its own key/history/budget/restricted tool
-surface (req. 4), deliberate budget exhaustion on a fourth turn (req. 5),
-and a well-formed final transcript with no dangling tool calls (req. 6).
+surface (req. 4, now proven once as a unit test —
+tests/unit/test_conversation.py — rather than by this script's own direct
+inspection, per G3's own Concerns), deliberate budget exhaustion on a
+fourth turn (req. 5), a well-formed final transcript with no dangling tool
+calls (req. 6), and — new — plugin-a's real `call` node reaching outside
+for real, under real approval, and handing back a link `Artifact`.
 """
 
 from __future__ import annotations
@@ -19,26 +26,19 @@ from __future__ import annotations
 import asyncio
 import os
 import sys
-from dataclasses import replace
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from sadana import model_access, plugins  # noqa: E402
+from sadana import model_access, plugin_dispatch, plugin_manifest, plugins  # noqa: E402
 from sadana.conversation import (  # noqa: E402
-    ChildSpec,
     Conversation,
     ConversationTemplate,
     ExitReason,
     IterationBudget,
-    PluginCatalogEntry,
-    SkillRef,
     TemplateRecipe,
-    ToolSpec,
     create_conversation,
     pending_tool_call_ids,
-    run_child,
-    take_turn,
 )
 
 MODEL = "deepseek/deepseek-v4-flash-0731"
@@ -47,196 +47,76 @@ STABLE_PROMPT = (
     "You are a plainly-behaved assistant used only by sadana-harness's own "
     "CONV-09 proof script. Follow instructions exactly and literally."
 )
-_ACK_MARKER = "ACKNOWLEDGED"
 
 FIXTURES_ROOT = Path(__file__).resolve().parent.parent / "tests" / "fixtures" / "plugins"
 
 
-def _tool_specs() -> tuple[ToolSpec, ...]:
-    return (
-        ToolSpec(
-            key="plugin_a_entry",
-            name="plugin_a_entry",
-            parameters={"type": "object", "properties": {}},
-            describe=lambda _resolved: (
-                "Runs plugin-a's flow: fetches a webhook-style input, hands it to a focused helper, and reports back."
-            ),
-        ),
-        ToolSpec(
-            key="plugin_b_entry",
-            name="plugin_b_entry",
-            parameters={
-                "type": "object",
-                "properties": {"note": {"type": "string", "description": "A short note to pass along."}},
-                "required": ["note"],
-            },
-            describe=lambda _resolved: "Runs plugin-b's flow: hands a short note to a focused helper and reports back.",
-        ),
-    )
-
-
-def _assert_child_isolated(child: Conversation, parent: Conversation) -> None:
-    """The two checks both dispatch branches need on a spawned child: its
-    own identity, its own history. Shared here so the two branches don't
-    each restate them."""
-    assert child.key != parent.key, "child must have its own key"
-    assert len(child.messages) > 0, "child must have its own message history"
-
-
-def _build_template() -> ConversationTemplate:
-    recipe = TemplateRecipe(
-        stable_prompt=STABLE_PROMPT,
-        catalog=(
-            PluginCatalogEntry(
-                name="plugin-a",
-                purpose="Runs a small three-step flow via a focused helper.",
-                entry_tool="plugin_a_entry",
-            ),
-            PluginCatalogEntry(
-                name="plugin-b",
-                purpose="The simplest possible flow: one helper, one report.",
-                entry_tool="plugin_b_entry",
-            ),
-        ),
-        tool_specs=_tool_specs(),
-    )
-    return ConversationTemplate(name="conv09-proof", recipe=recipe)
+def _print_dag_result(label: str, result: plugins.DagResult) -> None:
+    print(f"{label}: plugin={result.plugin!r} entry={result.entry!r} failed_node={result.failed_node!r}")
+    for t in result.trace:
+        print(f"  node={t.node!r} kind={t.kind!r} ok={t.ok} port={t.port!r} detail={t.detail!r}")
+    for a in result.artifacts:
+        print(f"  artifact kind={a.kind!r} name={a.name!r} ref={a.ref!r}")
 
 
 async def main() -> None:
     os.environ["SADANA_PLUGINS_DIR"] = str(FIXTURES_ROOT)
 
-    template = _build_template()
+    approved_calls: list[tuple[str, str]] = []
+
+    async def auto_approve(plugin: str, node: str, _value: object) -> bool:
+        """This script's own honest stand-in for a person — answers the
+        real approval question every time, without waiting on one
+        (docs/tasks/G3-real-plugin-under-eval/spec.md)."""
+        approved_calls.append((plugin, node))
+        print(f"    [auto-approved] {plugin}'s {node!r} step")
+        return True
+
+    installed = plugin_manifest.discover_plugins()
+    names = sorted(p.name for p in installed)
+    print(f"discover_plugins() found: {names}")
+    assert "plugin-a" in names and "plugin-b" in names, f"expected plugin-a and plugin-b among {names}"
+
+    plugin_set = plugin_dispatch.build_plugin_set(p for p in installed if p.name in ("plugin-a", "plugin-b"))
+    print(f"catalog entry_tools: {[e.entry_tool for e in plugin_set.catalog]}")
+
+    template = ConversationTemplate(
+        name="conv09-proof",
+        recipe=TemplateRecipe(
+            stable_prompt=STABLE_PROMPT, catalog=plugin_set.catalog, tool_specs=plugin_set.tool_specs
+        ),
+    )
     conversation, _template = create_conversation(
         template,
         key="conv09-proof/run-1",
         system_message="This is a proof-of-concept conversation for sadana-harness's CONV-09 evidence.",
         iteration_budget=IterationBudget(max_total=5),
     )
-    # The source of truth for how many children this run has spawned —
-    # not `conversation.next_child_seq` itself, which take_turn()'s own
-    # threading can't be told about mid-turn. See dispatch()'s docstring.
-    next_child_seq = conversation.next_child_seq
-
-    async def dispatch(name: str, arguments: dict) -> plugins.DagResult:
-        # take_turn() builds its own return value from the `conversation`
-        # it was called with — a stale local snapshot nothing running
-        # inside it (this function included) can retroactively change. So
-        # a spawn's only real effect on the parent (next_child_seq
-        # advancing — run_child's own docstring: nothing else differs)
-        # is tracked here as its own counter instead, and reconciled back
-        # onto `conversation` by main()'s own turn loop after each
-        # take_turn() call returns — the one place that's actually safe
-        # to do it. See docs/reference/dispatch_closure_state_bug.md.
-        nonlocal next_child_seq
-        parent = replace(conversation, next_child_seq=next_child_seq)
-        now = 0.0  # wall-clock budget isn't exercised by this proof; a fixed value is fine.
-
-        if name == "plugin_a_entry":
-            # node 1: webhook-ish input node — a fixed stand-in; no real webhook exists (intent §Constraints).
-            webhook_input = "incoming webhook payload: {'event': 'ping'}"
-            # node 2: subagent-with-skill node.
-            spec = ChildSpec(
-                node_name="plugin_a_child",
-                skill=SkillRef(plugin="plugin-a", skill="plugin-a-skill"),
-                input=webhook_input,
-                tools=frozenset(),
-                budget=IterationBudget(max_total=3),
-            )
-            result, child, updated_parent = await run_child(
-                parent,
-                spec,
-                stable_prompt=STABLE_PROMPT,
-                provider=PROVIDER,
-                model=MODEL,
-                dispatch=dispatch,
-                now=now,
-            )
-            next_child_seq = updated_parent.next_child_seq
-
-            _assert_child_isolated(child, parent)
-            # tool_surface == () is the strongest possible "excludes every
-            # tool the parent has" proof — a name-exclusion check over an
-            # already-known-empty tuple would only restate this.
-            assert child.tool_surface == (), "plugin-a's child must be given zero tools"
-
-            print(f"    [plugin-a] child key={child.key} exit={result.exit_reason} final_text={result.final_text!r}")
-
-            # node 3: branch node.
-            fetch_trace = plugins.NodeTrace(
-                node="fetch_webhook", kind="compute", visit=0, ok=True, port=None, detail=webhook_input
-            )
-            ask_trace = plugins.NodeTrace(
-                node="ask_helper", kind="ask", visit=0, ok=True, port=None, detail=f"child exit={result.exit_reason}"
-            )
-            acknowledged = bool(result.final_text and _ACK_MARKER in result.final_text)
-            route_trace = plugins.NodeTrace(
-                node="branch_on_reply",
-                kind="route",
-                visit=0,
-                ok=True,
-                port="acknowledged" if acknowledged else "not_acknowledged",
-                detail=None,
-            )
-            if acknowledged:
-                text = f"plugin-a: child acknowledged. report: {result.final_text}"
-            else:
-                text = f"plugin-a: child did not acknowledge as expected. raw report: {result.final_text!r}"
-            return plugins.DagResult(
-                plugin="plugin-a",
-                entry="plugin_a_entry",
-                text=text,
-                artifacts=(),
-                trace=(fetch_trace, ask_trace, route_trace),
-                failed_node=None,
-            )
-
-        if name == "plugin_b_entry":
-            spec = ChildSpec(
-                node_name="plugin_b_child",
-                skill=SkillRef(plugin="plugin-b", skill="plugin-b-skill"),
-                input=str(arguments.get("note", "no note given")),
-                tools=frozenset(),
-                budget=IterationBudget(max_total=3),
-            )
-            result, child, updated_parent = await run_child(
-                parent,
-                spec,
-                stable_prompt=STABLE_PROMPT,
-                provider=PROVIDER,
-                model=MODEL,
-                dispatch=dispatch,
-                now=now,
-            )
-            next_child_seq = updated_parent.next_child_seq
-
-            _assert_child_isolated(child, parent)
-
-            print(f"    [plugin-b] child key={child.key} exit={result.exit_reason} final_text={result.final_text!r}")
-            ask_trace = plugins.NodeTrace(
-                node="ask_helper", kind="ask", visit=0, ok=True, port=None, detail=f"child exit={result.exit_reason}"
-            )
-            return plugins.DagResult(
-                plugin="plugin-b",
-                entry="plugin_b_entry",
-                text=f"plugin-b: {result.final_text}",
-                artifacts=(),
-                trace=(ask_trace,),
-                failed_node=None,
-            )
-
-        return plugins.DagResult(
-            plugin="unknown",
-            entry=name,
-            text=f"tool_error: unknown tool {name!r}",
-            artifacts=(),
-            trace=(),
-            failed_node="entry",
-        )
 
     initial_hash = conversation.prompt_sha256
     print(f"initial prompt_sha256={initial_hash}")
 
+    def build_dispatch(
+        conversation: Conversation,
+    ) -> tuple[plugin_dispatch.DispatchFn, plugin_dispatch.ChildSeqTracker]:
+        """A fresh `build_dispatch()` call per turn, using that turn's own
+        `conversation` — never one built once and reused, which would
+        close over a stale `conversation`
+        (docs/reference/dispatch_closure_state_bug.md), exactly the
+        discipline `scripts/prove_plugin_dispatch_e2e.py` already
+        follows."""
+        return plugin_dispatch.build_dispatch(
+            conversation,
+            plugin_set,
+            stable_prompt=STABLE_PROMPT,
+            provider=PROVIDER,
+            model=MODEL,
+            now=0.0,
+            approve=auto_approve,
+        )
+
+    print("\n=== turn 1: plain exchange, no plugin ===")
+    dispatch, tracker = build_dispatch(conversation)
     # C10-context-lifecycle's own acceptance criterion: a real OpenRouter
     # request body must actually carry cache_control on the system
     # message's stable prefix. Wraps the real send() once, for turn 1 only,
@@ -249,18 +129,16 @@ async def main() -> None:
         return real_send(request)
 
     model_access.send = _capturing_send
-
-    print("\n=== turn 1: plain exchange, no plugin ===")
-    result1, conversation = await take_turn(
+    result1, conversation = await plugin_dispatch.take_turn_and_reconcile(
         conversation,
+        dispatch,
+        tracker,
         user_input="Reply with a short one-sentence greeting and nothing else.",
         provider=PROVIDER,
         model=MODEL,
-        dispatch=dispatch,
         now=0.0,
     )
     model_access.send = real_send
-    conversation = replace(conversation, next_child_seq=next_child_seq)
     print(f"exit_reason={result1.exit_reason} final_text={result1.final_text!r}")
     assert result1.exit_reason == ExitReason.COMPLETED, f"turn 1: expected COMPLETED, got {result1.exit_reason}"
     assert conversation.prompt_sha256 == initial_hash, "prompt_sha256 drifted after turn 1"
@@ -276,49 +154,72 @@ async def main() -> None:
     ), "expected at least one cache_control marker on the real system message"
     print("[ok] turn 1's real request body carries a cache_control marker on the system message")
 
-    print("\n=== turn 2: plugin-a ===")
-    result2, conversation = await take_turn(
+    print("\n=== turn 2: plugin-a, a real call node under real approval ===")
+    dispatch, tracker = build_dispatch(conversation)
+    capturing_dispatch_2, captured_2 = plugin_dispatch.capturing_dispatch(dispatch)
+    result2, conversation = await plugin_dispatch.take_turn_and_reconcile(
         conversation,
+        capturing_dispatch_2,
+        tracker,
         user_input="Call the plugin_a_entry tool now.",
         provider=PROVIDER,
         model=MODEL,
-        dispatch=dispatch,
         now=0.0,
     )
-    conversation = replace(conversation, next_child_seq=next_child_seq)
     print(f"exit_reason={result2.exit_reason} final_text={result2.final_text!r}")
     assert result2.exit_reason == ExitReason.COMPLETED, f"turn 2: expected COMPLETED, got {result2.exit_reason}"
     assert conversation.prompt_sha256 == initial_hash, "prompt_sha256 drifted after turn 2"
-    print("[ok] turn 2 completed; prompt_sha256 unchanged; child isolation verified above")
+    assert captured_2, "turn 2: plugin_a_entry was never actually dispatched (capture list is empty)"
+    dag2 = captured_2[-1]
+    _print_dag_result("turn 2 dag_result", dag2)
+    assert dag2.failed_node is None, f"turn 2: expected no failed_node, got {dag2.failed_node!r}"
+    assert [t.node for t in dag2.trace][:2] == [
+        "fetch_webhook",
+        "interpret",
+    ], f"turn 2: expected the walk to start fetch_webhook -> interpret, got {[t.node for t in dag2.trace]}"
+    assert dag2.trace[0].ok is True, "turn 2: expected the call node to have succeeded"
+    assert dag2.artifacts == (
+        plugins.Artifact(kind="link", name="webhook", ref="https://example.com"),
+    ), f"turn 2: expected the real webhook link artifact, got {dag2.artifacts}"
+    assert approved_calls, "turn 2: the call node's approval question was never actually asked"
+    print("[ok] turn 2 completed; prompt_sha256 unchanged; a real call node ran under real approval")
 
     print("\n=== turn 3: plugin-b ===")
-    result3, conversation = await take_turn(
+    dispatch, tracker = build_dispatch(conversation)
+    capturing_dispatch_3, captured_3 = plugin_dispatch.capturing_dispatch(dispatch)
+    result3, conversation = await plugin_dispatch.take_turn_and_reconcile(
         conversation,
+        capturing_dispatch_3,
+        tracker,
         user_input="Call the plugin_b_entry tool now, with note='hello from turn 3'.",
         provider=PROVIDER,
         model=MODEL,
-        dispatch=dispatch,
         now=0.0,
     )
-    conversation = replace(conversation, next_child_seq=next_child_seq)
     print(f"exit_reason={result3.exit_reason} final_text={result3.final_text!r}")
     assert result3.exit_reason == ExitReason.COMPLETED, f"turn 3: expected COMPLETED, got {result3.exit_reason}"
     assert conversation.prompt_sha256 == initial_hash, "prompt_sha256 drifted after turn 3"
+    assert captured_3, "turn 3: plugin_b_entry was never actually dispatched (capture list is empty)"
+    dag3 = captured_3[-1]
+    _print_dag_result("turn 3 dag_result", dag3)
+    assert dag3.failed_node is None, f"turn 3: expected no failed_node, got {dag3.failed_node!r}"
+    assert [t.node for t in dag3.trace] == ["ask_helper"], f"turn 3: expected one ask node, got {dag3.trace}"
     print("[ok] turn 3 completed; prompt_sha256 unchanged")
     print(
         f"iteration_budget after turn 3: {conversation.iteration_budget.used}/{conversation.iteration_budget.max_total}"
     )
 
     print("\n=== turn 4: forced budget exhaustion ===")
-    result4, conversation = await take_turn(
+    dispatch, tracker = build_dispatch(conversation)
+    result4, conversation = await plugin_dispatch.take_turn_and_reconcile(
         conversation,
+        dispatch,
+        tracker,
         user_input="Reply with a short one-sentence greeting and nothing else.",
         provider=PROVIDER,
         model=MODEL,
-        dispatch=dispatch,
         now=0.0,
     )
-    conversation = replace(conversation, next_child_seq=next_child_seq)
     print(f"exit_reason={result4.exit_reason} detail={result4.detail!r}")
     assert result4.exit_reason == ExitReason.BUDGET_EXHAUSTED, (
         f"turn 4: expected BUDGET_EXHAUSTED, got {result4.exit_reason} — "

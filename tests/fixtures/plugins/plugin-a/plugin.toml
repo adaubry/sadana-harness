@@ -1,0 +1,36 @@
+[plugin]
+name = "plugin-a"
+version = "0.1.0"
+description = "Reaches outside for a stand-in webhook payload, asks a focused helper about it, and branches on whether the helper acknowledged."
+
+[[entry]]
+tool = "plugin_a_entry"
+purpose = "Runs plugin-a's flow: fetches a webhook-style input, hands it to a focused helper, and reports back."
+parameters = "schema/plugin_a_entry.json"
+start = "fetch_webhook"
+
+[[node]]
+name = "fetch_webhook"
+kind = "call"
+body = "init:fetch_webhook"
+next = "interpret"
+
+[[node]]
+name = "interpret"
+kind = "ask"
+skill = "plugin-a-skill"
+next = "branch_on_reply"
+
+[[node]]
+name = "branch_on_reply"
+kind = "route"
+body = "init:classify"
+ports = ["acknowledged", "not_acknowledged"]
+
+[[node]]
+name = "acknowledged"
+kind = "stop"
+
+[[node]]
+name = "not_acknowledged"
+kind = "stop"

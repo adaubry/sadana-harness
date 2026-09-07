@@ -1,0 +1,15 @@
+[plugin]
+name = "plugin-b"
+version = "0.1.0"
+description = "The simplest possible flow: hands a note to a focused helper and reports back."
+
+[[entry]]
+tool = "plugin_b_entry"
+purpose = "Runs plugin-b's flow: hands a short note to a focused helper and reports back."
+parameters = "schema/plugin_b_entry.json"
+start = "ask_helper"
+
+[[node]]
+name = "ask_helper"
+kind = "ask"
+skill = "plugin-b-skill"

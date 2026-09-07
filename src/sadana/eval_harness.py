@@ -19,7 +19,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
-from sadana import config, plugins
+from sadana import config, plugin_dispatch, plugins
 from sadana.conversation import (
     Conversation,
     ConversationKey,
@@ -40,11 +40,15 @@ class Task:
     ``grade`` reads the turn's own ``TurnResult`` and resulting message
     history directly — no new type wraps them; `conversation.py` already
     defines both, and a grader reading them is the smallest surface that
-    could work (spec.md's own guideline-3 reasoning)."""
+    could work (spec.md's own guideline-3 reasoning). The third parameter,
+    ``dag_results``, is every ``DagResult`` the turn's own dispatch calls
+    produced (`docs/tasks/G3-real-plugin-under-eval/spec.md`) — a grader
+    that cares what a plugin actually did reads its structured trace here,
+    never a substring match against rendered message content."""
 
     task_id: str
     prompt: str
-    grade: Callable[[TurnResult, tuple[Message, ...]], float]
+    grade: Callable[[TurnResult, tuple[Message, ...], tuple[plugins.DagResult, ...]], float]
 
 
 @dataclass(frozen=True)
@@ -112,7 +116,11 @@ async def run_task(
     not an independently-constructed guess at what it would be (EVAL-02's
     own build caught this: a caller building its own `Conversation` via a
     second `create_conversation()` call, hoping it matches, is a silent
-    divergence risk the moment this function's own call ever changes)."""
+    divergence risk the moment this function's own call ever changes).
+
+    The given dispatch is wrapped in `plugin_dispatch.capturing_dispatch`
+    so `task.grade` receives every `DagResult` the turn's own dispatch
+    calls produced, not just `TurnResult`/the message history."""
     conversation, _template = create_conversation(
         template,
         key=key if key is not None else run_task_key(task.task_id, now),
@@ -120,15 +128,16 @@ async def run_task(
         iteration_budget=iteration_budget,
     )
     dispatch = dispatch_factory(conversation)
+    wrapped_dispatch, captured = plugin_dispatch.capturing_dispatch(dispatch)
     result, updated = await take_turn(
         conversation,
         user_input=task.prompt,
         provider=provider,
         model=model,
-        dispatch=dispatch,
+        dispatch=wrapped_dispatch,
         now=now,
     )
-    score = task.grade(result, updated.messages)
+    score = task.grade(result, updated.messages, tuple(captured))
     return TaskRun(
         task_id=task.task_id,
         score=score,

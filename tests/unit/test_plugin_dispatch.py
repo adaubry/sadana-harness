@@ -186,6 +186,21 @@ def _one_ask_node_plugin_set(tmp_path: Path) -> PluginSet:
     return PluginSet(catalog=(), tool_specs=(), by_tool={"do_it": (installed, manifest.entries[0])})
 
 
+def _one_call_node_plugin_set(tmp_path: Path) -> PluginSet:
+    plugin_dir = tmp_path / "p"
+    plugin_dir.mkdir()
+    (plugin_dir / "init.py").write_text("def reach_out(value):\n    return {'reached': value}\n")
+    manifest = Manifest(
+        name="p",
+        version="0.1.0",
+        description="d",
+        entries=(Entry(tool="do_it", purpose="p", parameters="s.json", start="call_step"),),
+        nodes=(Node(name="call_step", kind="call", body="init:reach_out"),),
+    )
+    installed = InstalledPlugin(name="p", directory=plugin_dir, manifest=manifest)
+    return PluginSet(catalog=(), tool_specs=(), by_tool={"do_it": (installed, manifest.entries[0])})
+
+
 @pytest.mark.unit
 def test_build_dispatch_ask_updates_the_tracker_from_run_childs_updated_parent(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -260,3 +275,27 @@ def test_take_turn_and_reconcile_applies_the_trackers_seq_onto_the_result(monkey
 
     assert result.final_text == "hi"
     assert updated.next_child_seq == 5
+
+
+@pytest.mark.unit
+def test_build_dispatch_threads_a_given_approve_to_run_graph(tmp_path: Path) -> None:
+    """G3-real-plugin-under-eval: without this passthrough, a `call` node
+    built through `build_dispatch` falls back to `run_graph`'s own
+    default, which blocks on real stdin — this test would hang instead of
+    failing if the passthrough were missing."""
+    plugin_set = _one_call_node_plugin_set(tmp_path)
+    seen: list[tuple[str, str]] = []
+
+    async def fake_approve(plugin: str, node: str, _value: object) -> bool:
+        seen.append((plugin, node))
+        return True
+
+    dispatch, _tracker = build_dispatch(
+        _conversation(), plugin_set, stable_prompt="", provider="p", model="m", now=0.0, approve=fake_approve
+    )
+
+    result = asyncio.run(dispatch("do_it", {"a": 1}))
+
+    assert result.failed_node is None
+    assert result.text == json.dumps({"reached": {"a": 1}})
+    assert seen == [("p", "call_step")]

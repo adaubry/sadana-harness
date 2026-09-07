@@ -41,6 +41,7 @@ WSL only. Python lives in `.venv`; `make` puts it on PATH for you, so there is n
 - Provider-specific wire-format knowledge — what a given transport's request shape accepts or silently drops — lives in MODEL-ACCESS, never in CONTEXT or CONVERSATION.
 - A retry loop over a provider's Retry outcome lives once, in MODEL-ACCESS's own resolve(), never duplicated per caller.
 - A plugin's outcome crosses back to its caller only as a returned DagResult — never a raised exception for an expected outcome, a string convention, or any other side channel.
+- A Task's grade() reads DagResult/NodeTrace structure to judge plugin behavior — never a substring match against rendered message content.
 - A classified outcome whose branches carry meaningfully different data — model_access.classify()'s Outcome today, more as they land — is a named, closed set of outcome types, never a raised exception. A result whose branches differ only by one field, like DagResult, doesn't need this shape.
 - plugins.py and plugin_manifest.py never import conversation.py — anything needing both lives in a separate module that imports conversation.py, keeping PLUGINS' leaf modules acyclic.
 - A plugin graph's node receives only its immediate predecessor's output, never the run's accumulated history.

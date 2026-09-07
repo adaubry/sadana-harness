@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 from conftest import write_skill as _write_skill
+from sadana import execution
 from sadana.plugin_manifest import _default_approve, discover_plugins, load_skill, run_graph, validate
 from sadana.plugins import (
     Artifact,
@@ -17,6 +18,7 @@ from sadana.plugins import (
     DanglingTarget,
     DuplicateNodeName,
     Entry,
+    InstalledPlugin,
     InvalidSchema,
     Manifest,
     ManifestParseError,
@@ -686,3 +688,108 @@ def test_run_graph_walks_compute_ask_route_and_stop_together(tmp_path: Path) -> 
     assert all(t.ok for t in result.trace)
     assert result.trace[2].port == "urgent"
     assert result.text == "child said: " + json.dumps({"from_fetch": {"raw": True}})
+
+
+# ── G3: the real plugin-a/plugin-b fixtures, end to end ────────────────
+# Full contract: docs/tasks/G3-real-plugin-under-eval/spec.md. These walk
+# the actual shipped tests/fixtures/plugins/plugin-{a,b} directories — not
+# an equivalent thrown-together fixture — with the network (execution.run_http)
+# and the model (ask) faked, per testing-conventions' network ban.
+
+_REAL_FIXTURES = Path(__file__).resolve().parent.parent / "fixtures" / "plugins"
+
+
+def _find_real_plugin(name: str) -> InstalledPlugin:
+    installed = discover_plugins(plugins_root=_REAL_FIXTURES)
+    for plugin in installed:
+        if plugin.name == name:
+            return plugin
+    raise AssertionError(f"{name!r} not found among {[p.name for p in installed]!r}")
+
+
+@pytest.mark.unit
+def test_discover_plugins_finds_the_real_plugin_a_and_plugin_b() -> None:
+    names = {p.name for p in discover_plugins(plugins_root=_REAL_FIXTURES)}
+    assert {"plugin-a", "plugin-b"} <= names
+
+
+@pytest.mark.unit
+def test_real_plugin_a_acknowledged_branch_end_to_end(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(execution, "run_http", lambda _request: execution.Success(status=200, body=b"ok"))
+    installed = _find_real_plugin("plugin-a")
+
+    async def ack_ask(_skill: SkillRef, _text: str) -> str:
+        return "a short summary. ACKNOWLEDGED"
+
+    result = asyncio.run(
+        run_graph(
+            installed.directory,
+            installed.manifest,
+            installed.manifest.entries[0],
+            {},
+            ask=ack_ask,
+            approve=_stub_approve_ok,
+        )
+    )
+    assert result.failed_node is None
+    assert [t.node for t in result.trace] == ["fetch_webhook", "interpret", "branch_on_reply", "acknowledged"]
+    assert result.artifacts == (Artifact(kind="link", name="webhook", ref="https://example.com"),)
+    assert result.trace[2].port == "acknowledged"
+
+
+@pytest.mark.unit
+def test_real_plugin_a_not_acknowledged_branch_end_to_end(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(execution, "run_http", lambda _request: execution.Success(status=200, body=b"ok"))
+    installed = _find_real_plugin("plugin-a")
+
+    async def no_ack_ask(_skill: SkillRef, _text: str) -> str:
+        return "a short summary with no marker"
+
+    result = asyncio.run(
+        run_graph(
+            installed.directory,
+            installed.manifest,
+            installed.manifest.entries[0],
+            {},
+            ask=no_ack_ask,
+            approve=_stub_approve_ok,
+        )
+    )
+    assert result.failed_node is None
+    assert result.trace[2].port == "not_acknowledged"
+
+
+@pytest.mark.unit
+def test_real_plugin_a_declined_never_reaches_the_network(monkeypatch: pytest.MonkeyPatch) -> None:
+    def _boom(_request: execution.HttpRequest) -> execution.Outcome:
+        raise AssertionError("run_http must not be called when the call node is declined")
+
+    monkeypatch.setattr(execution, "run_http", _boom)
+    installed = _find_real_plugin("plugin-a")
+
+    result = asyncio.run(
+        run_graph(
+            installed.directory,
+            installed.manifest,
+            installed.manifest.entries[0],
+            {},
+            ask=_stub_ask_ok,
+            approve=_stub_approve_denied,
+        )
+    )
+    assert result.failed_node == "fetch_webhook"
+    assert result.trace[-1].detail == "declined"
+
+
+@pytest.mark.unit
+def test_real_plugin_b_end_to_end() -> None:
+    installed = _find_real_plugin("plugin-b")
+
+    async def echo_ask(_skill: SkillRef, text: str) -> str:
+        return f"got it: {text}"
+
+    result = asyncio.run(
+        run_graph(installed.directory, installed.manifest, installed.manifest.entries[0], {"note": "hi"}, ask=echo_ask)
+    )
+    assert result.failed_node is None
+    assert [t.node for t in result.trace] == ["ask_helper"]

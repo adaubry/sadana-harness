@@ -22,6 +22,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
+from sadana import plugins  # noqa: E402
 from sadana.conversation import (  # noqa: E402
     ConversationTemplate,
     ExitReason,
@@ -37,7 +38,7 @@ PROVIDER = "openrouter"
 
 
 def _exact_match(expected: str):
-    def grade(result: TurnResult, _messages: tuple[Message, ...]) -> float:
+    def grade(result: TurnResult, _messages: tuple[Message, ...], _dag_results: tuple[plugins.DagResult, ...]) -> float:
         return 1.0 if (result.final_text or "").strip() == expected else 0.0
 
     return grade

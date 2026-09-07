@@ -31,8 +31,10 @@ def _text_response(text: str) -> model_access.Response:
     return model_access.Response(content=text, tool_calls=(), finish_reason="stop", usage=model_access.Usage())
 
 
-def _exact_match_grader(expected: str) -> Callable[[TurnResult, tuple[Message, ...]], float]:
-    def grade(result: TurnResult, _messages: tuple[Message, ...]) -> float:
+def _exact_match_grader(
+    expected: str,
+) -> Callable[[TurnResult, tuple[Message, ...], tuple[plugins.DagResult, ...]], float]:
+    def grade(result: TurnResult, _messages: tuple[Message, ...], _dag_results: tuple[plugins.DagResult, ...]) -> float:
         return 1.0 if result.final_text == expected else 0.0
 
     return grade
@@ -79,7 +81,7 @@ def test_run_task_non_completed_exit_still_graded(monkeypatch: pytest.MonkeyPatc
     monkeypatch.setattr(model_access, "send", lambda request: _text_response("irrelevant"))
     grader_saw: list[ExitReason] = []
 
-    def grade(result: TurnResult, _messages: tuple[Message, ...]) -> float:
+    def grade(result: TurnResult, _messages: tuple[Message, ...], _dag_results: tuple[plugins.DagResult, ...]) -> float:
         grader_saw.append(result.exit_reason)
         return 0.0
 
@@ -147,7 +149,7 @@ def test_run_task_with_real_dispatch_reaches_the_grader(monkeypatch: pytest.Monk
 
         return dispatch
 
-    def grade(_result: TurnResult, messages: tuple[Message, ...]) -> float:
+    def grade(_result: TurnResult, messages: tuple[Message, ...], _dag_results: tuple[plugins.DagResult, ...]) -> float:
         tool_messages = [m for m in messages if m.role == "tool"]
         return 1.0 if any(m.content == "TOOL_RAN_OK" for m in tool_messages) else 0.0
 
@@ -169,6 +171,62 @@ def test_run_task_with_real_dispatch_reaches_the_grader(monkeypatch: pytest.Monk
     assert run.exit_reason == ExitReason.COMPLETED
     assert run.score == 1.0
     assert factory_saw_key == ["explicit-key"]  # the factory got the real conversation, not a guess
+
+
+@pytest.mark.unit
+def test_run_task_threads_captured_dag_results_to_the_grader(monkeypatch: pytest.MonkeyPatch) -> None:
+    """G3-real-plugin-under-eval: task.grade's third parameter is every
+    DagResult the turn's own dispatch produced, not just TurnResult and
+    the message history."""
+    template = ConversationTemplate(
+        name="eval-dag-results-test",
+        recipe=TemplateRecipe(
+            stable_prompt="You are a test fixture.",
+            catalog=(),
+            tool_specs=(
+                ToolSpec(
+                    key="noop_tool",
+                    name="noop_tool",
+                    parameters={"type": "object", "properties": {}},
+                    describe=lambda _resolved: "does nothing",
+                ),
+            ),
+        ),
+    )
+    responses = iter([_tool_call_response("noop_tool"), _text_response("done")])
+    monkeypatch.setattr(model_access, "send", lambda request: next(responses))
+
+    known_result = plugins.DagResult(
+        plugin="test", entry="noop_tool", text="ok", artifacts=(), trace=(), failed_node=None
+    )
+
+    def dispatch_factory(_conversation: Conversation) -> Callable[[str, dict], Awaitable[plugins.DagResult]]:
+        async def dispatch(_name: str, _arguments: dict) -> plugins.DagResult:
+            return known_result
+
+        return dispatch
+
+    seen_dag_results: list[tuple[plugins.DagResult, ...]] = []
+
+    def grade(_result: TurnResult, _messages: tuple[Message, ...], dag_results: tuple[plugins.DagResult, ...]) -> float:
+        seen_dag_results.append(dag_results)
+        return 1.0
+
+    task = Task(task_id="dag_results", prompt="call the tool", grade=grade)
+
+    asyncio.run(
+        run_task(
+            task,
+            template,
+            provider="p",
+            model="m",
+            iteration_budget=IterationBudget(max_total=5),
+            now=0.0,
+            dispatch_factory=dispatch_factory,
+        )
+    )
+
+    assert seen_dag_results == [(known_result,)]
 
 
 @pytest.mark.unit

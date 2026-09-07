@@ -4,11 +4,13 @@
 The first real, keep-forever eval task — not a `scripts/prove_*.py`
 mechanism proof. Checks genuine plugin dispatch: does the model, told
 about one mounted add-on procedure, actually call it when the prompt
-asks for it. Reuses CONV-09/CONV-10's own `plugin-a` fixture
-(`tests/fixtures/plugins/plugin-a/skills/plugin-a-skill`) as-is — the
-same webhook-style-input -> child-spawn -> branch shape, not a
-reimplementation. See docs/tasks/EVAL-02-one-real-turn/spec.md for the
-full contract.
+asks for it. Drives the real, on-disk `plugin-a` fixture
+(`tests/fixtures/plugins/plugin-a`) through the actual dispatch
+mechanism — `discover_plugins()` -> `build_plugin_set()` ->
+`build_dispatch()` -> `run_graph()` -> a real `run_child()` call — not a
+hand-written, per-plugin dispatch closure. See
+docs/tasks/EVAL-02-one-real-turn/spec.md and
+docs/tasks/G3-real-plugin-under-eval/spec.md for the full contract.
 
 Not a pytest test — testing-conventions bars the network and the model API
 from the unit suite. Run manually with a real OPENROUTER_API_KEY, paste its
@@ -19,6 +21,10 @@ response out), not a single model call: internally this costs three real
 calls — the parent asking for the tool, the spawned child's own
 completion, the parent's final response after the tool result — the same
 shape CONV-09's own turn 2 already proved (spec.md §Design).
+
+`grade()` reads the turn's own captured `DagResult.trace` — G3's own point:
+a `Task` whose grading function reads structure, never a substring match
+against rendered message content (CLAUDE.md).
 """
 
 from __future__ import annotations
@@ -26,25 +32,19 @@ from __future__ import annotations
 import asyncio
 import os
 import sys
-from collections.abc import Awaitable, Callable
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent.parent / "src"))
 
-from sadana import plugins  # noqa: E402
+from sadana import plugin_dispatch, plugin_manifest, plugins  # noqa: E402
 from sadana.conversation import (  # noqa: E402
-    ChildSpec,
     Conversation,
     ConversationTemplate,
     ExitReason,
     IterationBudget,
     Message,
-    PluginCatalogEntry,
-    SkillRef,
     TemplateRecipe,
-    ToolSpec,
     TurnResult,
-    run_child,
 )
 from sadana.eval_harness import Task, results_dir_from_config, run_task, save_result  # noqa: E402
 
@@ -54,96 +54,31 @@ STABLE_PROMPT = (
     "You are a plainly-behaved assistant used only by sadana-harness's own "
     "EVAL-02 real-turn task. Follow instructions exactly and literally."
 )
-_ACK_MARKER = "ACKNOWLEDGED"
 _TASK_KEY = "eval/plugin_dispatch/0"
 
 FIXTURES_ROOT = Path(__file__).resolve().parent.parent.parent.parent / "tests" / "fixtures" / "plugins"
 
 
-def build_template() -> ConversationTemplate:
-    recipe = TemplateRecipe(
-        stable_prompt=STABLE_PROMPT,
-        catalog=(
-            PluginCatalogEntry(
-                name="plugin-a",
-                purpose="Runs a small flow via a focused helper.",
-                entry_tool="plugin_a_entry",
-            ),
-        ),
-        tool_specs=(
-            ToolSpec(
-                key="plugin_a_entry",
-                name="plugin_a_entry",
-                parameters={"type": "object", "properties": {}},
-                describe=lambda _resolved: (
-                    "Runs plugin-a's flow: fetches a webhook-style input, hands it to a "
-                    "focused helper, and reports back."
-                ),
-            ),
-        ),
-    )
-    return ConversationTemplate(name="eval02-plugin-dispatch", recipe=recipe)
+async def auto_approve(plugin: str, node: str, _value: object) -> bool:
+    """This task's own honest stand-in for a person — answers the real
+    approval question every time, without waiting on one
+    (docs/tasks/G3-real-plugin-under-eval/spec.md)."""
+    print(f"    [auto-approved] {plugin}'s {node!r} step")
+    return True
 
 
-def make_dispatch(parent: Conversation) -> Callable[[str, dict], Awaitable[plugins.DagResult]]:
-    """A `dispatch_factory` for `run_task()` (EVAL-02's own addition to
-    `eval_harness.py`): receives the real `Conversation` `run_task()`
-    built, so `run_child()` below gets the actual parent, never an
-    independently-guessed one. This task calls `run_child()` exactly
-    once, so there is no second spawn's `next_child_seq` to propagate —
-    CONV-10's propagation fix has nothing to apply to here."""
-
-    async def dispatch(name: str, arguments: dict) -> plugins.DagResult:
-        webhook_input = "incoming webhook payload: {'event': 'ping'}"
-        spec = ChildSpec(
-            node_name="plugin_a_child",
-            skill=SkillRef(plugin="plugin-a", skill="plugin-a-skill"),
-            input=webhook_input,
-            tools=frozenset(),
-            budget=IterationBudget(max_total=3),
-        )
-        result, _child, _updated_parent = await run_child(
-            parent,
-            spec,
-            stable_prompt=STABLE_PROMPT,
-            provider=PROVIDER,
-            model=MODEL,
-            dispatch=dispatch,
-            now=0.0,
-        )
-
-        acknowledged = bool(result.final_text and _ACK_MARKER in result.final_text)
-        if acknowledged:
-            text = f"plugin-a: child acknowledged. report: {result.final_text}"
-        else:
-            text = f"plugin-a: child did not acknowledge as expected. raw report: {result.final_text!r}"
-        ask_trace = plugins.NodeTrace(
-            node="ask_helper", kind="ask", visit=0, ok=True, port=None, detail=f"child exit={result.exit_reason}"
-        )
-        return plugins.DagResult(
-            plugin="plugin-a",
-            entry="plugin_a_entry",
-            text=text,
-            artifacts=(),
-            trace=(ask_trace,),
-            failed_node=None,
-        )
-
-    return dispatch
-
-
-def grade(_result: TurnResult, messages: tuple[Message, ...]) -> float:
+def grade(_result: TurnResult, _messages: tuple[Message, ...], dag_results: tuple[plugins.DagResult, ...]) -> float:
     """Structural grading (hermes's own `core_tool_deferral` shape, no
-    LLM-as-judge): did the model call `plugin_a_entry`, and did the tool
-    result show the spawned child correctly acknowledged. Partial credit
-    for "called but didn't come back right" — the mechanism partly
-    worked; spec.md §Concerns names this as this task's own judgement
-    call, not a project-wide scale."""
-    called = any(m.role == "assistant" and any(tc["name"] == "plugin_a_entry" for tc in m.tool_calls) for m in messages)
-    if not called:
+    LLM-as-judge): did plugin-a's own DAG actually run, and did it reach
+    the `acknowledged` port. Partial credit for "ran but didn't come back
+    right" — the mechanism partly worked; spec.md §Concerns names this as
+    this task's own judgement call, not a project-wide scale."""
+    if not dag_results:
         return 0.0
-    acknowledged = any(m.role == "tool" and m.content and "child acknowledged" in m.content for m in messages)
-    return 1.0 if acknowledged else 0.5
+    dag = dag_results[-1]
+    if dag.failed_node is not None:
+        return 0.0
+    return 1.0 if any(t.port == "acknowledged" for t in dag.trace) else 0.5
 
 
 TASK = Task(
@@ -156,7 +91,28 @@ TASK = Task(
 async def main() -> None:
     os.environ["SADANA_PLUGINS_DIR"] = str(FIXTURES_ROOT)
 
-    template = build_template()
+    installed = plugin_manifest.discover_plugins()
+    plugin_set = plugin_dispatch.build_plugin_set(p for p in installed if p.name == "plugin-a")
+    assert "plugin_a_entry" in plugin_set.by_tool, f"plugin_a_entry missing from the built PluginSet: {installed}"
+
+    template = ConversationTemplate(
+        name="eval02-plugin-dispatch",
+        recipe=TemplateRecipe(
+            stable_prompt=STABLE_PROMPT, catalog=plugin_set.catalog, tool_specs=plugin_set.tool_specs
+        ),
+    )
+
+    def dispatch_factory(conversation: Conversation) -> plugin_dispatch.DispatchFn:
+        dispatch, _tracker = plugin_dispatch.build_dispatch(
+            conversation,
+            plugin_set,
+            stable_prompt=STABLE_PROMPT,
+            provider=PROVIDER,
+            model=MODEL,
+            now=0.0,
+            approve=auto_approve,
+        )
+        return dispatch
 
     run = await run_task(
         TASK,
@@ -166,7 +122,7 @@ async def main() -> None:
         iteration_budget=IterationBudget(max_total=3),
         now=0.0,
         key=_TASK_KEY,
-        dispatch_factory=make_dispatch,
+        dispatch_factory=dispatch_factory,
     )
 
     print(f"task_id={run.task_id}")
@@ -175,8 +131,8 @@ async def main() -> None:
     print(f"score={run.score}")
 
     assert run.exit_reason == ExitReason.COMPLETED, f"expected COMPLETED, got {run.exit_reason}"
-    assert run.score == 1.0, f"expected a full score (tool called and child acknowledged), got {run.score}"
-    print("[ok] plugin dispatch verified end to end")
+    assert run.score == 1.0, f"expected a full score (plugin-a ran and acknowledged), got {run.score}"
+    print("[ok] plugin dispatch verified end to end, graded by structure")
 
     path = save_result(run, results_dir_from_config())
     print(f"[ok] result saved to {path}")

@@ -31,6 +31,25 @@ from sadana.conversation import take_turn as _take_turn
 DispatchFn = Callable[[str, dict], Awaitable[plugins.DagResult]]
 
 
+def capturing_dispatch(dispatch: DispatchFn) -> tuple[DispatchFn, list[plugins.DagResult]]:
+    """Wraps one turn's own dispatch, capturing what it returns before
+    `run_turn` discards everything but `.text`
+    (`docs/tasks/G3-real-plugin-under-eval/spec.md`). The one shared
+    implementation of a technique this project proved three times
+    independently before landing here — `scripts/prove_plugin_dispatch_e2e.py`'s
+    own `_make_capturing_dispatch` first, `eval_harness.run_task` and
+    `scripts/prove_conversation_e2e.py` next. A fresh `captured` list per
+    call, never shared across turns."""
+    captured: list[plugins.DagResult] = []
+
+    async def wrapped(name: str, arguments: dict) -> plugins.DagResult:
+        result = await dispatch(name, arguments)
+        captured.append(result)
+        return result
+
+    return wrapped, captured
+
+
 @dataclass(frozen=True)
 class PluginSet:
     """Everything a template's recipe and a real dispatch call both need,
@@ -110,6 +129,7 @@ def build_dispatch(
     model: str,
     now: float,
     persist: Callable[[tuple[Message, ...]], Awaitable[None]] = _noop_persist,
+    approve: plugins.ApproveFn = plugin_manifest._default_approve,
 ) -> tuple[DispatchFn, ChildSeqTracker]:
     """Builds one dispatch closure matching `conversation.py`'s own
     `dispatch` contract exactly, and the `ChildSeqTracker` it shares with
@@ -123,7 +143,11 @@ def build_dispatch(
     bounded, tool-less child via `run_child` (a judgement step is pure
     judgement, `plugin_blueprint.md §3.3` — nothing in `Node` gives a
     plugin author a way to ask for more) and reports back its final text
-    on a clean `ExitReason.COMPLETED`, `None` otherwise.
+    on a clean `ExitReason.COMPLETED`, `None` otherwise. `approve` passes
+    straight through to `run_graph` for its own `call`-node gate
+    (`docs/tasks/G3-real-plugin-under-eval/spec.md`) — defaulted, like
+    `persist`, since no caller needed to override it until a real `call`
+    node existed.
 
     **The caller's obligation**, since nothing enforces it structurally:
     after a `take_turn()` call made with the returned dispatch, reconcile
@@ -163,7 +187,9 @@ def build_dispatch(
                 failed_node="entry",
             )
         installed, entry = hit
-        return await plugin_manifest.run_graph(installed.directory, installed.manifest, entry, arguments, ask=ask)
+        return await plugin_manifest.run_graph(
+            installed.directory, installed.manifest, entry, arguments, ask=ask, approve=approve
+        )
 
     return dispatch, tracker
 
