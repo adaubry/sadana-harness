@@ -129,7 +129,10 @@ We will iterate on our MVP, sand off the rough edges, and focus on stability, pe
 
 ## Layout and ownership informations
 
-Caution, docs/reference/ (the hermes index) is generated and must never be hand-edited
+`docs/reference/hermes_core_blocks_kind.csv` is generated and must never be
+hand-edited; every other file under `docs/reference/` is hand-authored and
+tracked like source. A pre-commit check fails any citation to a
+`docs/reference/` path that isn't tracked or that exception.
 
 A Make target is one line. The moment it needs branching, environment setup or
 error handling it becomes a script in `scripts/`, and the target calls that.

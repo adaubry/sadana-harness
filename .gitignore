@@ -29,5 +29,8 @@ __pycache__/
 .idea/
 .DS_Store
 
-# References
-docs/reference/*
+# The hermes core-block index is regenerated from ../hermes-agent and must
+# never be hand-edited or trusted stale (CLAUDE.md, "The reference corpus").
+# Every other file under docs/reference/ is hand-authored analysis and is
+# tracked like any other source.
+docs/reference/hermes_core_blocks_kind.csv

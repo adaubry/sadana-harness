@@ -7,7 +7,7 @@
 go wrong. No reference-corpus lookup was done for this plan: `spec.md`'s
 Design section already established that `../hermes-agent` has no analog
 for a documented multi-stage engineering process, so there is nothing in
-`docs/reference/hermes_core_blocks.csv` to consult for a prose-only
+`docs/reference/hermes_core_blocks_kind.csv` to consult for a prose-only
 change to this project's own methodology files.
 
 ## Files that change

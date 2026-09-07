@@ -4,9 +4,10 @@
 # mypy is deliberately NOT here — `make typecheck` owns static types. Running
 # it in both places means two configs that will disagree.
 #
-# docs/reference/ is excluded: the hermes index is a generated 500KB+ CSV, and
-# formatting a corpus you did not write is noise.
-exclude: '^(\.sadana-bootstrap-backup/|docs/reference/)'
+# Only the hermes index is excluded: it's a generated 500KB+ CSV, and
+# formatting a corpus you did not write is noise. Everything else under
+# docs/reference/ is hand-authored and gets every hook like any other source.
+exclude: '^(\.sadana-bootstrap-backup/|docs/reference/hermes_core_blocks_kind\.csv)'
 
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
@@ -74,3 +75,16 @@ repos:
     rev: v1.5.0
     hooks:
       - id: detect-secrets
+
+  # docs/reference/ mixes one regenerated index with hand-authored analysis
+  # (docs/tasks/A2-reference-tracking-scope). A citation into it from tracked
+  # content has to resolve to a tracked file for a fresh clone to make sense
+  # of it — this is what makes that a checkable fact, not a convention.
+  - repo: local
+    hooks:
+      - id: check-reference-citations
+        name: docs/reference/ citations resolve to tracked files
+        entry: python3 scripts/check_reference_citations.py
+        language: system
+        pass_filenames: false
+        always_run: true

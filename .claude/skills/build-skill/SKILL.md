@@ -26,7 +26,7 @@ mid-thought; the gate is what stops you succeeding at it.
 Read `intent.md` and `spec.md` for this work item. Then find the reference
 files that already solve something like this.
 
-**The index is `docs/reference/hermes_core_blocks.csv`** — 2,368 rows,
+**The index is `docs/reference/hermes_core_blocks_kind.csv`** — 2,368 rows,
 one per file in the reference corpus's core, with columns:
 
 | column     | meaning                                                                                                                                                                                                                                                                                                           |
@@ -38,15 +38,15 @@ one per file in the reference corpus's core, with columns:
 ```bash
 # every production file in a block
 awk -F, '$1=="CONFIG" && $3=="production-code" {print $5}' \
-  docs/reference/hermes_core_blocks.csv
+  docs/reference/hermes_core_blocks_kind.csv
 
 # how big is a block, really
 awk -F, 'NR>1 && $3=="production-code" {c[$1]++} END{for(b in c) print c[b], b}' \
-  docs/reference/hermes_core_blocks.csv | sort -rn
+  docs/reference/hermes_core_blocks_kind.csv | sort -rn
 ```
 
 No field contains a comma, so `awk -F,` is safe. If only the three-column
-`hermes_core_blocks.csv` is present, the columns are `block,filename,path`
+`hermes_core_blocks_kind.csv` is present, the columns are `block,filename,path`
 
 **When the user names a block, load it before asking anything.** List its
 production files, then read the three to six whose names match the concern in
