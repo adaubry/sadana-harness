@@ -299,11 +299,11 @@ async def run_graph(
 
     A ``call`` node is asked about, via ``approve``, before anything else
     happens for it — no other kind is (`docs/tasks/F1-call-node-approval/
-    spec.md`). Approval only clears the way to ask; no ``call`` node has a
-    body-execution mechanism wired to it yet (PLUGINS' execution half, a
-    separate later item), so an approved ``call`` node still ends the walk,
-    the same way an ``each``/``wait`` node already does — the trace's
-    ``detail`` is what distinguishes "declined" from "not runnable yet".
+    spec.md`). Only once approved does its body run, resolved the same way
+    ``compute``'s already is, but off the event loop (``asyncio.to_thread``)
+    since ``call`` is the one kind expected to block
+    (`docs/tasks/G1-call-node-run/spec.md`) — a declined ``call`` node never
+    reaches body resolution at all.
 
     Exactly one ``value`` is threaded through the loop — the entry's raw
     ``arguments`` for the first node, each node's own output after that.
@@ -349,7 +349,13 @@ async def run_graph(
                 value = output
             elif node.kind == "call":
                 approved = await approve(manifest.name, node.name, value)
-                return failed(node, f"{node.kind} steps are not runnable yet" if approved else "declined")
+                if not approved:
+                    return failed(node, "declined")
+
+                def run_body(n: plugins.Node = node, v: object = value) -> object:
+                    return _resolve_body(plugin_dir, n, modules)(v)
+
+                value = await asyncio.to_thread(run_body)
             elif node.kind == "stop":
                 pass
             else:

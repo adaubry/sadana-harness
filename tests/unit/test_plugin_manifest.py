@@ -510,14 +510,32 @@ def test_run_graph_a_raising_body_fails_closed_without_leaking_the_exception(tmp
 
 
 @pytest.mark.unit
-def test_run_graph_refuses_call_nodes(tmp_path: Path) -> None:
-    plugin_dir = _write_init_py(tmp_path, "")
-    manifest = _manifest(Node(name="future", kind="call", body="init:whatever"))
-    result = asyncio.run(
-        run_graph(plugin_dir, manifest, _entry("future"), {}, ask=_stub_ask_ok, approve=_stub_approve_ok)
+def test_run_graph_call_node_runs_its_body_and_threads_the_result(tmp_path: Path) -> None:
+    plugin_dir = _write_init_py(tmp_path, "def do_call(value):\n    return {'called': value}\n")
+    nodes = (
+        Node(name="reach_out", kind="call", body="init:do_call", next="done"),
+        Node(name="done", kind="stop"),
     )
-    assert result.failed_node == "future"
-    assert "not runnable yet" in (result.trace[-1].detail or "")
+    manifest = _manifest(*nodes)
+    result = asyncio.run(
+        run_graph(plugin_dir, manifest, _entry("reach_out"), {"a": 1}, ask=_stub_ask_ok, approve=_stub_approve_ok)
+    )
+    assert result.failed_node is None
+    assert result.text == json.dumps({"called": {"a": 1}})
+    assert [t.node for t in result.trace] == ["reach_out", "done"]
+
+
+@pytest.mark.unit
+def test_run_graph_call_node_raising_body_fails_closed(tmp_path: Path) -> None:
+    plugin_dir = _write_init_py(tmp_path, "def boom(value):\n    raise KeyError('super secret internal detail')\n")
+    manifest = _manifest(Node(name="explode", kind="call", body="init:boom"))
+    result = asyncio.run(
+        run_graph(plugin_dir, manifest, _entry("explode"), {}, ask=_stub_ask_ok, approve=_stub_approve_ok)
+    )
+    assert result.failed_node == "explode"
+    assert "super secret internal detail" not in result.text
+    assert "Traceback" not in result.text
+    assert result.trace[-1].ok is False
 
 
 @pytest.mark.unit
@@ -538,7 +556,7 @@ def test_run_graph_call_node_records_what_was_asked(tmp_path: Path) -> None:
 
     async def _capturing_approve(plugin: str, node: str, value: object) -> bool:
         seen.append((plugin, node, value))
-        return True
+        return False
 
     manifest = _manifest(Node(name="future", kind="call", body="init:whatever"), name="my-plugin")
     asyncio.run(
