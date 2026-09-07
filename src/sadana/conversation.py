@@ -20,10 +20,9 @@ import re
 from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass, replace
 from enum import Enum
-from pathlib import Path
 from typing import Literal
 
-from sadana import config, context, model_access, plugins
+from sadana import config, context, model_access, plugin_manifest, plugins
 
 # A caller-supplied natural key, e.g. "support/ticket-4821". This module
 # does not mint or validate one, and does not enforce it is unique — that
@@ -1157,92 +1156,8 @@ async def take_turn(
 
 # ── CONV-07: child conversation ──────────────────────────────────────────
 # Its full contract is `docs/tasks/C9-child-conversation/spec.md`.
-
-
-@dataclass(frozen=True)
-class SkillRef:
-    """A name, not a path — see spec.md's Design section. A plugin's real
-    on-disk location can move (re-install, version bump) independently of
-    anything holding a reference to it, so this holds the two names that
-    resolve to one, fresh, every call."""
-
-    plugin: str
-    skill: str
-
-
-class SkillLoadError(Exception):
-    """A skill's SKILL.md is missing, malformed, or its declared name
-    doesn't match what was asked for."""
-
-
-def _plugins_root() -> Path:
-    """Where installed plugins live. ``SADANA_PLUGINS_DIR`` if set, else
-    under the existing state directory. Deliberately not prefixed
-    ``SADANA_CONVERSATION_...`` despite config.py's own convention note:
-    this value's real owner is a PLUGINS block that doesn't exist yet, and
-    prefixing it as conversation-owned would just mean renaming it out
-    from under that block later. Resolved fresh on every call, never
-    cached — same posture as ``config.get_paths()``."""
-    return config.env_path("SADANA_PLUGINS_DIR", default=config.get_paths().state_dir / "plugins")
-
-
-def _skill_path(ref: SkillRef) -> Path:
-    """``<plugins_root>/<plugin>/skills/<skill>`` — the layout the
-    requester's own plugin-repo shape already commits to, used one level
-    early. Only what populates ``_plugins_root()`` needs to change when a
-    real installer exists; this function and every caller of it don't."""
-    return _plugins_root() / ref.plugin / "skills" / ref.skill
-
-
-def _parse_skill_md(text: str) -> tuple[dict[str, str], str]:
-    """Split a SKILL.md's ``---``-delimited frontmatter from its body.
-    Hand-rolled rather than a YAML dependency: the frontmatter this
-    project reads is two flat string fields (``name``, ``description``),
-    and this project has zero runtime dependencies today. Raises
-    ``SkillLoadError`` if the delimiters are missing or unclosed."""
-    if not text.startswith("---\n"):
-        raise SkillLoadError("SKILL.md is missing its frontmatter delimiter")
-    end = text.find("\n---", 4)
-    if end == -1:
-        raise SkillLoadError("SKILL.md's frontmatter is never closed")
-    header = text[4:end]
-    body = text[end + 4 :].lstrip("\n")
-    frontmatter: dict[str, str] = {}
-    for line in header.splitlines():
-        if not line.strip():
-            continue
-        key, _, value = line.partition(":")
-        frontmatter[key.strip()] = value.strip()
-    return frontmatter, body
-
-
-_SKILL_DESCRIPTION_MAX_CHARS = 1024  # agentskills.io's own ceiling.
-
-
-def load_skill(ref: SkillRef) -> str:
-    """Read ``ref``'s SKILL.md, validate its frontmatter, and return the
-    body — the text a child's system prompt is built from. Raises
-    ``SkillLoadError`` when the file is absent, its frontmatter is
-    missing/malformed, its declared ``name`` doesn't match ``ref.skill``,
-    or its ``description`` is absent or over 1024 characters."""
-    path = _skill_path(ref) / "SKILL.md"
-    if not path.exists():
-        raise SkillLoadError(f"no SKILL.md at {path}")
-    frontmatter, body = _parse_skill_md(path.read_text())
-
-    name = frontmatter.get("name")
-    if name != ref.skill:
-        raise SkillLoadError(f"SKILL.md at {path} declares name {name!r}, expected {ref.skill!r}")
-
-    description = frontmatter.get("description")
-    if not description:
-        raise SkillLoadError(f"SKILL.md at {path} is missing a description")
-    if len(description) > _SKILL_DESCRIPTION_MAX_CHARS:
-        raise SkillLoadError(
-            f"SKILL.md at {path} has a {len(description)}-char description "
-            f"(over the {_SKILL_DESCRIPTION_MAX_CHARS}-char limit)"
-        )
-    return body
+# SkillRef, SkillLoadError, _plugins_root, _skill_path, _parse_skill_md and
+# load_skill moved to plugins.py/plugin_manifest.py — see D2's spec.md.
 
 
 class ChildDepthExceeded(Exception):
@@ -1301,7 +1216,7 @@ class ChildSpec:
     default: a caller must say what a child may touch."""
 
     node_name: str
-    skill: SkillRef
+    skill: plugins.SkillRef
     input: str
     tools: frozenset[str]
     budget: IterationBudget | None = None
@@ -1345,8 +1260,8 @@ async def run_child(
     this; the only difference between ``parent`` and the returned updated
     parent is ``next_child_seq``. Raises ``ChildDepthExceeded`` before
     anything else if the spawn would nest too deep; raises
-    ``SkillLoadError`` (via ``load_skill``) before anything else if
-    ``spec.skill`` doesn't resolve to a valid SKILL.md.
+    ``plugins.SkillLoadError`` (via ``plugin_manifest.load_skill``) before
+    anything else if ``spec.skill`` doesn't resolve to a valid SKILL.md.
 
     ``stable_prompt`` is a plain caller-supplied string, the same posture
     ``create_conversation``'s ``system_message`` already has — this
@@ -1362,7 +1277,7 @@ async def run_child(
     updated_parent = replace(parent, next_child_seq=seq + 1)
     child_key = _child_key(parent.key, spec.node_name, seq)
 
-    skill_body = load_skill(spec.skill)
+    skill_body = plugin_manifest.load_skill(spec.skill)
     system_prompt = "\n\n".join(part for part in (stable_prompt, skill_body, _CHILD_TASK_FRAMING) if part)
     tool_surface = filter_surface(parent.tool_surface, spec.tools)
     prompt_sha256 = turn_prompt_hash(system_prompt, tool_surface)

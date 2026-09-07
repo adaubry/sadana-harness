@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 
+from conftest import write_skill
 from sadana import context, model_access, plugins
 from sadana.context import CacheHint, ContextState
 from sadana.conversation import (
@@ -25,8 +26,6 @@ from sadana.conversation import (
     PluginCatalogEntry,
     PromptDriftError,
     ProviderFailure,
-    SkillLoadError,
-    SkillRef,
     TemplateRecipe,
     ToolSpec,
     ToolSurface,
@@ -50,7 +49,6 @@ from sadana.conversation import (
     filter_surface,
     find_compaction_boundary,
     iteration_budget_from_config,
-    load_skill,
     pending_tool_call_ids,
     repair,
     repair_tool_call_arguments,
@@ -1434,85 +1432,12 @@ def test_rotate_prompt_is_the_only_epoch_mutating_path(monkeypatch: pytest.Monke
 # ── child conversation ───────────────────────────────────────────────────
 
 
-def _write_skill(
-    tmp_path: Path,
-    *,
-    plugin: str = "p1",
-    skill: str = "s1",
-    name: str | None = None,
-    description: str | None = "Does one focused thing.",
-    body: str = "Do the thing, then stop.",
-) -> Path:
-    skill_dir = tmp_path / "plugins" / plugin / "skills" / skill
-    skill_dir.mkdir(parents=True)
-    lines = [f"name: {skill if name is None else name}"]
-    if description is not None:
-        lines.append(f"description: {description}")
-    (skill_dir / "SKILL.md").write_text("---\n" + "\n".join(lines) + f"\n---\n{body}")
-    return tmp_path / "plugins"
-
-
-def _install_skill(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, body: str = "Skill instructions.") -> SkillRef:
-    root = _write_skill(tmp_path, body=body)
+def _install_skill(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, body: str = "Skill instructions."
+) -> plugins.SkillRef:
+    root = write_skill(tmp_path, body=body)
     monkeypatch.setenv("SADANA_PLUGINS_DIR", str(root))
-    return SkillRef(plugin="p1", skill="s1")
-
-
-@pytest.mark.unit
-def test_load_skill_returns_body_for_valid_skill(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    ref = _install_skill(tmp_path, monkeypatch, body="Do the thing, then stop.")
-    assert load_skill(ref) == "Do the thing, then stop."
-
-
-@pytest.mark.unit
-def test_load_skill_raises_for_missing_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("SADANA_PLUGINS_DIR", str(tmp_path / "plugins"))
-    with pytest.raises(SkillLoadError):
-        load_skill(SkillRef(plugin="nope", skill="nope"))
-
-
-@pytest.mark.unit
-def test_load_skill_raises_for_missing_frontmatter_delimiter(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    skill_dir = tmp_path / "plugins" / "p1" / "skills" / "s1"
-    skill_dir.mkdir(parents=True)
-    (skill_dir / "SKILL.md").write_text("no frontmatter here")
-    monkeypatch.setenv("SADANA_PLUGINS_DIR", str(tmp_path / "plugins"))
-    with pytest.raises(SkillLoadError):
-        load_skill(SkillRef(plugin="p1", skill="s1"))
-
-
-@pytest.mark.unit
-def test_load_skill_raises_for_unclosed_frontmatter(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    skill_dir = tmp_path / "plugins" / "p1" / "skills" / "s1"
-    skill_dir.mkdir(parents=True)
-    (skill_dir / "SKILL.md").write_text("---\nname: s1\ndescription: x\nno closing delimiter")
-    monkeypatch.setenv("SADANA_PLUGINS_DIR", str(tmp_path / "plugins"))
-    with pytest.raises(SkillLoadError):
-        load_skill(SkillRef(plugin="p1", skill="s1"))
-
-
-@pytest.mark.unit
-def test_load_skill_raises_for_name_mismatch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    root = _write_skill(tmp_path, name="a-different-name")
-    monkeypatch.setenv("SADANA_PLUGINS_DIR", str(root))
-    with pytest.raises(SkillLoadError):
-        load_skill(SkillRef(plugin="p1", skill="s1"))
-
-
-@pytest.mark.unit
-def test_load_skill_raises_for_missing_description(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    root = _write_skill(tmp_path, description=None)
-    monkeypatch.setenv("SADANA_PLUGINS_DIR", str(root))
-    with pytest.raises(SkillLoadError):
-        load_skill(SkillRef(plugin="p1", skill="s1"))
-
-
-@pytest.mark.unit
-def test_load_skill_raises_for_description_too_long(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    root = _write_skill(tmp_path, description="x" * 1025)
-    monkeypatch.setenv("SADANA_PLUGINS_DIR", str(root))
-    with pytest.raises(SkillLoadError):
-        load_skill(SkillRef(plugin="p1", skill="s1"))
+    return plugins.SkillRef(plugin="p1", skill="s1")
 
 
 @pytest.mark.unit
@@ -1571,7 +1496,7 @@ def test_child_max_depth_from_config_raises_for_negative(monkeypatch: pytest.Mon
         child_max_depth_from_config()
 
 
-def _child_spec(ref: SkillRef, **overrides) -> ChildSpec:
+def _child_spec(ref: plugins.SkillRef, **overrides) -> ChildSpec:
     kwargs = {
         "node_name": "task",
         "skill": ref,

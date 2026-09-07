@@ -8,6 +8,8 @@ has already learned to depend on the developer's machine.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 
@@ -21,3 +23,26 @@ def _isolated_state(tmp_path, monkeypatch):  # type: ignore[no-untyped-def]
     monkeypatch.setenv("XDG_CONFIG_HOME", str(home / ".config"))
     monkeypatch.setenv("SADANA_STATE_DIR", str(home / ".sadana"))
     return home
+
+
+def write_skill(
+    tmp_path: Path,
+    *,
+    plugin: str = "p1",
+    skill: str = "s1",
+    name: str | None = None,
+    description: str | None = "Does one focused thing.",
+    body: str = "Do the thing, then stop.",
+) -> Path:
+    """A ``tmp_path``-rooted ``<plugins_root>/<plugin>/skills/<skill>/SKILL.md``,
+    shared by ``test_conversation.py``'s ``run_child`` tests and
+    ``test_plugin_manifest.py``'s ``load_skill`` tests — both write the same
+    on-disk layout `plugin_blueprint.md §5.1` fixes. Returns the plugins
+    root, not the skill directory."""
+    skill_dir = tmp_path / "plugins" / plugin / "skills" / skill
+    skill_dir.mkdir(parents=True)
+    lines = [f"name: {skill if name is None else name}"]
+    if description is not None:
+        lines.append(f"description: {description}")
+    (skill_dir / "SKILL.md").write_text("---\n" + "\n".join(lines) + f"\n---\n{body}")
+    return tmp_path / "plugins"
