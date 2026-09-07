@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from sadana import conversation_store, model_access
+from sadana import conversation_store, model_access, plugins
 from sadana.context import ContextState
 from sadana.conversation import (
     Conversation,
@@ -305,9 +305,9 @@ def test_bind_persist_real_failure_aborts_turn_before_dispatch(tmp_path: Path, m
 
     dispatch_called: list[str] = []
 
-    async def dispatch_tracker(name: str, arguments: dict) -> str:
+    async def dispatch_tracker(name: str, arguments: dict) -> plugins.DagResult:
         dispatch_called.append(name)
-        return "ok"
+        return plugins.DagResult(plugin="test", entry="test", text="ok")
 
     persist = bind_persist(conn, conv, now=0.0)
     result, _messages, _budget, _prompt = _run_turn(surface, dispatch=dispatch_tracker, persist=persist)
@@ -331,8 +331,8 @@ def test_bind_persist_success_saves_growing_messages(tmp_path: Path, monkeypatch
     )
     monkeypatch.setattr(model_access, "send", lambda request: next(responses))
 
-    async def dispatch_ok(name: str, arguments: dict) -> str:
-        return "ran"
+    async def dispatch_ok(name: str, arguments: dict) -> plugins.DagResult:
+        return plugins.DagResult(plugin="test", entry="test", text="ran", artifacts=(), trace=(), failed_node=None)
 
     persist = bind_persist(conn, conv, now=0.0)
     result, _messages, _budget, _prompt = _run_turn(surface, dispatch=dispatch_ok, persist=persist)

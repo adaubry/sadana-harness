@@ -167,3 +167,28 @@ keeps being accurate rather than needing a second correction later:
   ever depended on this field — but a fresh real run of the same script
   would no longer reproduce that exact printed line, and that is
   expected, not a regression.
+
+## Resolution (D1-dagresult-dispatch)
+
+The interface gap this document names above under "Does not address at
+all" — `dispatch()`'s contract gives a handler no channel to report
+anything back to its caller except a result string — is closed.
+`dispatch`'s declared return type, everywhere it appears
+(`run_turn`/`take_turn`/`run_child` in `conversation.py`), is now
+`Awaitable[plugins.DagResult]`, not `Awaitable[str]`. `DagResult`
+(`src/sadana/plugins.py`) carries a `text` field (what the model reads,
+rendered exactly where the old plain string rendered), a `trace` of what
+happened along the way, any `artifacts` produced, and a `failed_node` that
+is `None` only when the run reached a terminal step — a plugin's own
+result now has a real, typed shape instead of one line of text standing in
+for all of it.
+
+This proof script's own `dispatch` closure was migrated onto the new
+shape as part of the same work item — every branch (`plugin_a_entry`,
+`plugin_b_entry`, the unreachable unknown-tool fallback) now returns a
+`DagResult`, with `trace` naming the same three hand-written steps this
+document's own "first plugin already ran" already pointed to. What this
+item does **not** do: build anything that walks a *declared* graph and
+produces this trace automatically — the trace above is still hand-written,
+by this script, the same way the DAG itself always has been. That remains
+future work (`docs/reference/plugin_blueprint.md §11` items 4-5).

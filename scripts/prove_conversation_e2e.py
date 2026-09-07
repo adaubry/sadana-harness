@@ -24,7 +24,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from sadana import model_access  # noqa: E402
+from sadana import model_access, plugins  # noqa: E402
 from sadana.conversation import (  # noqa: E402
     ChildSpec,
     Conversation,
@@ -118,7 +118,7 @@ async def main() -> None:
     # threading can't be told about mid-turn. See dispatch()'s docstring.
     next_child_seq = conversation.next_child_seq
 
-    async def dispatch(name: str, arguments: dict) -> str:
+    async def dispatch(name: str, arguments: dict) -> plugins.DagResult:
         # take_turn() builds its own return value from the `conversation`
         # it was called with — a stale local snapshot nothing running
         # inside it (this function included) can retroactively change. So
@@ -163,9 +163,33 @@ async def main() -> None:
             print(f"    [plugin-a] child key={child.key} exit={result.exit_reason} final_text={result.final_text!r}")
 
             # node 3: branch node.
-            if result.final_text and _ACK_MARKER in result.final_text:
-                return f"plugin-a: child acknowledged. report: {result.final_text}"
-            return f"plugin-a: child did not acknowledge as expected. raw report: {result.final_text!r}"
+            fetch_trace = plugins.NodeTrace(
+                node="fetch_webhook", kind="compute", visit=0, ok=True, port=None, detail=webhook_input
+            )
+            ask_trace = plugins.NodeTrace(
+                node="ask_helper", kind="ask", visit=0, ok=True, port=None, detail=f"child exit={result.exit_reason}"
+            )
+            acknowledged = bool(result.final_text and _ACK_MARKER in result.final_text)
+            route_trace = plugins.NodeTrace(
+                node="branch_on_reply",
+                kind="route",
+                visit=0,
+                ok=True,
+                port="acknowledged" if acknowledged else "not_acknowledged",
+                detail=None,
+            )
+            if acknowledged:
+                text = f"plugin-a: child acknowledged. report: {result.final_text}"
+            else:
+                text = f"plugin-a: child did not acknowledge as expected. raw report: {result.final_text!r}"
+            return plugins.DagResult(
+                plugin="plugin-a",
+                entry="plugin_a_entry",
+                text=text,
+                artifacts=(),
+                trace=(fetch_trace, ask_trace, route_trace),
+                failed_node=None,
+            )
 
         if name == "plugin_b_entry":
             spec = ChildSpec(
@@ -189,9 +213,26 @@ async def main() -> None:
             _assert_child_isolated(child, parent)
 
             print(f"    [plugin-b] child key={child.key} exit={result.exit_reason} final_text={result.final_text!r}")
-            return f"plugin-b: {result.final_text}"
+            ask_trace = plugins.NodeTrace(
+                node="ask_helper", kind="ask", visit=0, ok=True, port=None, detail=f"child exit={result.exit_reason}"
+            )
+            return plugins.DagResult(
+                plugin="plugin-b",
+                entry="plugin_b_entry",
+                text=f"plugin-b: {result.final_text}",
+                artifacts=(),
+                trace=(ask_trace,),
+                failed_node=None,
+            )
 
-        return f"tool_error: unknown tool {name!r}"
+        return plugins.DagResult(
+            plugin="unknown",
+            entry=name,
+            text=f"tool_error: unknown tool {name!r}",
+            artifacts=(),
+            trace=(),
+            failed_node="entry",
+        )
 
     initial_hash = conversation.prompt_sha256
     print(f"initial prompt_sha256={initial_hash}")

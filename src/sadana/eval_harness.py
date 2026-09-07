@@ -19,7 +19,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
-from sadana import config
+from sadana import config, plugins
 from sadana.conversation import (
     Conversation,
     ConversationKey,
@@ -61,11 +61,18 @@ class TaskRun:
     detail: str | None = None
 
 
-async def _no_tools_dispatch(name: str, arguments: dict) -> str:
+async def _no_tools_dispatch(name: str, arguments: dict) -> plugins.DagResult:
     """Satisfies `take_turn()`'s required `dispatch` parameter (no
     default) for a task whose template offers no tools — never actually
     invoked, since a model with nothing to call has nothing to ask for."""
-    return f"tool_error: no tools available (unexpected call to {name!r} with {arguments!r})"
+    return plugins.DagResult(
+        plugin="none",
+        entry=name,
+        text=f"tool_error: no tools available (unexpected call to {name!r} with {arguments!r})",
+        artifacts=(),
+        trace=(),
+        failed_node="entry",
+    )
 
 
 def run_task_key(task_id: str, now: float) -> ConversationKey:
@@ -76,7 +83,7 @@ def run_task_key(task_id: str, now: float) -> ConversationKey:
     return f"eval/{task_id}/{now}"
 
 
-def _no_tools_dispatch_factory(_conversation: Conversation) -> Callable[[str, dict], Awaitable[str]]:
+def _no_tools_dispatch_factory(_conversation: Conversation) -> Callable[[str, dict], Awaitable[plugins.DagResult]]:
     return _no_tools_dispatch
 
 
@@ -89,7 +96,9 @@ async def run_task(
     iteration_budget: IterationBudget,
     now: float,
     key: ConversationKey | None = None,
-    dispatch_factory: Callable[[Conversation], Callable[[str, dict], Awaitable[str]]] = _no_tools_dispatch_factory,
+    dispatch_factory: Callable[
+        [Conversation], Callable[[str, dict], Awaitable[plugins.DagResult]]
+    ] = _no_tools_dispatch_factory,
 ) -> TaskRun:
     """Builds a fresh `Conversation` from `template`, takes exactly one
     turn with `task.prompt`, grades the result with `task.grade`, returns

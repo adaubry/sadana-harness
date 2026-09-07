@@ -31,6 +31,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent.parent / "src"))
 
+from sadana import plugins  # noqa: E402
 from sadana.conversation import (  # noqa: E402
     ChildSpec,
     Conversation,
@@ -84,7 +85,7 @@ def build_template() -> ConversationTemplate:
     return ConversationTemplate(name="eval02-plugin-dispatch", recipe=recipe)
 
 
-def make_dispatch(parent: Conversation) -> Callable[[str, dict], Awaitable[str]]:
+def make_dispatch(parent: Conversation) -> Callable[[str, dict], Awaitable[plugins.DagResult]]:
     """A `dispatch_factory` for `run_task()` (EVAL-02's own addition to
     `eval_harness.py`): receives the real `Conversation` `run_task()`
     built, so `run_child()` below gets the actual parent, never an
@@ -92,7 +93,7 @@ def make_dispatch(parent: Conversation) -> Callable[[str, dict], Awaitable[str]]
     once, so there is no second spawn's `next_child_seq` to propagate —
     CONV-10's propagation fix has nothing to apply to here."""
 
-    async def dispatch(name: str, arguments: dict) -> str:
+    async def dispatch(name: str, arguments: dict) -> plugins.DagResult:
         webhook_input = "incoming webhook payload: {'event': 'ping'}"
         spec = ChildSpec(
             node_name="plugin_a_child",
@@ -111,9 +112,22 @@ def make_dispatch(parent: Conversation) -> Callable[[str, dict], Awaitable[str]]
             now=0.0,
         )
 
-        if result.final_text and _ACK_MARKER in result.final_text:
-            return f"plugin-a: child acknowledged. report: {result.final_text}"
-        return f"plugin-a: child did not acknowledge as expected. raw report: {result.final_text!r}"
+        acknowledged = bool(result.final_text and _ACK_MARKER in result.final_text)
+        if acknowledged:
+            text = f"plugin-a: child acknowledged. report: {result.final_text}"
+        else:
+            text = f"plugin-a: child did not acknowledge as expected. raw report: {result.final_text!r}"
+        ask_trace = plugins.NodeTrace(
+            node="ask_helper", kind="ask", visit=0, ok=True, port=None, detail=f"child exit={result.exit_reason}"
+        )
+        return plugins.DagResult(
+            plugin="plugin-a",
+            entry="plugin_a_entry",
+            text=text,
+            artifacts=(),
+            trace=(ask_trace,),
+            failed_node=None,
+        )
 
     return dispatch
 

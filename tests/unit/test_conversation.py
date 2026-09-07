@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from sadana import context, model_access
+from sadana import context, model_access, plugins
 from sadana.context import CacheHint, ContextState
 from sadana.conversation import (
     ChildDepthExceeded,
@@ -647,8 +647,15 @@ def test_complete_deduplicates_shared_ids_via_uniquify(monkeypatch: pytest.Monke
 _SYSTEM_PROMPT = "You are a helpful assistant."
 
 
-async def _fake_dispatch_ok(name: str, arguments: dict) -> str:
-    return f"ran {name}"
+def _ok(text: str) -> plugins.DagResult:
+    """A minimal successful DagResult for a stub dispatch — plugin/entry
+    are placeholders no test in this file reads; artifacts/trace/
+    failed_node take DagResult's own defaults."""
+    return plugins.DagResult(plugin="test", entry="test", text=text)
+
+
+async def _fake_dispatch_ok(name: str, arguments: dict) -> plugins.DagResult:
+    return _ok(f"ran {name}")
 
 
 def _tool_call_response(*names: str) -> model_access.Response:
@@ -848,9 +855,9 @@ def test_run_turn_interrupted(monkeypatch: pytest.MonkeyPatch) -> None:
     surface = build_surface([_spec("noop", "noop")])
     monkeypatch.setattr(model_access, "send", lambda request: _tool_call_response("noop"))
 
-    async def slow_dispatch(name: str, arguments: dict) -> str:
+    async def slow_dispatch(name: str, arguments: dict) -> plugins.DagResult:
         await asyncio.sleep(10)
-        return "never"
+        return _ok("never")
 
     async def scenario():
         task = asyncio.ensure_future(
@@ -935,9 +942,9 @@ def test_run_turn_persistence_failed(monkeypatch: pytest.MonkeyPatch) -> None:
 
     dispatch_called = []
 
-    async def dispatch_tracker(name: str, arguments: dict) -> str:
+    async def dispatch_tracker(name: str, arguments: dict) -> plugins.DagResult:
         dispatch_called.append(name)
-        return "ok"
+        return _ok("ok")
 
     async def failing_persist(messages: tuple[Message, ...]) -> None:
         raise RuntimeError("disk full")
@@ -954,7 +961,7 @@ def test_run_turn_dispatch_raises_produces_tool_error(monkeypatch: pytest.Monkey
     outcomes = iter([_tool_call_response("noop"), _text_response("done")])
     monkeypatch.setattr(model_access, "send", lambda request: next(outcomes))
 
-    async def raising_dispatch(name: str, arguments: dict) -> str:
+    async def raising_dispatch(name: str, arguments: dict) -> plugins.DagResult:
         raise ValueError("boom")
 
     result, messages, _budget, _prompt = _run(surface, dispatch=raising_dispatch)
@@ -987,14 +994,34 @@ def test_run_turn_calls_after_tool_result_before_appending(monkeypatch: pytest.M
 
 
 @pytest.mark.unit
+def test_run_turn_renders_dag_result_text_not_the_whole_value(monkeypatch: pytest.MonkeyPatch) -> None:
+    """D1: the tool-result message is DagResult.text, not str(DagResult(...)).
+    A DagResult whose repr would obviously differ from its own text field
+    (the dataclass repr always contains "DagResult(") catches a regression
+    back to the old str(raw_result) behaviour."""
+    surface = build_surface([_spec("noop", "noop")])
+    outcomes = iter([_tool_call_response("noop"), _text_response("done")])
+    monkeypatch.setattr(model_access, "send", lambda request: next(outcomes))
+
+    async def dispatch(name: str, arguments: dict) -> plugins.DagResult:
+        return plugins.DagResult(plugin="plugin-a", entry="noop", text="what the model should see")
+
+    _result, messages, _budget, _prompt = _run(surface, dispatch=dispatch)
+
+    tool_messages = [m for m in messages if m.role == "tool"]
+    assert tool_messages[0].content == "what the model should see"
+    assert "DagResult(" not in tool_messages[0].content
+
+
+@pytest.mark.unit
 def test_run_turn_caps_oversized_tool_result(monkeypatch: pytest.MonkeyPatch) -> None:
     surface = build_surface([_spec("noop", "noop")])
     outcomes = iter([_tool_call_response("noop"), _text_response("done")])
     monkeypatch.setattr(model_access, "send", lambda request: next(outcomes))
     monkeypatch.setenv("SADANA_CONVERSATION_TOOL_RESULT_CHARS", "50")
 
-    async def big_dispatch(name: str, arguments: dict) -> str:
-        return "x" * 1000
+    async def big_dispatch(name: str, arguments: dict) -> plugins.DagResult:
+        return _ok("x" * 1000)
 
     result, messages, _budget, _prompt = _run(surface, dispatch=big_dispatch)
 
@@ -1018,8 +1045,8 @@ def test_run_turn_spills_before_truncating_an_oversized_result(monkeypatch: pyte
     # never needs the truncation cap's help; this is the case that proves
     # spilling ran first.
 
-    async def big_dispatch(name: str, arguments: dict) -> str:
-        return "x" * 1000
+    async def big_dispatch(name: str, arguments: dict) -> plugins.DagResult:
+        return _ok("x" * 1000)
 
     result, messages, _budget, _prompt = _run(surface, dispatch=big_dispatch)
 
@@ -1040,8 +1067,8 @@ def test_run_turn_truncates_when_under_the_spill_threshold(monkeypatch: pytest.M
     # Spill threshold left at its high default — well above the 1000-char
     # result below, so after_tool_result stays identity.
 
-    async def big_dispatch(name: str, arguments: dict) -> str:
-        return "x" * 1000
+    async def big_dispatch(name: str, arguments: dict) -> plugins.DagResult:
+        return _ok("x" * 1000)
 
     result, messages, _budget, _prompt = _run(surface, dispatch=big_dispatch)
 
@@ -1067,8 +1094,8 @@ def test_run_turn_caps_per_turn_budget_independently(monkeypatch: pytest.MonkeyP
     monkeypatch.setenv("SADANA_CONVERSATION_TOOL_RESULT_CHARS", "1000")
     monkeypatch.setenv("SADANA_CONVERSATION_TOOL_TURN_BUDGET_CHARS", "150")
 
-    async def medium_dispatch(name: str, arguments: dict) -> str:
-        return "y" * 100
+    async def medium_dispatch(name: str, arguments: dict) -> plugins.DagResult:
+        return _ok("y" * 100)
 
     result, messages, _budget, _prompt = _run(surface, dispatch=medium_dispatch)
 
@@ -1600,9 +1627,9 @@ def test_run_child_restricts_tool_surface_to_spec_tools(tmp_path: Path, monkeypa
 
     calls: list[str] = []
 
-    async def recording_dispatch(name: str, arguments: dict) -> str:
+    async def recording_dispatch(name: str, arguments: dict) -> plugins.DagResult:
         calls.append(name)
-        return "unreachable"
+        return _ok("unreachable")
 
     result, _child, _p = _spawn(parent, _child_spec(ref, tools=frozenset({"allowed"})), dispatch=recording_dispatch)
 
@@ -1698,7 +1725,7 @@ def test_run_child_raises_child_depth_exceeded_before_calling_provider_or_dispat
     def fail_send(request: model_access.Request) -> model_access.Response:
         raise AssertionError("model_access.send should not be called")
 
-    async def fail_dispatch(name: str, arguments: dict) -> str:
+    async def fail_dispatch(name: str, arguments: dict) -> plugins.DagResult:
         raise AssertionError("dispatch should not be called")
 
     monkeypatch.setattr(model_access, "send", fail_send)

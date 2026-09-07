@@ -23,7 +23,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Literal
 
-from sadana import config, context, model_access
+from sadana import config, context, model_access, plugins
 
 # A caller-supplied natural key, e.g. "support/ticket-4821". This module
 # does not mint or validate one, and does not enforce it is unique — that
@@ -748,7 +748,7 @@ async def run_turn(
     now: float,
     provider: str,
     model: str,
-    dispatch: Callable[[str, dict], Awaitable[str]],
+    dispatch: Callable[[str, dict], Awaitable[plugins.DagResult]],
     context_state: context.ContextState,
     stable_prompt_len: int,
     persist: Callable[[tuple[Message, ...]], Awaitable[None]] = _noop_persist,
@@ -886,8 +886,8 @@ async def run_turn(
 
             for tc in valid:
                 try:
-                    raw_result = await dispatch(tc["name"], tc["arguments"])
-                    result_text = str(raw_result)
+                    dag_result = await dispatch(tc["name"], tc["arguments"])
+                    result_text = dag_result.text
                 except Exception as e:
                     result_text = f"tool_error: {e}"
                 # after_tool_result runs on the raw result first (it may
@@ -1111,7 +1111,7 @@ async def take_turn(
     user_input: str,
     provider: str,
     model: str,
-    dispatch: Callable[[str, dict], Awaitable[str]],
+    dispatch: Callable[[str, dict], Awaitable[plugins.DagResult]],
     persist: Callable[[tuple[Message, ...]], Awaitable[None]] = _noop_persist,
     now: float,
 ) -> tuple[TurnResult, Conversation]:
@@ -1331,7 +1331,7 @@ async def run_child(
     stable_prompt: str,
     provider: str,
     model: str,
-    dispatch: Callable[[str, dict], Awaitable[str]],
+    dispatch: Callable[[str, dict], Awaitable[plugins.DagResult]],
     persist: Callable[[tuple[Message, ...]], Awaitable[None]] = _noop_persist,
     now: float,
 ) -> tuple[ChildResult, Conversation, Conversation]:

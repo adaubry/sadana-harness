@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from sadana import model_access
+from sadana import model_access, plugins
 from sadana.conversation import (
     Conversation,
     ConversationTemplate,
@@ -136,12 +136,14 @@ def test_run_task_with_real_dispatch_reaches_the_grader(monkeypatch: pytest.Monk
 
     factory_saw_key: list[str] = []
 
-    def dispatch_factory(conversation: Conversation) -> Callable[[str, dict], Awaitable[str]]:
+    def dispatch_factory(conversation: Conversation) -> Callable[[str, dict], Awaitable[plugins.DagResult]]:
         factory_saw_key.append(conversation.key)
 
-        async def dispatch(name: str, arguments: dict) -> str:
+        async def dispatch(name: str, arguments: dict) -> plugins.DagResult:
             assert name == "noop_tool"
-            return "TOOL_RAN_OK"
+            return plugins.DagResult(
+                plugin="test", entry="test", text="TOOL_RAN_OK", artifacts=(), trace=(), failed_node=None
+            )
 
         return dispatch
 

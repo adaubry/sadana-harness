@@ -33,7 +33,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from sadana import model_access  # noqa: E402
+from sadana import model_access, plugins  # noqa: E402
 from sadana.conversation import (  # noqa: E402
     ConversationTemplate,
     ExitReason,
@@ -71,12 +71,20 @@ def _install_forced_overflow(real_send: Callable, force_call_numbers: set[int]) 
     return wrapped, calls
 
 
-async def _no_tools_dispatch(name: str, arguments: dict) -> str:
-    return f"tool_error: no tools available (unexpected call to {name!r})"
+async def _no_tools_dispatch(name: str, arguments: dict) -> plugins.DagResult:
+    return plugins.DagResult(
+        plugin="none",
+        entry=name,
+        text=f"tool_error: no tools available (unexpected call to {name!r})",
+        artifacts=(),
+        trace=(),
+        failed_node="entry",
+    )
 
 
-async def _big_result_dispatch(name: str, arguments: dict) -> str:
-    return "REAL DATA " * 20_000  # ~200,000 chars — well over any real spill threshold
+async def _big_result_dispatch(name: str, arguments: dict) -> plugins.DagResult:
+    text = "REAL DATA " * 20_000  # ~200,000 chars — well over any real spill threshold
+    return plugins.DagResult(plugin="test", entry=name, text=text, artifacts=(), trace=(), failed_node=None)
 
 
 async def main() -> None:
