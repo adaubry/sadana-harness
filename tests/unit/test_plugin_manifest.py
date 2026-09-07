@@ -12,6 +12,7 @@ import pytest
 from conftest import write_skill as _write_skill
 from sadana.plugin_manifest import _default_approve, discover_plugins, load_skill, run_graph, validate
 from sadana.plugins import (
+    Artifact,
     CyclicGraph,
     DanglingTarget,
     DuplicateNodeName,
@@ -523,6 +524,45 @@ def test_run_graph_call_node_runs_its_body_and_threads_the_result(tmp_path: Path
     assert result.failed_node is None
     assert result.text == json.dumps({"called": {"a": 1}})
     assert [t.node for t in result.trace] == ["reach_out", "done"]
+    assert result.artifacts == ()
+
+
+@pytest.mark.unit
+def test_run_graph_call_node_emits_a_link_artifact(tmp_path: Path) -> None:
+    plugin_dir = _write_init_py(
+        tmp_path,
+        "from sadana.plugins import Artifact\n\n"
+        "def fetch_link(value):\n"
+        "    return Artifact(kind='link', name='result', ref='https://example.test/thing')\n",
+    )
+    nodes = (
+        Node(name="reach_out", kind="call", body="init:fetch_link", next="done"),
+        Node(name="done", kind="stop"),
+    )
+    manifest = _manifest(*nodes)
+    result = asyncio.run(
+        run_graph(plugin_dir, manifest, _entry("reach_out"), {}, ask=_stub_ask_ok, approve=_stub_approve_ok)
+    )
+    assert result.failed_node is None
+    assert result.artifacts == (Artifact(kind="link", name="result", ref="https://example.test/thing"),)
+    assert result.text == "https://example.test/thing"
+    assert result.trace[0].node == "reach_out"
+    assert result.trace[0].detail is not None
+    assert result.trace[1].detail is None
+
+
+@pytest.mark.unit
+def test_run_graph_compute_node_returning_artifact_is_not_recorded(tmp_path: Path) -> None:
+    plugin_dir = _write_init_py(
+        tmp_path,
+        "from sadana.plugins import Artifact\n\n"
+        "def make_artifact(value):\n"
+        "    return Artifact(kind='link', name='result', ref='https://example.test/thing')\n",
+    )
+    manifest = _manifest(Node(name="fake_call", kind="compute", body="init:make_artifact"))
+    result = asyncio.run(run_graph(plugin_dir, manifest, _entry("fake_call"), {}, ask=_stub_ask_ok))
+    assert result.failed_node is None
+    assert result.artifacts == ()
 
 
 @pytest.mark.unit

@@ -314,12 +314,18 @@ async def run_graph(
     by_name = plugins._node_index(manifest)
     modules: dict[str, ModuleType | None] = {}
     trace: list[plugins.NodeTrace] = []
+    artifacts: list[plugins.Artifact] = []
     value: object = arguments
     current = entry.start
 
     def result(text: str, failed_node: str | None) -> plugins.DagResult:
         return plugins.DagResult(
-            plugin=manifest.name, entry=entry.tool, text=text, artifacts=(), trace=tuple(trace), failed_node=failed_node
+            plugin=manifest.name,
+            entry=entry.tool,
+            text=text,
+            artifacts=tuple(artifacts),
+            trace=tuple(trace),
+            failed_node=failed_node,
         )
 
     def failed(node: plugins.Node, detail: str) -> plugins.DagResult:
@@ -333,6 +339,7 @@ async def run_graph(
             return failed(node, f"{node.kind} steps are not runnable yet")
 
         port: str | None = None
+        detail: str | None = None
         try:
             if node.kind == "compute":
                 value = _resolve_body(plugin_dir, node, modules)(value)
@@ -356,6 +363,10 @@ async def run_graph(
                     return _resolve_body(plugin_dir, n, modules)(v)
 
                 value = await asyncio.to_thread(run_body)
+                if isinstance(value, plugins.Artifact):
+                    artifacts.append(value)
+                    detail = f"emitted {value.kind} artifact {value.name!r}"
+                    value = value.ref
             elif node.kind == "stop":
                 pass
             else:
@@ -363,7 +374,7 @@ async def run_graph(
         except Exception as e:
             return failed(node, f"node raised {type(e).__name__}")
 
-        trace.append(plugins.NodeTrace(node=node.name, kind=node.kind, visit=0, ok=True, port=port, detail=None))
+        trace.append(plugins.NodeTrace(node=node.name, kind=node.kind, visit=0, ok=True, port=port, detail=detail))
 
         next_name = port if node.kind == "route" else node.next
         if next_name is None:
