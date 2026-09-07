@@ -1,18 +1,21 @@
 """Tests for sadana.plugins: Artifact, NodeTrace, DagResult, Entry, Node,
-Manifest, ManifestOutcome."""
+Manifest, ManifestOutcome, InstalledPlugin."""
 
 from __future__ import annotations
 
 import dataclasses
+from pathlib import Path
 
 import pytest
 
 from sadana.plugins import (
     Artifact,
+    CyclicGraph,
     DagResult,
     DanglingTarget,
     DuplicateNodeName,
     Entry,
+    InstalledPlugin,
     InvalidSchema,
     Manifest,
     ManifestParseError,
@@ -230,3 +233,29 @@ def test_unresolved_body_carries_node_and_body() -> None:
 @pytest.mark.unit
 def test_unreachable_node_carries_the_node() -> None:
     assert UnreachableNode(node="orphan").node == "orphan"
+
+
+@pytest.mark.unit
+def test_cyclic_graph_carries_a_node_on_the_cycle() -> None:
+    assert CyclicGraph(node="a").node == "a"
+
+
+# ── InstalledPlugin ──────────────────────────────────────────────────────
+
+
+@pytest.mark.unit
+def test_installed_plugin_constructs_with_its_documented_fields() -> None:
+    manifest = Manifest(name="example-plugin", version="0.1.0", description="d", entries=(), nodes=())
+    directory = Path("/plugins/example-plugin")
+    installed = InstalledPlugin(name="example-plugin", directory=directory, manifest=manifest)
+    assert installed.name == "example-plugin"
+    assert installed.directory == directory
+    assert installed.manifest == manifest
+
+
+@pytest.mark.unit
+def test_installed_plugin_is_frozen() -> None:
+    manifest = Manifest(name="p", version="0.1.0", description="d", entries=(), nodes=())
+    installed = InstalledPlugin(name="p", directory=Path("/plugins/p"), manifest=manifest)
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        installed.name = "changed"  # type: ignore[misc]

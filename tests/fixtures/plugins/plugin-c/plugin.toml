@@ -1,0 +1,15 @@
+[plugin]
+name = "plugin-c"
+version = "0.1.0"
+description = "The one-node, ask-only plugin: no code steps at all, plugin_blueprint.md §3.4's minimal shape."
+
+[[entry]]
+tool = "plugin_c_entry"
+purpose = "Asks a focused helper to acknowledge a short note, and reports back."
+parameters = "schema/do_thing.json"
+start = "interpret"
+
+[[node]]
+name = "interpret"
+kind = "ask"
+skill = "plugin-c-skill"

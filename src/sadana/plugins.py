@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import tomllib
 from collections import deque
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -251,6 +252,25 @@ class UnreachableNode:
     node: str
 
 
+@dataclass(frozen=True)
+class CyclicGraph:
+    """The declared graph loops back on itself. ``node`` names one node on
+    the cycle, not the whole cycle — enough to point a plugin author at it.
+
+    D2's own reachability check (``_first_unreachable``) proves every node
+    can be reached from an entry; it does not prove the graph is
+    acyclic, despite every design document naming this structure a DAG.
+    Added at D3's own Deploy-stage review, once ``run_graph`` (D3's own
+    graph walker) made the gap a real one: a route back-edge makes a walk
+    that has nowhere else to end run forever. Checked here, at load time,
+    rather than bounded at walk time — an acyclic graph is bounded by
+    construction (at most one visit per node before a walk ends), so
+    catching the cause here means the walker needs no separate ceiling of
+    its own to guard the same scenario."""
+
+    node: str
+
+
 ManifestOutcome = (
     Valid
     | ManifestParseError
@@ -260,6 +280,7 @@ ManifestOutcome = (
     | DanglingTarget
     | UnresolvedBody
     | UnreachableNode
+    | CyclicGraph
 )
 
 
@@ -294,6 +315,15 @@ def _parse_manifest(text: str) -> Manifest:
     )
 
 
+def _node_index(manifest: Manifest) -> dict[str, Node]:
+    """``manifest``'s own nodes, keyed by name — built fresh from whatever
+    ``manifest`` is handed, never cached, since a second caller with a
+    different ``Manifest`` value must never see a stale index. Shared by
+    ``_first_unreachable`` (below) and ``plugin_manifest.run_graph`` so
+    there is one way to build this lookup, not two."""
+    return {node.name: node for node in manifest.nodes}
+
+
 def _first_unreachable(manifest: Manifest) -> UnreachableNode | None:
     """A breadth-first walk of ``manifest``'s own declared edges, from
     every entry's ``start`` — reads the graph's shape, runs nothing. Every
@@ -301,7 +331,7 @@ def _first_unreachable(manifest: Manifest) -> UnreachableNode | None:
     runs — ``plugin_manifest.validate()``'s own dangling-target check
     holds first, same as every other check in its sequence assuming the
     one before it held."""
-    by_name = {node.name: node for node in manifest.nodes}
+    by_name = _node_index(manifest)
     visited: set[str] = set()
     queue: deque[str] = deque(entry.start for entry in manifest.entries)
     while queue:
@@ -317,3 +347,62 @@ def _first_unreachable(manifest: Manifest) -> UnreachableNode | None:
         if node.name not in visited:
             return UnreachableNode(node=node.name)
     return None
+
+
+def _first_cycle(manifest: Manifest) -> CyclicGraph | None:
+    """A depth-first walk from every entry's ``start``, tracking the
+    current path — reaching a node already on that path is a back edge,
+    the definition of a cycle. Reads the graph's shape only, runs nothing;
+    independent of ``_first_unreachable`` (a cycle can exist among
+    reachable nodes, as it does in `plugin_blueprint.md`'s own worry about
+    plugin composition, §12 OQ2 — this checks one plugin's own graph, not
+    across plugins)."""
+    by_name = _node_index(manifest)
+    visited: set[str] = set()
+    on_path: set[str] = set()
+
+    def visit(name: str) -> CyclicGraph | None:
+        if name in on_path:
+            return CyclicGraph(node=name)
+        if name in visited:
+            return None
+        visited.add(name)
+        on_path.add(name)
+        node = by_name[name]
+        successors = list(node.ports) + ([node.next] if node.next is not None else [])
+        for successor in successors:
+            outcome = visit(successor)
+            if outcome is not None:
+                return outcome
+        on_path.discard(name)
+        return None
+
+    for entry in manifest.entries:
+        outcome = visit(entry.start)
+        if outcome is not None:
+            return outcome
+    return None
+
+
+# ── D3: catalog and tool surface, and the graph's execution seams ────────
+# Its full contract is `docs/tasks/D3-graph-dispatch/spec.md`.
+
+
+@dataclass(frozen=True)
+class InstalledPlugin:
+    """One plugins-root subdirectory that validated cleanly, kept around so
+    a dispatch call doesn't re-read plugin.toml on every tool call — a
+    plugin is immutable and external (`plugin_blueprint.md §3.1`); nothing
+    in this project can change one mid-conversation, so re-validating per
+    call would be pure waste, not extra safety."""
+
+    name: str
+    directory: Path
+    manifest: Manifest
+
+
+# The one seam this module and plugin_manifest.py expose for "consult a
+# model" — neither may import conversation.py (spec.md's import-direction
+# invariant), so neither can call run_child directly. None means the
+# sub-task didn't finish cleanly; a str is what it reported back.
+AskFn = Callable[[SkillRef, str], Awaitable[str | None]]

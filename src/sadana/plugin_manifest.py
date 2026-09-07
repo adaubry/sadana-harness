@@ -11,6 +11,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import tomllib
+from collections.abc import Callable
 from pathlib import Path
 from types import ModuleType
 
@@ -131,10 +132,15 @@ def _check_body(
 
 
 def validate(plugin_dir: Path) -> plugins.ManifestOutcome:
-    """Read ``plugin_dir``'s own ``plugin.toml`` and run the seven `§8`
-    checks against it, in order, stopping at the first failure. Runs no
-    step of the plugin's declared sequence — a ``body`` reference is only
-    imported far enough to confirm the named function exists."""
+    """Read ``plugin_dir``'s own ``plugin.toml`` and run the `§8` checks
+    against it, in order, stopping at the first failure — the original
+    seven, plus an eighth added at D3's own Deploy-stage review:
+    acyclicity. §8 never named it because nothing that actually walked a
+    graph existed yet to make the gap real; D3's own `run_graph` does, and
+    a graph that loops back on itself has no other way to be caught before
+    it makes a walk run forever. Runs no step of the plugin's declared
+    sequence — a ``body`` reference is only imported far enough to confirm
+    the named function exists."""
     manifest_path = plugin_dir / "plugin.toml"
     if not manifest_path.exists():
         return plugins.ManifestParseError(detail=f"no plugin.toml at {manifest_path}")
@@ -182,4 +188,147 @@ def validate(plugin_dir: Path) -> plugins.ManifestOutcome:
     if unreachable is not None:
         return unreachable
 
+    cycle = plugins._first_cycle(manifest)
+    if cycle is not None:
+        return cycle
+
     return plugins.Valid(manifest=manifest)
+
+
+# ── D3: catalog and tool surface, and the graph's execution seams ────────
+# Its full contract is `docs/tasks/D3-graph-dispatch/spec.md`.
+
+
+def discover_plugins(plugins_root: Path | None = None) -> tuple[plugins.InstalledPlugin, ...]:
+    """Every immediate subdirectory of ``plugins_root`` (default:
+    ``plugins._plugins_root()``) whose ``plugin.toml`` comes back ``Valid``
+    from ``validate()``. One that doesn't is silently excluded — the same
+    "not trustworthy, don't build on it" outcome the `§8` checks already
+    produce, applied by simply not including it. A root that doesn't exist
+    yet (nothing installed) returns an empty tuple, not an error."""
+    root = plugins_root if plugins_root is not None else plugins._plugins_root()
+    if not root.is_dir():
+        return ()
+    installed = []
+    for child in sorted(root.iterdir()):
+        if not child.is_dir():
+            continue
+        outcome = validate(child)
+        if isinstance(outcome, plugins.Valid):
+            installed.append(
+                plugins.InstalledPlugin(name=outcome.manifest.name, directory=child, manifest=outcome.manifest)
+            )
+    return tuple(installed)
+
+
+def _coerce_text(value: object) -> str:
+    """One coercion rule, used both for an ``ask`` node's input and for a
+    run's final ``text`` — a plugin author's data is usually already a
+    ``str`` by the time it reaches either; a ``dict``/``list`` (the raw
+    tool-call ``arguments``, most often) becomes JSON, not a Python
+    ``repr()``, so a model reading it sees ordinary JSON, not
+    single-quoted Python syntax."""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict | list):
+        return json.dumps(value)
+    return str(value)
+
+
+def _resolve_body(plugin_dir: Path, node: plugins.Node, modules: dict[str, ModuleType | None]) -> Callable:
+    """Reuses ``_load_body_module``'s existing import-and-cache logic
+    rather than a second one. ``node.body`` and the function it names are
+    trusted to resolve — ``validate()``'s own ``UnresolvedBody`` check
+    already proved it for whatever ``Manifest`` a caller reached this
+    function with; the asserts are a self-check against this item's own
+    bug, not a validation this function repeats."""
+    assert node.body is not None, f"{node.name!r} has no body to resolve"
+    module_name, _, func_name = node.body.partition(":")
+    module = _load_body_module(plugin_dir, module_name, modules)
+    assert module is not None, f"{node.name!r}'s body module {module_name!r} did not resolve"
+    return getattr(module, func_name)
+
+
+async def run_graph(
+    plugin_dir: Path,
+    manifest: plugins.Manifest,
+    entry: plugins.Entry,
+    arguments: dict,
+    *,
+    ask: plugins.AskFn,
+) -> plugins.DagResult:
+    """Walks ``manifest``'s declared steps from ``entry.start``, exactly as
+    ``validate()`` already proved they connect and never loop back on
+    themselves (its reachability and acyclicity checks — trusted here the
+    same way ``run_child`` already trusts an already-validated system
+    prompt). Acyclicity is what keeps this walk bounded: nothing here
+    caps the number of steps, because an already-validated ``manifest``
+    cannot revisit a node, so a walk over one ends in at most
+    ``len(manifest.nodes)`` steps on its own. A hand-built ``Manifest``
+    that skips ``validate()`` (as this module's own tests do) has no such
+    guarantee and can still loop forever — the same trust an untested
+    caller already extends to reachability, body resolution, and every
+    other `§8` check this function never re-runs. Every node kind's own
+    failure — a
+    raised exception, a ``route`` body naming an undeclared port, a
+    ``call``/``each``/``wait`` node this vocabulary doesn't execute yet, an
+    ``ask`` whose sub-task didn't finish cleanly — ends the walk at that
+    node: ``failed_node`` names it, ``text`` is one fixed, generic sentence
+    naming the plugin and the step (never the raw exception or its
+    traceback), and nothing raises out of this function for any of them.
+
+    Exactly one ``value`` is threaded through the loop — the entry's raw
+    ``arguments`` for the first node, each node's own output after that.
+    No node is ever given more than what the step immediately before it
+    produced (CLAUDE.md: "A plugin graph's node receives only its
+    immediate predecessor's output, never the run's accumulated
+    history")."""
+    by_name = plugins._node_index(manifest)
+    modules: dict[str, ModuleType | None] = {}
+    trace: list[plugins.NodeTrace] = []
+    value: object = arguments
+    current = entry.start
+
+    def result(text: str, failed_node: str | None) -> plugins.DagResult:
+        return plugins.DagResult(
+            plugin=manifest.name, entry=entry.tool, text=text, artifacts=(), trace=tuple(trace), failed_node=failed_node
+        )
+
+    def failed(node: plugins.Node, detail: str) -> plugins.DagResult:
+        trace.append(plugins.NodeTrace(node=node.name, kind=node.kind, visit=0, ok=False, port=None, detail=detail))
+        return result(f"{manifest.name}'s {node.name!r} step did not complete.", node.name)
+
+    while True:
+        node = by_name[current]
+
+        if node.kind in ("call", "each", "wait"):
+            return failed(node, f"{node.kind} steps are not runnable yet")
+
+        port: str | None = None
+        try:
+            if node.kind == "compute":
+                value = _resolve_body(plugin_dir, node, modules)(value)
+            elif node.kind == "route":
+                port = _resolve_body(plugin_dir, node, modules)(value)
+                if port not in node.ports:
+                    return failed(node, f"returned {port!r}, not a declared port")
+            elif node.kind == "ask":
+                assert node.skill is not None, f"{node.name!r} has no skill to ask"
+                skill_ref = plugins.SkillRef(plugin=manifest.name, skill=node.skill)
+                output = await ask(skill_ref, _coerce_text(value))
+                if output is None:
+                    return failed(node, "child did not complete")
+                value = output
+            elif node.kind == "stop":
+                pass
+            else:
+                return failed(node, f"unrecognized node kind {node.kind!r}")
+        except Exception as e:
+            return failed(node, f"node raised {type(e).__name__}")
+
+        trace.append(plugins.NodeTrace(node=node.name, kind=node.kind, visit=0, ok=True, port=port, detail=None))
+
+        next_name = port if node.kind == "route" else node.next
+        if next_name is None:
+            return result(_coerce_text(value), None)
+        current = next_name

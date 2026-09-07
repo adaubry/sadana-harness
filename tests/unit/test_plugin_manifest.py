@@ -1,15 +1,18 @@
-"""Tests for sadana.plugin_manifest: load_skill(), validate()."""
+"""Tests for sadana.plugin_manifest: load_skill(), validate(),
+discover_plugins(), run_graph()."""
 
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 
 import pytest
 
 from conftest import write_skill as _write_skill
-from sadana.plugin_manifest import load_skill, validate
+from sadana.plugin_manifest import discover_plugins, load_skill, run_graph, validate
 from sadana.plugins import (
+    CyclicGraph,
     DanglingTarget,
     DuplicateNodeName,
     Entry,
@@ -17,6 +20,7 @@ from sadana.plugins import (
     Manifest,
     ManifestParseError,
     Node,
+    NodeTrace,
     SkillLoadError,
     SkillRef,
     UnreachableNode,
@@ -263,6 +267,23 @@ def test_validate_returns_unreachable_node_for_a_node_no_edge_reaches(tmp_path: 
 
 
 @pytest.mark.unit
+def test_validate_returns_cyclic_graph_for_a_route_back_edge(tmp_path: Path) -> None:
+    """§8's original seven checks prove every node is reachable; none of
+    them prove the graph is acyclic. `normal` routing back to
+    `route_on_kind` (instead of `_VALID_TOML`'s own terminal `stop`) is
+    reachable from the entry and reaches every node, same as before — the
+    only thing wrong with it is that it never ends."""
+    toml = _VALID_TOML.replace(
+        'name = "normal"\nkind = "stop"',
+        'name = "normal"\nkind = "route"\nbody = "init:classify"\nports = ["route_on_kind"]',
+    )
+    plugin_dir = _write_plugin(tmp_path, toml=toml)
+    outcome = validate(plugin_dir)
+    assert isinstance(outcome, CyclicGraph)
+    assert outcome.node in ("normal", "route_on_kind")
+
+
+@pytest.mark.unit
 def test_validate_returns_dangling_target_for_an_entry_start_with_no_such_node(
     tmp_path: Path,
 ) -> None:
@@ -314,3 +335,230 @@ def test_validate_returns_unresolved_skill_for_invalid_utf8_skill_md(tmp_path: P
     outcome = validate(plugin_dir)
     assert isinstance(outcome, UnresolvedSkill)
     assert outcome.node == "interpret"
+
+
+# ── discover_plugins ─────────────────────────────────────────────────────
+
+
+@pytest.mark.unit
+def test_discover_plugins_keeps_only_valid_plugins(tmp_path: Path) -> None:
+    root = tmp_path / "plugins"
+    root.mkdir()
+    _write_plugin(root, dirname="good-plugin")
+    (root / "broken-plugin").mkdir()  # no plugin.toml at all — not Valid
+    installed = discover_plugins(root)
+    assert [p.name for p in installed] == ["example-plugin"]
+    assert installed[0].directory == root / "good-plugin"
+    assert installed[0].manifest.name == "example-plugin"
+
+
+@pytest.mark.unit
+def test_discover_plugins_ignores_non_directory_entries(tmp_path: Path) -> None:
+    root = tmp_path / "plugins"
+    root.mkdir()
+    (root / "not-a-plugin.txt").write_text("stray file")
+    assert discover_plugins(root) == ()
+
+
+@pytest.mark.unit
+def test_discover_plugins_returns_empty_tuple_for_a_missing_root(tmp_path: Path) -> None:
+    assert discover_plugins(tmp_path / "does-not-exist") == ()
+
+
+@pytest.mark.unit
+def test_discover_plugins_defaults_to_the_configured_plugins_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "plugins"
+    root.mkdir()
+    _write_plugin(root, dirname="good-plugin")
+    monkeypatch.setenv("SADANA_PLUGINS_DIR", str(root))
+    assert [p.name for p in discover_plugins()] == ["example-plugin"]
+
+
+# ── run_graph ────────────────────────────────────────────────────────────
+
+# run_graph() takes an already-parsed Manifest — it never reads
+# plugin.toml itself, so these fixtures write only whatever init.py a
+# test's compute/route nodes need, not a full plugin directory.
+
+
+def _write_init_py(tmp_path: Path, body: str, *, dirname: str = "graph-plugin") -> Path:
+    plugin_dir = tmp_path / dirname
+    plugin_dir.mkdir()
+    (plugin_dir / "init.py").write_text(body)
+    return plugin_dir
+
+
+def _entry(start: str) -> Entry:
+    return Entry(tool="do_thing", purpose="p", parameters="schema/do_thing.json", start=start)
+
+
+def _manifest(*nodes: Node, name: str = "p") -> Manifest:
+    return Manifest(name=name, version="0.1.0", description="d", entries=(), nodes=nodes)
+
+
+async def _stub_ask_ok(_skill: SkillRef, text: str) -> str:
+    return f"child said: {text}"
+
+
+async def _stub_ask_fails(_skill: SkillRef, _text: str) -> str | None:
+    return None
+
+
+@pytest.mark.unit
+def test_run_graph_stop_node_ends_the_walk(tmp_path: Path) -> None:
+    plugin_dir = _write_init_py(tmp_path, "")
+    manifest = _manifest(Node(name="done", kind="stop"))
+    result = asyncio.run(run_graph(plugin_dir, manifest, _entry("done"), {"a": 1}, ask=_stub_ask_ok))
+    assert result.failed_node is None
+    assert result.text == json.dumps({"a": 1})
+    assert result.trace == (NodeTrace(node="done", kind="stop", visit=0, ok=True, port=None, detail=None),)
+
+
+@pytest.mark.unit
+def test_run_graph_compute_chain_gets_only_the_immediate_predecessor(tmp_path: Path) -> None:
+    """Requirement 6: a node's body is given only what the step
+    immediately before it produced. Each function below raises if handed
+    anything other than exactly its own predecessor's return value — an
+    accidental "pass everything" implementation fails this test, not
+    merely looks different."""
+    plugin_dir = _write_init_py(
+        tmp_path,
+        "def step_one(value):\n"
+        "    assert value == {'raw': True}, value\n"
+        "    return 'one'\n\n"
+        "def step_two(value):\n"
+        "    assert value == 'one', value\n"
+        "    return 'two'\n\n"
+        "def step_three(value):\n"
+        "    assert value == 'two', value\n"
+        "    return 'three'\n",
+    )
+    nodes = (
+        Node(name="a", kind="compute", body="init:step_one", next="b"),
+        Node(name="b", kind="compute", body="init:step_two", next="c"),
+        Node(name="c", kind="compute", body="init:step_three"),
+    )
+    manifest = _manifest(*nodes)
+    result = asyncio.run(run_graph(plugin_dir, manifest, _entry("a"), {"raw": True}, ask=_stub_ask_ok))
+    assert result.failed_node is None
+    assert result.text == "three"
+    assert [t.node for t in result.trace] == ["a", "b", "c"]
+    assert all(t.ok for t in result.trace)
+
+
+@pytest.mark.unit
+def test_run_graph_route_follows_the_named_port(tmp_path: Path) -> None:
+    plugin_dir = _write_init_py(tmp_path, "def pick(value):\n    return 'left' if value['flag'] else 'right'\n")
+    nodes = (
+        Node(name="branch", kind="route", body="init:pick", ports=("left", "right")),
+        Node(name="left", kind="stop"),
+        Node(name="right", kind="stop"),
+    )
+    manifest = _manifest(*nodes)
+    result = asyncio.run(run_graph(plugin_dir, manifest, _entry("branch"), {"flag": True}, ask=_stub_ask_ok))
+    assert result.failed_node is None
+    assert result.text == json.dumps({"flag": True})  # route decides, it doesn't transform
+    assert [t.node for t in result.trace] == ["branch", "left"]
+    assert result.trace[0].port == "left"
+
+
+@pytest.mark.unit
+def test_run_graph_route_returning_an_undeclared_port_fails_closed(tmp_path: Path) -> None:
+    plugin_dir = _write_init_py(tmp_path, "def pick(value):\n    return 'nowhere'\n")
+    manifest = _manifest(Node(name="branch", kind="route", body="init:pick", ports=("left", "right")))
+    result = asyncio.run(run_graph(plugin_dir, manifest, _entry("branch"), {}, ask=_stub_ask_ok))
+    assert result.failed_node == "branch"
+    assert result.trace[-1].ok is False
+
+
+@pytest.mark.unit
+def test_run_graph_a_raising_body_fails_closed_without_leaking_the_exception(tmp_path: Path) -> None:
+    plugin_dir = _write_init_py(tmp_path, "def boom(value):\n    raise KeyError('super secret internal detail')\n")
+    manifest = _manifest(Node(name="explode", kind="compute", body="init:boom"))
+    result = asyncio.run(run_graph(plugin_dir, manifest, _entry("explode"), {}, ask=_stub_ask_ok))
+    assert result.failed_node == "explode"
+    assert "super secret internal detail" not in result.text
+    assert "Traceback" not in result.text
+    assert result.trace[-1].ok is False
+
+
+@pytest.mark.unit
+def test_run_graph_refuses_call_nodes(tmp_path: Path) -> None:
+    plugin_dir = _write_init_py(tmp_path, "")
+    manifest = _manifest(Node(name="future", kind="call", body="init:whatever"))
+    result = asyncio.run(run_graph(plugin_dir, manifest, _entry("future"), {}, ask=_stub_ask_ok))
+    assert result.failed_node == "future"
+    assert "not runnable yet" in (result.trace[-1].detail or "")
+
+
+@pytest.mark.unit
+def test_run_graph_refuses_each_nodes(tmp_path: Path) -> None:
+    plugin_dir = _write_init_py(tmp_path, "")
+    manifest = _manifest(Node(name="future", kind="each"))
+    result = asyncio.run(run_graph(plugin_dir, manifest, _entry("future"), {}, ask=_stub_ask_ok))
+    assert result.failed_node == "future"
+
+
+@pytest.mark.unit
+def test_run_graph_refuses_wait_nodes(tmp_path: Path) -> None:
+    plugin_dir = _write_init_py(tmp_path, "")
+    manifest = _manifest(Node(name="future", kind="wait"))
+    result = asyncio.run(run_graph(plugin_dir, manifest, _entry("future"), {}, ask=_stub_ask_ok))
+    assert result.failed_node == "future"
+
+
+@pytest.mark.unit
+def test_run_graph_ask_success_becomes_the_next_predecessor_value(tmp_path: Path) -> None:
+    plugin_dir = _write_init_py(tmp_path, "")
+    nodes = (Node(name="interpret", kind="ask", skill="example-skill", next="done"), Node(name="done", kind="stop"))
+    manifest = _manifest(*nodes)
+    result = asyncio.run(run_graph(plugin_dir, manifest, _entry("interpret"), {"raw": True}, ask=_stub_ask_ok))
+    assert result.failed_node is None
+    assert result.text == "child said: " + json.dumps({"raw": True})
+    assert [t.node for t in result.trace] == ["interpret", "done"]
+
+
+@pytest.mark.unit
+def test_run_graph_ask_returning_none_fails_closed(tmp_path: Path) -> None:
+    plugin_dir = _write_init_py(tmp_path, "")
+    manifest = _manifest(Node(name="interpret", kind="ask", skill="example-skill"))
+    result = asyncio.run(run_graph(plugin_dir, manifest, _entry("interpret"), {}, ask=_stub_ask_fails))
+    assert result.failed_node == "interpret"
+
+
+@pytest.mark.unit
+def test_run_graph_ask_is_given_the_nodes_declared_skill(tmp_path: Path) -> None:
+    plugin_dir = _write_init_py(tmp_path, "")
+    seen: list[SkillRef] = []
+
+    async def _capturing_ask(skill: SkillRef, _text: str) -> str:
+        seen.append(skill)
+        return "ok"
+
+    manifest = _manifest(Node(name="interpret", kind="ask", skill="example-skill"), name="my-plugin")
+    asyncio.run(run_graph(plugin_dir, manifest, _entry("interpret"), {}, ask=_capturing_ask))
+    assert seen == [SkillRef(plugin="my-plugin", skill="example-skill")]
+
+
+@pytest.mark.unit
+def test_run_graph_walks_compute_ask_route_and_stop_together(tmp_path: Path) -> None:
+    plugin_dir = _write_init_py(
+        tmp_path,
+        "def fetch(value):\n    return {'from_fetch': value}\n\ndef classify(value):\n    return 'urgent'\n",
+    )
+    nodes = (
+        Node(name="fetch", kind="compute", body="init:fetch", next="interpret"),
+        Node(name="interpret", kind="ask", skill="example-skill", next="route_on_kind"),
+        Node(name="route_on_kind", kind="route", body="init:classify", ports=("urgent", "normal")),
+        Node(name="urgent", kind="stop"),
+        Node(name="normal", kind="stop"),
+    )
+    manifest = _manifest(*nodes)
+    result = asyncio.run(run_graph(plugin_dir, manifest, _entry("fetch"), {"raw": True}, ask=_stub_ask_ok))
+    assert result.failed_node is None
+    assert [t.node for t in result.trace] == ["fetch", "interpret", "route_on_kind", "urgent"]
+    assert all(t.ok for t in result.trace)
+    assert result.trace[2].port == "urgent"
+    assert result.text == "child said: " + json.dumps({"from_fetch": {"raw": True}})

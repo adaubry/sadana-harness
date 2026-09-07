@@ -1,0 +1,10 @@
+{
+  "type": "object",
+  "properties": {
+    "note": {
+      "type": "string",
+      "description": "A short note to pass along."
+    }
+  },
+  "required": ["note"]
+}
