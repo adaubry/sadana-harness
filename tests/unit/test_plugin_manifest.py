@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 
 from conftest import write_skill as _write_skill
-from sadana.plugin_manifest import discover_plugins, load_skill, run_graph, validate
+from sadana.plugin_manifest import _default_approve, discover_plugins, load_skill, run_graph, validate
 from sadana.plugins import (
     CyclicGraph,
     DanglingTarget,
@@ -394,6 +394,23 @@ def _entry(start: str) -> Entry:
     return Entry(tool="do_thing", purpose="p", parameters="schema/do_thing.json", start=start)
 
 
+# ── F1: _default_approve ─────────────────────────────────────────────────
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("answer", ["y", "yes", "Y", "YES"])
+def test_default_approve_accepts_yes(monkeypatch: pytest.MonkeyPatch, answer: str) -> None:
+    monkeypatch.setattr("builtins.input", lambda _prompt: answer)
+    assert asyncio.run(_default_approve("p", "n", {"a": 1})) is True
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("answer", ["", "n", "no", "maybe"])
+def test_default_approve_rejects_anything_else(monkeypatch: pytest.MonkeyPatch, answer: str) -> None:
+    monkeypatch.setattr("builtins.input", lambda _prompt: answer)
+    assert asyncio.run(_default_approve("p", "n", {"a": 1})) is False
+
+
 def _manifest(*nodes: Node, name: str = "p") -> Manifest:
     return Manifest(name=name, version="0.1.0", description="d", entries=(), nodes=nodes)
 
@@ -404,6 +421,14 @@ async def _stub_ask_ok(_skill: SkillRef, text: str) -> str:
 
 async def _stub_ask_fails(_skill: SkillRef, _text: str) -> str | None:
     return None
+
+
+async def _stub_approve_ok(_plugin: str, _node: str, _value: object) -> bool:
+    return True
+
+
+async def _stub_approve_denied(_plugin: str, _node: str, _value: object) -> bool:
+    return False
 
 
 @pytest.mark.unit
@@ -488,9 +513,38 @@ def test_run_graph_a_raising_body_fails_closed_without_leaking_the_exception(tmp
 def test_run_graph_refuses_call_nodes(tmp_path: Path) -> None:
     plugin_dir = _write_init_py(tmp_path, "")
     manifest = _manifest(Node(name="future", kind="call", body="init:whatever"))
-    result = asyncio.run(run_graph(plugin_dir, manifest, _entry("future"), {}, ask=_stub_ask_ok))
+    result = asyncio.run(
+        run_graph(plugin_dir, manifest, _entry("future"), {}, ask=_stub_ask_ok, approve=_stub_approve_ok)
+    )
     assert result.failed_node == "future"
     assert "not runnable yet" in (result.trace[-1].detail or "")
+
+
+@pytest.mark.unit
+def test_run_graph_call_node_declined(tmp_path: Path) -> None:
+    plugin_dir = _write_init_py(tmp_path, "")
+    manifest = _manifest(Node(name="future", kind="call", body="init:whatever"))
+    result = asyncio.run(
+        run_graph(plugin_dir, manifest, _entry("future"), {}, ask=_stub_ask_ok, approve=_stub_approve_denied)
+    )
+    assert result.failed_node == "future"
+    assert result.trace[-1].detail == "declined"
+
+
+@pytest.mark.unit
+def test_run_graph_call_node_records_what_was_asked(tmp_path: Path) -> None:
+    plugin_dir = _write_init_py(tmp_path, "")
+    seen: list[tuple[str, str, object]] = []
+
+    async def _capturing_approve(plugin: str, node: str, value: object) -> bool:
+        seen.append((plugin, node, value))
+        return True
+
+    manifest = _manifest(Node(name="future", kind="call", body="init:whatever"), name="my-plugin")
+    asyncio.run(
+        run_graph(plugin_dir, manifest, _entry("future"), {"a": 1}, ask=_stub_ask_ok, approve=_capturing_approve)
+    )
+    assert seen == [("my-plugin", "future", {"a": 1})]
 
 
 @pytest.mark.unit
@@ -544,6 +598,10 @@ def test_run_graph_ask_is_given_the_nodes_declared_skill(tmp_path: Path) -> None
 
 @pytest.mark.unit
 def test_run_graph_walks_compute_ask_route_and_stop_together(tmp_path: Path) -> None:
+    """Also covers spec's own acceptance criterion that compute/ask/route/
+    stop never call `approve`: `approve` here raises if called at all, so a
+    regression that reaches it for any of these four kinds fails this test
+    rather than passing by omission."""
     plugin_dir = _write_init_py(
         tmp_path,
         "def fetch(value):\n    return {'from_fetch': value}\n\ndef classify(value):\n    return 'urgent'\n",
@@ -556,7 +614,15 @@ def test_run_graph_walks_compute_ask_route_and_stop_together(tmp_path: Path) -> 
         Node(name="normal", kind="stop"),
     )
     manifest = _manifest(*nodes)
-    result = asyncio.run(run_graph(plugin_dir, manifest, _entry("fetch"), {"raw": True}, ask=_stub_ask_ok))
+
+    async def _approve_must_not_be_called(_plugin: str, _node: str, _value: object) -> bool:
+        raise AssertionError("approve must not be called for compute/ask/route/stop nodes")
+
+    result = asyncio.run(
+        run_graph(
+            plugin_dir, manifest, _entry("fetch"), {"raw": True}, ask=_stub_ask_ok, approve=_approve_must_not_be_called
+        )
+    )
     assert result.failed_node is None
     assert [t.node for t in result.trace] == ["fetch", "interpret", "route_on_kind", "urgent"]
     assert all(t.ok for t in result.trace)

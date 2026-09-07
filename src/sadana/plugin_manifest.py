@@ -8,6 +8,7 @@ from a block's pure module.
 
 from __future__ import annotations
 
+import asyncio
 import importlib.util
 import json
 import tomllib
@@ -249,6 +250,23 @@ def _resolve_body(plugin_dir: Path, node: plugins.Node, modules: dict[str, Modul
     return getattr(module, func_name)
 
 
+# ── F1: the approval gate ────────────────────────────────────────────────
+# Its full contract is `docs/tasks/F1-call-node-approval/spec.md`.
+
+
+async def _default_approve(plugin: str, node: str, value: object) -> bool:
+    """``run_graph``'s default ``ApproveFn`` — the real behavior for this
+    project's one interactive caller today: a person at a WSL terminal,
+    asked synchronously and blocked on until they answer. ``input()`` runs
+    in a worker thread via ``asyncio.to_thread`` so the blocking call never
+    freezes the event loop the rest of a ``dispatch`` call is running on.
+    Fails closed: anything other than ``y``/``yes`` (case-insensitively) is
+    a decline."""
+    prompt = f"{plugin}'s {node!r} step wants to run with input {value!r}. Allow it? [y/N] "
+    answer = await asyncio.to_thread(input, prompt)
+    return answer.strip().lower() in ("y", "yes")
+
+
 async def run_graph(
     plugin_dir: Path,
     manifest: plugins.Manifest,
@@ -256,6 +274,7 @@ async def run_graph(
     arguments: dict,
     *,
     ask: plugins.AskFn,
+    approve: plugins.ApproveFn = _default_approve,
 ) -> plugins.DagResult:
     """Walks ``manifest``'s declared steps from ``entry.start``, exactly as
     ``validate()`` already proved they connect and never loop back on
@@ -271,11 +290,20 @@ async def run_graph(
     other `§8` check this function never re-runs. Every node kind's own
     failure — a
     raised exception, a ``route`` body naming an undeclared port, a
-    ``call``/``each``/``wait`` node this vocabulary doesn't execute yet, an
+    ``call`` step declined by ``approve``, an ``each``/``wait`` node this
+    vocabulary doesn't execute yet, an
     ``ask`` whose sub-task didn't finish cleanly — ends the walk at that
     node: ``failed_node`` names it, ``text`` is one fixed, generic sentence
     naming the plugin and the step (never the raw exception or its
     traceback), and nothing raises out of this function for any of them.
+
+    A ``call`` node is asked about, via ``approve``, before anything else
+    happens for it — no other kind is (`docs/tasks/F1-call-node-approval/
+    spec.md`). Approval only clears the way to ask; no ``call`` node has a
+    body-execution mechanism wired to it yet (PLUGINS' execution half, a
+    separate later item), so an approved ``call`` node still ends the walk,
+    the same way an ``each``/``wait`` node already does — the trace's
+    ``detail`` is what distinguishes "declined" from "not runnable yet".
 
     Exactly one ``value`` is threaded through the loop — the entry's raw
     ``arguments`` for the first node, each node's own output after that.
@@ -301,7 +329,7 @@ async def run_graph(
     while True:
         node = by_name[current]
 
-        if node.kind in ("call", "each", "wait"):
+        if node.kind in ("each", "wait"):
             return failed(node, f"{node.kind} steps are not runnable yet")
 
         port: str | None = None
@@ -319,6 +347,9 @@ async def run_graph(
                 if output is None:
                     return failed(node, "child did not complete")
                 value = output
+            elif node.kind == "call":
+                approved = await approve(manifest.name, node.name, value)
+                return failed(node, f"{node.kind} steps are not runnable yet" if approved else "declined")
             elif node.kind == "stop":
                 pass
             else:

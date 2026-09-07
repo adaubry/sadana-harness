@@ -406,3 +406,9 @@ class InstalledPlugin:
 # invariant), so neither can call run_child directly. None means the
 # sub-task didn't finish cleanly; a str is what it reported back.
 AskFn = Callable[[SkillRef, str], Awaitable[str | None]]
+
+# Gates a `call` node before its body runs (`docs/tasks/F1-call-node-approval
+# /spec.md`). Args: plugin name, node name, the value about to reach it.
+# True lets the walk proceed; False ends the run at that node. `ask`/
+# `compute`/`route`/`stop` never call this — one kind, not every body.
+ApproveFn = Callable[[str, str, object], Awaitable[bool]]
