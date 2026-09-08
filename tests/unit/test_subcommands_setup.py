@@ -85,7 +85,7 @@ def test_cmd_setup_leaves_alone_values_already_in_env(
     monkeypatch.setattr("sys.stdin.isatty", lambda: False)
     monkeypatch.setattr("sys.stdout.isatty", lambda: False)
     monkeypatch.setenv("OPENROUTER_API_KEY", _VAL)
-    assert cmd_setup(_args(webhook_secret=_VAL2)) == 0
+    assert cmd_setup(_args(webhook_secret="S")) == 0
     env_vals = _read_env(_env_path())
     assert env_vals["OPENROUTER_API_KEY"] == _VAL
     assert env_vals["SADANA_GATEWAY_WEBHOOK_SECRET"] == "S"
