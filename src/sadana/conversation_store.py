@@ -261,6 +261,40 @@ def load(conn: sqlite3.Connection, key: ConversationKey, *, now: float) -> Conve
     )
 
 
+def _escape_like(query: str) -> str:
+    """Backslash-escapes a literal ``\\``, ``%`` or ``_`` in ``query`` —
+    backslash first, so escaping ``%``/``_`` afterward can't be
+    double-escaped by that first step — so ``search_conversations``'s
+    ``LIKE ... ESCAPE '\\'`` clause treats them as literal characters
+    instead of SQL wildcards."""
+    return query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def search_conversations(conn: sqlite3.Connection, query: str, *, now: float) -> list[Conversation]:
+    """Every saved conversation whose ``key``, ``template_name``, or any
+    message's ``content`` contains ``query`` as a case-insensitive
+    substring (SQLite's ``LIKE`` is case-insensitive for ASCII by
+    default), ordered by key. ``query == ""`` matches every row — this
+    doubles as ``search_conversations``'s own "list everything" behaviour
+    (CONV-08 spec.md requirement 7's deferred half), with no second
+    function or row-mapping to keep in sync with this one. Each match is
+    the same full ``Conversation`` ``load()`` returns for its key, not a
+    lighter summary — never raises: an empty result is a normal search
+    outcome, unlike ``load()``'s ``ConversationNotFound`` for one
+    specifically-named key that isn't there."""
+    pattern = f"%{_escape_like(query)}%"
+    rows = conn.execute(
+        "SELECT DISTINCT c.key FROM conversations c "
+        "LEFT JOIN messages m ON m.conversation_key = c.key "
+        "WHERE c.key LIKE ? ESCAPE '\\' "
+        "OR c.template_name LIKE ? ESCAPE '\\' "
+        "OR m.content LIKE ? ESCAPE '\\' "
+        "ORDER BY c.key",
+        (pattern, pattern, pattern),
+    ).fetchall()
+    return [load(conn, row["key"], now=now) for row in rows]
+
+
 def bind_persist(
     conn: sqlite3.Connection, conversation: Conversation, *, now: float
 ) -> Callable[[tuple[Message, ...]], Awaitable[None]]:

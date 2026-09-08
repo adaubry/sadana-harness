@@ -28,6 +28,7 @@ from sadana.conversation_store import (
     load,
     open_store,
     save,
+    search_conversations,
     store_path_from_config,
     write_txn,
 )
@@ -47,6 +48,7 @@ def _spec(key: str, name: str) -> ToolSpec:
 def _conversation(
     *,
     key: str = "k1",
+    template_name: str = "t1",
     messages: tuple[Message, ...] = (),
     wall_clock_budget: WallClockBudget | None = None,
     next_turn_seq: int = 0,
@@ -56,7 +58,7 @@ def _conversation(
     surface = build_surface([_spec("noop", "noop")])
     return Conversation(
         key=key,
-        template_name="t1",
+        template_name=template_name,
         system_prompt=_SYSTEM_PROMPT,
         prompt_sha256=turn_prompt_hash(_SYSTEM_PROMPT, surface),
         prompt_epoch=0,
@@ -341,3 +343,94 @@ def test_bind_persist_success_saves_growing_messages(tmp_path: Path, monkeypatch
     saved = load(conn, conv.key, now=0.0)
     assert len(saved.messages) >= 1  # the mid-turn persist() call landed durably
     assert any(m.role == "assistant" and m.tool_calls for m in saved.messages)
+
+
+# ── search_conversations ────────────────────────────────────────────────
+
+
+@pytest.mark.unit
+def test_search_empty_store_returns_empty_list(tmp_path: Path) -> None:
+    conn = open_store(tmp_path / "c.db")
+    assert search_conversations(conn, "", now=0.0) == []
+
+
+@pytest.mark.unit
+def test_search_empty_query_returns_every_conversation(tmp_path: Path) -> None:
+    conn = open_store(tmp_path / "c.db")
+    create(conn, _conversation(key="alpha"), now=0.0)
+    create(conn, _conversation(key="beta"), now=0.0)
+
+    found = search_conversations(conn, "", now=0.0)
+
+    assert [c.key for c in found] == ["alpha", "beta"]  # ORDER BY key
+    assert found[0] == load(conn, "alpha", now=0.0)
+    assert found[1] == load(conn, "beta", now=0.0)
+
+
+@pytest.mark.unit
+def test_search_matches_key_substring_case_insensitively(tmp_path: Path) -> None:
+    conn = open_store(tmp_path / "c.db")
+    create(conn, _conversation(key="debugging-session"), now=0.0)
+    create(conn, _conversation(key="unrelated"), now=0.0)
+
+    found = search_conversations(conn, "DEBUG", now=0.0)
+
+    assert [c.key for c in found] == ["debugging-session"]
+
+
+@pytest.mark.unit
+def test_search_matches_template_name_substring_case_insensitively(tmp_path: Path) -> None:
+    conn = open_store(tmp_path / "c.db")
+    create(conn, _conversation(key="k1", template_name="eval-harness"), now=0.0)
+    create(conn, _conversation(key="k2", template_name="other"), now=0.0)
+
+    found = search_conversations(conn, "EVAL", now=0.0)
+
+    assert [c.key for c in found] == ["k1"]
+
+
+@pytest.mark.unit
+def test_search_matches_message_content_substring(tmp_path: Path) -> None:
+    conn = open_store(tmp_path / "c.db")
+    create(conn, _conversation(key="k1", messages=(Message(role="user", content="find the needle here"),)), now=0.0)
+    create(conn, _conversation(key="k2", messages=(Message(role="user", content="nothing to see"),)), now=0.0)
+
+    found = search_conversations(conn, "NEEDLE", now=0.0)
+
+    assert [c.key for c in found] == ["k1"]
+
+
+@pytest.mark.unit
+def test_search_deduplicates_conversation_matching_multiple_fields(tmp_path: Path) -> None:
+    conn = open_store(tmp_path / "c.db")
+    create(
+        conn,
+        _conversation(
+            key="widget-session",
+            template_name="widget-template",
+            messages=(Message(role="user", content="about widgets"),),
+        ),
+        now=0.0,
+    )
+
+    found = search_conversations(conn, "widget", now=0.0)
+
+    assert [c.key for c in found] == ["widget-session"]
+
+
+@pytest.mark.unit
+def test_search_no_match_returns_empty_list(tmp_path: Path) -> None:
+    conn = open_store(tmp_path / "c.db")
+    create(conn, _conversation(key="k1"), now=0.0)
+
+    assert search_conversations(conn, "nothing-saved-matches-this", now=0.0) == []
+
+
+@pytest.mark.unit
+def test_search_escapes_percent_and_underscore_as_literals(tmp_path: Path) -> None:
+    conn = open_store(tmp_path / "c.db")
+    create(conn, _conversation(key="50%off"), now=0.0)
+    create(conn, _conversation(key="50Xoff"), now=0.0)
+
+    assert [c.key for c in search_conversations(conn, "50%off", now=0.0)] == ["50%off"]
+    assert search_conversations(conn, "50_off", now=0.0) == []
