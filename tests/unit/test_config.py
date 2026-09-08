@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from sadana.config import Paths, env, env_bool, env_int, env_path, get_paths
+from sadana.config import Paths, env, env_bool, env_int, env_path, get_paths, load_dotenv
 
 
 @pytest.mark.unit
@@ -128,3 +128,49 @@ def test_get_paths_does_not_cache(monkeypatch: pytest.MonkeyPatch, tmp_path: Pat
     assert get_paths().state_dir == first
     monkeypatch.setenv("SADANA_STATE_DIR", str(second))
     assert get_paths().state_dir == second
+
+
+# ── load_dotenv ───────────────────────────────────────────────────────────
+
+
+@pytest.mark.unit
+def test_load_dotenv_missing_file_is_a_no_op(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("SADANA_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.delenv("SADANA_TEST_LOADED", raising=False)
+    load_dotenv()
+    assert env("SADANA_TEST_LOADED", "fallback") == "fallback"
+
+
+@pytest.mark.unit
+def test_load_dotenv_loads_quoted_and_bare_values(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    state.mkdir()
+    (state / ".env").write_text('AAA="quoted value"\nBBB=bare\n', encoding="utf-8")
+    monkeypatch.setenv("SADANA_STATE_DIR", str(state))
+    monkeypatch.delenv("AAA", raising=False)
+    monkeypatch.delenv("BBB", raising=False)
+    load_dotenv()
+    assert env("AAA", "") == "quoted value"
+    assert env("BBB", "") == "bare"
+
+
+@pytest.mark.unit
+def test_load_dotenv_never_overrides_a_live_var(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    state.mkdir()
+    (state / ".env").write_text('AAA="from-file"\n', encoding="utf-8")
+    monkeypatch.setenv("SADANA_STATE_DIR", str(state))
+    monkeypatch.setenv("AAA", "from-shell")
+    load_dotenv()
+    assert env("AAA", "") == "from-shell"
+
+
+@pytest.mark.unit
+def test_load_dotenv_skips_comments_blank_and_malformed_lines(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    state.mkdir()
+    (state / ".env").write_text("# comment\n\n=novalue\nBAD\nCCC=ok\n= trailing-space-ok\n", encoding="utf-8")
+    monkeypatch.setenv("SADANA_STATE_DIR", str(state))
+    monkeypatch.delenv("CCC", raising=False)
+    load_dotenv()
+    assert env("CCC", "") == "ok"

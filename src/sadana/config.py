@@ -28,6 +28,36 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
+def load_dotenv() -> None:
+    """Copy ``KEY=value`` lines from ``state_dir/.env`` into the environment.
+
+    Loaded exactly once, at the CLI entrypoint, before any subcommand reads
+    config (see ``src/sadana/cli.py:main()``). Never overrides a variable
+    already set in the live environment — a real env var always wins. The
+    ``sadana setup`` command writes this file; this is the read half of that
+    same format (``KEY=value`` per line, values may be double-quoted).
+    """
+    dotenv = get_paths().state_dir / ".env"
+    if not dotenv.is_file():
+        return
+    for line in dotenv.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        key, sep, raw_value = stripped.partition("=")
+        if not sep or not key:
+            continue
+        key = key.strip()
+        if not key:
+            continue
+        if os.environ.get(key) is not None:
+            continue
+        value = raw_value.strip()
+        if len(value) >= 2 and value[0] == value[-1] == '"':
+            value = value[1:-1]
+        os.environ[key] = value
+
+
 def env(name: str, default: str) -> str:
     """Return the string value of ``name``, or ``default`` if unset."""
     return os.environ.get(name, default)

@@ -13,10 +13,11 @@ from __future__ import annotations
 import argparse
 import sys
 
-from sadana import __version__
+from sadana import __version__, config
 from sadana.subcommands.chat import build_chat_parser
 from sadana.subcommands.conversations import build_conversations_parser
 from sadana.subcommands.gateway import build_gateway_parser
+from sadana.subcommands.setup import build_setup_parser
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -26,10 +27,14 @@ def build_parser() -> argparse.ArgumentParser:
     build_conversations_parser(subparsers)
     build_chat_parser(subparsers)
     build_gateway_parser(subparsers)
+    build_setup_parser(subparsers)
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
+    # The state-dir .env that `sadana setup` writes: loaded before any
+    # subcommand reads config, never overriding a live env var.
+    config.load_dotenv()
     args = build_parser().parse_args(sys.argv[1:] if argv is None else argv)
     return args.func(args)
 
