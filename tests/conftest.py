@@ -12,6 +12,7 @@ from pathlib import Path
 
 import pytest
 
+from sadana import model_access
 from sadana.context import ContextState
 from sadana.conversation import (
     Conversation,
@@ -79,6 +80,24 @@ def conversation(
         context_state=ContextState(),
         next_child_seq=next_child_seq,
     )
+
+
+def tool_call_response(*names: str) -> model_access.Response:
+    """A model response calling each of ``names`` as a tool, no arguments
+    — shared by ``test_conversation_store.py`` and
+    ``test_subcommands_chat.py``."""
+    return model_access.Response(
+        content=None,
+        tool_calls=tuple({"function": {"name": n, "arguments": "{}"}} for n in names),
+        finish_reason="tool_calls",
+        usage=model_access.Usage(),
+    )
+
+
+def plain_response(content: str) -> model_access.Response:
+    """A model response with no tool calls — the turn-ending sibling of
+    ``tool_call_response``."""
+    return model_access.Response(content=content, tool_calls=(), finish_reason="stop", usage=model_access.Usage())
 
 
 def write_skill(

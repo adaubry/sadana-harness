@@ -9,6 +9,7 @@ import pytest
 
 from conftest import SYSTEM_PROMPT as _SYSTEM_PROMPT
 from conftest import conversation as _conversation
+from conftest import tool_call_response as _tool_call_response
 from conftest import tool_spec as _spec
 from sadana import conversation_store, model_access, plugins
 from sadana.context import ContextState
@@ -224,15 +225,6 @@ def test_save_forced_failure_leaves_previous_snapshot_intact(tmp_path: Path, mon
 
 
 # ── bind_persist against a real failure ─────────────────────────────────
-
-
-def _tool_call_response(*names: str) -> model_access.Response:
-    return model_access.Response(
-        content=None,
-        tool_calls=tuple({"function": {"name": n, "arguments": "{}"}} for n in names),
-        finish_reason="tool_calls",
-        usage=model_access.Usage(),
-    )
 
 
 def _run_turn(surface, *, dispatch, persist):

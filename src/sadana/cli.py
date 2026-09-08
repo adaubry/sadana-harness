@@ -14,6 +14,7 @@ import argparse
 import sys
 
 from sadana import __version__
+from sadana.subcommands.chat import build_chat_parser
 from sadana.subcommands.conversations import build_conversations_parser
 
 
@@ -22,6 +23,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--version", action="version", version=f"sadana {__version__}")
     subparsers = parser.add_subparsers(dest="command", required=True)
     build_conversations_parser(subparsers)
+    build_chat_parser(subparsers)
     return parser
 
 
