@@ -270,7 +270,7 @@ something real to call.
 | 2 | The bare dispatch shell | nothing new | One `argparse` entry point, `--version`, the exit-code/error-formatting convention picked once (§5.3), zero subcommands yet beyond what's needed to prove the shell runs and exits correctly. |
 | 3 | `hermes sessions list` / `hermes sessions search <query>` | items 1, 2 | Item 1's store function gets its first real caller — this is "session listing and search finally have a caller," the exact deferred half named when this work started. Thin: argv → `search_conversations()` → printed rows. |
 | 4 | `hermes chat` (or equivalent default command) | item 2, `conversation.py`/`conversation_store.py` (done) | The actual interactive agent loop, wired to `create`/`load`/`run_turn`/`bind_persist`. This is CLI-SHELL's real center of gravity and its own work item's spec.md will need its own design pass — not scoped further here. |
-| 5 | `hermes gateway` lifecycle verb | item 2; a future `GATEWAY-DAEMON`/`CHANNELS` block | Install/start/stop/status/restart for a persistent per-instance daemon, systemd-only (§4.2). **Not scheduled** — nothing to bridge to yet; real, not declined. |
+| 5 | `hermes gateway` lifecycle verb | item 2; a future `GATEWAY-DAEMON`/`CHANNELS` block | Install/start/stop/status/restart for a persistent per-instance daemon, systemd-only (§4.2). **Done** — `GATEWAY-DAEMON-01` (`f47862e`) built the block to bridge to; `CLI-SHELL-05` (`1a659a3`) built the lifecycle verb itself: `sadana gateway install/start/stop/restart/status`, one fixed system-scope systemd unit, no dual-scope/drift-detection/SIGUSR1-restart complexity hermes's own multi-profile precedent needed. See `docs/tasks/CLI-SHELL-05-gateway-lifecycle-verb/`. |
 | 6 | `hermes setup` / first-run | item 2 | The in-instance step an (out-of-scope) provisioning workflow would invoke once per new instance (§4.2). **Not scheduled** — no provisioning workflow exists yet to call it; real, not declined. |
 | — | Everything in §4.2's "No" rows (cloud-relay enrollment, both "proxy" concepts, billing, multi-profile, browser dashboard, Windows/Android shims, legacy migration, cron-dependent commands, middleware/provider-resolution misfiles, plugin-registered CLI verbs) | — | Not scheduled, and not a backlog either — declined because sadana's paradigm names no scenario for them, not because they're merely low-priority. |
 
@@ -301,13 +301,15 @@ isolated guess at CLI-SHELL's scope.
    (§4.2's `middleware.py`, `runtime_provider.py` rows) are real ideas with
    no home in this document — they belong to PLUGINS and MODEL-ACCESS
    respectively, flagged there rather than decided here.
-5. **Does sadana-harness build the messaging-platform bridge itself**
-   (a future `GATEWAY-DAEMON`/`CHANNELS`-equivalent), or is that also a
-   separate system's job the way fleet provisioning is? §1.1 only
-   confirmed the *access model* (messaging platform, named by the
-   maintainer); it didn't confirm *who builds it*. Decide before item 5
-   (§6) is ever specced — if it's out of scope the way provisioning is,
-   item 5 shrinks to nothing to bridge to, indefinitely.
+5. **Resolved.** Does sadana-harness build the messaging-platform bridge
+   itself (a future `GATEWAY-DAEMON`/`CHANNELS`-equivalent), or is that also
+   a separate system's job the way fleet provisioning is? Yes, by
+   `GATEWAY-DAEMON-01` (`f47862e`): a real daemon plus one working webhook
+   channel adapter, which is exactly what let item 5 (§6) get specced and
+   built as `CLI-SHELL-05` (`1a659a3`). Every other channel adapter
+   (Telegram, Slack, email, SMS, Discord, ~20 more) is still separate,
+   unscheduled future work, one item each — only the *bridge itself*, and
+   *who builds it*, were what this question actually asked.
 6. **Is VNC assumed sufficient for ops/troubleshooting access
    indefinitely, or does a browser dashboard eventually get built
    alongside it** (§4.2's pty-bridge/web-dashboard row)? Not named as
