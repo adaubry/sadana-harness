@@ -12,6 +12,17 @@ from pathlib import Path
 
 import pytest
 
+from sadana.context import ContextState
+from sadana.conversation import (
+    Conversation,
+    IterationBudget,
+    Message,
+    ToolSpec,
+    WallClockBudget,
+    build_surface,
+    turn_prompt_hash,
+)
+
 
 @pytest.fixture(autouse=True)
 def _isolated_state(tmp_path, monkeypatch):  # type: ignore[no-untyped-def]
@@ -23,6 +34,51 @@ def _isolated_state(tmp_path, monkeypatch):  # type: ignore[no-untyped-def]
     monkeypatch.setenv("XDG_CONFIG_HOME", str(home / ".config"))
     monkeypatch.setenv("SADANA_STATE_DIR", str(home / ".sadana"))
     return home
+
+
+SYSTEM_PROMPT = "You are a helpful assistant."
+
+
+def tool_spec(key: str = "noop", name: str = "noop") -> ToolSpec:
+    """A minimal ``ToolSpec`` for building a ``Conversation`` fixture —
+    shared by ``test_conversation_store.py`` and
+    ``test_subcommands_conversations.py``."""
+    return ToolSpec(
+        key=key,
+        name=name,
+        parameters={"type": "object", "properties": {}},
+        describe=lambda _resolved: f"{name} does things.",
+    )
+
+
+def conversation(
+    *,
+    key: str = "k1",
+    template_name: str = "t1",
+    messages: tuple[Message, ...] = (),
+    wall_clock_budget: WallClockBudget | None = None,
+    next_turn_seq: int = 0,
+    iteration_budget: IterationBudget | None = None,
+    next_child_seq: int = 0,
+) -> Conversation:
+    """A minimal, fully-defaulted ``Conversation`` fixture — shared by
+    ``test_conversation_store.py`` and ``test_subcommands_conversations.py``."""
+    surface = build_surface([tool_spec()])
+    return Conversation(
+        key=key,
+        template_name=template_name,
+        system_prompt=SYSTEM_PROMPT,
+        prompt_sha256=turn_prompt_hash(SYSTEM_PROMPT, surface),
+        prompt_epoch=0,
+        tool_surface=surface,
+        messages=messages,
+        next_turn_seq=next_turn_seq,
+        iteration_budget=iteration_budget or IterationBudget(max_total=10, used=3),
+        wall_clock_budget=wall_clock_budget,
+        stable_prompt_len=len(SYSTEM_PROMPT),
+        context_state=ContextState(),
+        next_child_seq=next_child_seq,
+    )
 
 
 def write_skill(

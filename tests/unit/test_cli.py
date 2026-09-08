@@ -52,3 +52,15 @@ def test_none_argv_reads_sys_argv(monkeypatch: pytest.MonkeyPatch) -> None:
 @pytest.mark.unit
 def test_build_parser_returns_a_fresh_instance_each_call() -> None:
     assert build_parser() is not build_parser()
+
+
+@pytest.mark.unit
+def test_no_args_names_conversations_as_a_valid_choice(capsys: pytest.CaptureFixture[str]) -> None:
+    with pytest.raises(SystemExit):
+        main([])
+    assert "conversations" in capsys.readouterr().err
+
+
+@pytest.mark.unit
+def test_conversations_subcommand_reachable_via_main() -> None:
+    assert main(["conversations"]) == 0

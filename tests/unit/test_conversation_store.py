@@ -7,14 +7,15 @@ from pathlib import Path
 
 import pytest
 
+from conftest import SYSTEM_PROMPT as _SYSTEM_PROMPT
+from conftest import conversation as _conversation
+from conftest import tool_spec as _spec
 from sadana import conversation_store, model_access, plugins
 from sadana.context import ContextState
 from sadana.conversation import (
-    Conversation,
     ExitReason,
     IterationBudget,
     Message,
-    ToolSpec,
     WallClockBudget,
     build_surface,
     run_turn,
@@ -32,45 +33,6 @@ from sadana.conversation_store import (
     store_path_from_config,
     write_txn,
 )
-
-_SYSTEM_PROMPT = "You are a helpful assistant."
-
-
-def _spec(key: str, name: str) -> ToolSpec:
-    return ToolSpec(
-        key=key,
-        name=name,
-        parameters={"type": "object", "properties": {}},
-        describe=lambda _resolved: f"{name} does things.",
-    )
-
-
-def _conversation(
-    *,
-    key: str = "k1",
-    template_name: str = "t1",
-    messages: tuple[Message, ...] = (),
-    wall_clock_budget: WallClockBudget | None = None,
-    next_turn_seq: int = 0,
-    iteration_budget: IterationBudget | None = None,
-    next_child_seq: int = 0,
-) -> Conversation:
-    surface = build_surface([_spec("noop", "noop")])
-    return Conversation(
-        key=key,
-        template_name=template_name,
-        system_prompt=_SYSTEM_PROMPT,
-        prompt_sha256=turn_prompt_hash(_SYSTEM_PROMPT, surface),
-        prompt_epoch=0,
-        tool_surface=surface,
-        messages=messages,
-        next_turn_seq=next_turn_seq,
-        iteration_budget=iteration_budget or IterationBudget(max_total=10, used=3),
-        wall_clock_budget=wall_clock_budget,
-        stable_prompt_len=len(_SYSTEM_PROMPT),
-        context_state=ContextState(),
-        next_child_seq=next_child_seq,
-    )
 
 
 def _messages() -> tuple[Message, ...]:
