@@ -47,6 +47,7 @@ WSL only. Python lives in `.venv`; `make` puts it on PATH for you, so there is n
 - A plugin graph's node receives only its immediate predecessor's output, never the run's accumulated history.
 - A `call` node's body runs only after `approve()` returns `True` — never unconditionally, and never for `ask`/`compute`/`route`/`stop`.
 - A registry or dispatch seam for a family of pluggable backends earns its cost only once a second real member exists to register — build the single member as a direct call, not a lookup table of one, no matter how certain a second member seems.
+- A CLI subcommand's handler returns an int for its own exit code; argparse's own `--version`/`--help`/parse-error exits are never wrapped or re-raised as something else.
 
 ## Glossary
 
