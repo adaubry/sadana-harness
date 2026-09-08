@@ -86,18 +86,19 @@ def test_load_or_seed_persona_reads_existing_file_verbatim(tmp_path: Path) -> No
     assert load_or_seed_persona(path) == "You are a pirate.\n"
 
 
-# ── cmd_chat: provider validation, before anything else runs ────────────
+# ── cmd_chat: an unwired provider fails via the normal turn loop ────────
 
 
 @pytest.mark.unit
-def test_cmd_chat_unknown_provider_exits_two_before_touching_store() -> None:
-    assert cmd_chat(_args(provider="not-a-real-provider")) == 2
-    conn = open_store(store_path_from_config())
-    try:
-        count = conn.execute("SELECT COUNT(*) FROM conversations").fetchone()[0]
-    finally:
-        conn.close()
-    assert count == 0
+def test_cmd_chat_unknown_provider_fails_via_the_normal_turn_loop(monkeypatch: pytest.MonkeyPatch) -> None:
+    _feed(monkeypatch, "hello")
+
+    assert cmd_chat(_args(key="bad-provider-test", provider="not-a-real-provider")) == 1
+
+    # unlike before MODEL-ACCESS-01, the conversation row already exists —
+    # the failure is discovered on the first turn, not before the store is
+    # touched. _load would raise ConversationNotFound if it weren't.
+    _load("bad-provider-test")
 
 
 # ── cmd_chat: a real turn, creation, and the post-turn save ─────────────

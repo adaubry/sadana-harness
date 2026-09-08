@@ -478,6 +478,20 @@ def test_resolve_returns_each_non_retry_outcome_unchanged(
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize(
+    ("provider", "expected_prefix"),
+    [
+        ("definitely-not-a-real-provider", "unknown provider:"),  # unregistered
+        ("anthropic", "provider not wired:"),  # registered but unwired
+    ],
+)
+def test_resolve_returns_needs_credential_for_a_bad_provider(provider: str, expected_prefix: str) -> None:
+    outcome = asyncio.run(resolve(Request(messages=(), provider=provider, model="x")))
+    assert isinstance(outcome, NeedsCredentialOrProviderChange)
+    assert outcome.detail.startswith(expected_prefix)
+
+
+@pytest.mark.unit
 def test_resolve_is_cancellable_between_attempts(monkeypatch: pytest.MonkeyPatch) -> None:
     """Cold review caught that collapsing the retry loop into one
     asyncio.to_thread call around the whole sequence (instead of one per

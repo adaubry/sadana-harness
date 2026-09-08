@@ -18,7 +18,7 @@ import time
 from contextlib import closing
 from pathlib import Path
 
-from sadana import config, conversation_store, model_access, plugin_dispatch, plugin_manifest
+from sadana import config, conversation_store, plugin_dispatch, plugin_manifest
 from sadana.conversation import (
     Conversation,
     ConversationTemplate,
@@ -105,15 +105,6 @@ async def _chat_loop(
 def cmd_chat(args: argparse.Namespace) -> int:
     provider = args.provider or config.env("SADANA_MODEL_ACCESS_PROVIDER", "openrouter")
     model = args.model or config.env("SADANA_MODEL_ACCESS_MODEL", "deepseek/deepseek-v4-flash-0731")
-
-    try:
-        manifest = model_access.get_provider(provider)
-    except model_access.UnknownProvider:
-        print(f"sadana chat: unknown provider {provider!r}", file=sys.stderr)
-        return 2
-    if manifest.request_fn is None:
-        print(f"sadana chat: provider {provider!r} has no request function configured", file=sys.stderr)
-        return 2
 
     persona = load_or_seed_persona(persona_path_from_config())
     plugin_set = plugin_dispatch.build_plugin_set(plugin_manifest.discover_plugins())

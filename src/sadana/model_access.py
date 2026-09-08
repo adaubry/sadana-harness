@@ -275,6 +275,20 @@ async def resolve(
     caller. Stays unaware of any caller's own exception types: each caller
     translates the returned outcome itself.
 
+    `send()`'s own two precondition failures — `UnknownProvider`,
+    `ProviderNotWired` — are folded into `NeedsCredentialOrProviderChange`
+    here rather than left to escape uncaught: the same outcome `send()`
+    already returns for a missing credential, since all three are the
+    same shape of problem ("this request cannot proceed because of what
+    provider was asked for"). Each gets its own short prefix
+    ("unknown provider: ...", "provider not wired: ...") — both
+    exceptions carry only the bare provider name as their message, so
+    `str(exc)` alone would read as an unlabeled name, not a reason.
+    `send()` and `get_provider()` themselves keep raising exactly as
+    their own tests already require — this is the one layer between
+    them and every real caller, so it is the one place that needs to
+    know.
+
     `async`, wrapping each individual attempt in its own
     `asyncio.to_thread` — not one call around the whole loop — so a
     pending cancellation is still observable between attempts, the same
@@ -284,7 +298,12 @@ async def resolve(
     round trip) before it could be delivered."""
     attempt = request.attempt
     while True:
-        outcome = await asyncio.to_thread(send, replace(request, attempt=attempt))
+        try:
+            outcome = await asyncio.to_thread(send, replace(request, attempt=attempt))
+        except UnknownProvider as exc:
+            return NeedsCredentialOrProviderChange(f"unknown provider: {exc}")
+        except ProviderNotWired as exc:
+            return NeedsCredentialOrProviderChange(f"provider not wired: {exc}")
         if isinstance(outcome, Retry):
             attempt = outcome.next_attempt
             continue
