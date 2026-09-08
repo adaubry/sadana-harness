@@ -1,11 +1,12 @@
-"""The `sadana gateway run` subcommand.
+"""The `sadana gateway` subcommand family.
 
-`docs/tasks/GATEWAY-DAEMON-01-daemon-and-webhook-channel/spec.md`. Owns both
-its parser and its handler in one file, matching `chat.py`'s and
-`conversations.py`'s existing convention. Nested under `gateway` because
-that's the literal two-word command spec.md names, not speculative
-registry-building — only `run` is registered; the process is stopped
-externally via signal, not a second subcommand.
+`run` is `docs/tasks/GATEWAY-DAEMON-01-daemon-and-webhook-channel/spec.md`'s
+own work — starts the daemon in the foreground and blocks until a signal.
+`install`/`start`/`stop`/`restart`/`status` are
+`docs/tasks/CLI-SHELL-05-gateway-lifecycle-verb/spec.md`'s own extension of
+this same file and parser tree — installing and controlling `run` as a real
+systemd service. Owns both its parser and its handlers in one file, matching
+`chat.py`'s and `conversations.py`'s existing convention.
 """
 
 from __future__ import annotations
@@ -18,6 +19,7 @@ from sadana import (
     conversation_store,
     gateway_daemon,
     gateway_dispatch,
+    gateway_service,
     model_access,
     plugin_dispatch,
     plugin_manifest,
@@ -29,10 +31,29 @@ from sadana.persona import load_or_seed_persona, persona_path_from_config
 def build_gateway_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
     parser = subparsers.add_parser("gateway", help="run sadana as a long-lived background process")
     gateway_subparsers = parser.add_subparsers(dest="gateway_command", required=True)
+
     run_parser = gateway_subparsers.add_parser("run", help="start the gateway daemon and block until stopped")
     run_parser.add_argument("--host", help="override the configured bind host")
     run_parser.add_argument("--port", type=int, help="override the configured bind port")
     run_parser.set_defaults(func=cmd_gateway_run)
+
+    install_parser = gateway_subparsers.add_parser("install", help="install the gateway as a systemd service")
+    install_parser.add_argument(
+        "--run-as-user", help="user account the service should run as (default: the user who ran sudo)"
+    )
+    install_parser.set_defaults(func=cmd_gateway_install)
+
+    start_parser = gateway_subparsers.add_parser("start", help="start the installed gateway service")
+    start_parser.set_defaults(func=cmd_gateway_start)
+
+    stop_parser = gateway_subparsers.add_parser("stop", help="stop the installed gateway service")
+    stop_parser.set_defaults(func=cmd_gateway_stop)
+
+    restart_parser = gateway_subparsers.add_parser("restart", help="restart the installed gateway service")
+    restart_parser.set_defaults(func=cmd_gateway_restart)
+
+    status_parser = gateway_subparsers.add_parser("status", help="show whether the gateway service is running")
+    status_parser.set_defaults(func=cmd_gateway_status)
 
 
 def cmd_gateway_run(args: argparse.Namespace) -> int:
@@ -56,3 +77,23 @@ def cmd_gateway_run(args: argparse.Namespace) -> int:
         )
 
     return gateway_daemon.run(host=host, port=port, secret=secret, on_message=on_message)
+
+
+def cmd_gateway_install(args: argparse.Namespace) -> int:
+    return gateway_service.install(run_as_user=args.run_as_user)
+
+
+def cmd_gateway_start(args: argparse.Namespace) -> int:
+    return gateway_service.start()
+
+
+def cmd_gateway_stop(args: argparse.Namespace) -> int:
+    return gateway_service.stop()
+
+
+def cmd_gateway_restart(args: argparse.Namespace) -> int:
+    return gateway_service.restart()
+
+
+def cmd_gateway_status(args: argparse.Namespace) -> int:
+    return gateway_service.status()
