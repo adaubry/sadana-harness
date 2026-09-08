@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-from pathlib import Path
 
 import pytest
 
@@ -12,12 +11,8 @@ from conftest import plain_response, tool_call_response
 from sadana import model_access
 from sadana.conversation import Conversation
 from sadana.conversation_store import ConversationNotFound, create, load, open_store, store_path_from_config
-from sadana.subcommands.chat import (
-    build_chat_parser,
-    cmd_chat,
-    load_or_seed_persona,
-    persona_path_from_config,
-)
+from sadana.persona import persona_path_from_config
+from sadana.subcommands.chat import build_chat_parser, cmd_chat
 
 
 def _args(**overrides: object) -> argparse.Namespace:
@@ -66,24 +61,6 @@ def test_build_chat_parser_rejects_resume_and_key_together() -> None:
     with pytest.raises(SystemExit) as exc:
         parser.parse_args(["chat", "--resume", "x", "--key", "y"])
     assert exc.value.code == 2
-
-
-# ── persona ──────────────────────────────────────────────────────────────
-
-
-@pytest.mark.unit
-def test_load_or_seed_persona_creates_default_file(tmp_path: Path) -> None:
-    path = tmp_path / "persona.md"
-    text = load_or_seed_persona(path)
-    assert path.read_text(encoding="utf-8") == text
-    assert "sadana" in text
-
-
-@pytest.mark.unit
-def test_load_or_seed_persona_reads_existing_file_verbatim(tmp_path: Path) -> None:
-    path = tmp_path / "persona.md"
-    path.write_text("You are a pirate.\n", encoding="utf-8")
-    assert load_or_seed_persona(path) == "You are a pirate.\n"
 
 
 # ── cmd_chat: an unwired provider fails via the normal turn loop ────────

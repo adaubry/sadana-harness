@@ -39,6 +39,12 @@ RawResult = tuple[int | None, dict]
 
 # ── Request / Outcome ────────────────────────────────────────────────────
 
+# The one provider/model pair this work item wires (see _CONTEXT_WINDOWS
+# below) — the shared default every caller resolving SADANA_MODEL_ACCESS_*
+# reads, instead of restating the same two literals in each subcommand.
+DEFAULT_PROVIDER = "openrouter"
+DEFAULT_MODEL = "deepseek/deepseek-v4-flash-0731"
+
 
 @dataclass(frozen=True)
 class Request:
