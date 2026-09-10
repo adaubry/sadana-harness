@@ -53,6 +53,7 @@ WSL only. Python lives in `.venv`; `make` puts it on PATH for you, so there is n
 - An observability/recording write's failure is caught and logged, never raised to the caller of the run it is observing.
 - A derived/observability record's key reuses whatever unique key its producing call already minted — never invent a synthetic id where one already exists.
 - A check that can execute code as a side effect of validating it (e.g. importing a module to confirm a symbol exists) must offer a mode that never executes anything, and any caller handling input from a source it doesn't already trust uses that mode.
+- A caller-supplied string passed to `git` (or any CLI tool) as a bare, unflagged positional argument is a command-injection vector — a value starting with `-` is parsed as an option, not data (e.g. `--upload-pack=<cmd>` runs it). Always put `--` before the first untrusted positional so everything after it is read literally.
 
 ## Glossary
 
