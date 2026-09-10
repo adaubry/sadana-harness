@@ -96,6 +96,28 @@ def test_cmd_chat_creates_and_persists_a_new_conversation(monkeypatch: pytest.Mo
 
 
 @pytest.mark.unit
+def test_cmd_chat_records_the_turn(monkeypatch: pytest.MonkeyPatch) -> None:
+    """OBSERVABILITY-01: a real chat turn leaves a `turn_runs` row behind,
+    not just the transcript `test_cmd_chat_creates_and_persists_a_new_conversation`
+    already checks."""
+    responses = iter([plain_response("hi there")])
+    monkeypatch.setattr(model_access, "send", lambda request: next(responses))
+    _feed(monkeypatch, "hello")
+
+    assert cmd_chat(_args(key="recorded-convo")) == 0
+
+    conn = open_store(store_path_from_config())
+    try:
+        row = conn.execute(
+            "SELECT * FROM turn_runs WHERE conversation_key = ? AND turn_seq = 0", ("recorded-convo",)
+        ).fetchone()
+    finally:
+        conn.close()
+    assert row is not None
+    assert row["exit_reason"] == "completed"
+
+
+@pytest.mark.unit
 def test_cmd_chat_immediate_eof_creates_conversation_with_no_turns(monkeypatch: pytest.MonkeyPatch) -> None:
     _feed(monkeypatch)  # EOF on the very first prompt
 

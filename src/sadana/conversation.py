@@ -1036,6 +1036,16 @@ class Conversation:
     context_state: context.ContextState
     next_child_seq: int = 0  # CONV-07's own counter; see run_child below.
 
+    @property
+    def pending_turn_key(self) -> TurnKey:
+        """The `TurnKey` a `take_turn()` call made with this `Conversation`
+        is about to mint (`run_turn`'s own `turn_seq=conversation.next_turn_seq`
+        below) — the one place that formula is written, so a caller that
+        needs a not-yet-run turn's key ahead of time
+        (`plugin_dispatch.build_dispatch()`, for its `record_plugin_run`
+        calls) reuses it instead of re-deriving it independently."""
+        return TurnKey(conversation=self.key, turn_seq=self.next_turn_seq)
+
 
 def _render_context(system_message: str, catalog: tuple[PluginCatalogEntry, ...]) -> str:
     """The context tier: a caller-supplied message plus one rendered line

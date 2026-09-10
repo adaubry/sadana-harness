@@ -29,7 +29,7 @@ import sqlite3
 import threading
 import time
 
-from sadana import conversation_store, plugin_dispatch
+from sadana import conversation_store, observability, plugin_dispatch
 from sadana.conversation import (
     ConversationTemplate,
     ExitReason,
@@ -51,6 +51,8 @@ async def handle_inbound(
     persona: str,
     provider: str,
     model: str,
+    record_turn: observability.RecordTurnFn = observability.noop_record,
+    record_plugin_run: observability.RecordPluginRunFn = observability.noop_record,
 ) -> tuple[bool, str]:
     """Load-or-create the conversation `session_key_for(event)` names, run
     one turn with `event.text` as the user input, persist it, and return
@@ -64,6 +66,13 @@ async def handle_inbound(
     non-`None` even when `exit_reason != COMPLETED` (chat.py's own
     `BUDGET_EXHAUSTED` comment) — so the caller needs both values, not one
     string to re-parse.
+
+    `record_turn`/`record_plugin_run` (OBSERVABILITY-01) default to a
+    no-op; `cmd_gateway_run` builds a real `Recorder` once, outside this
+    per-message call, and passes its two callables through — `conn` is
+    already this call's own parameter and every inbound message shares the
+    same connection, so there is nothing to build here that would differ
+    call to call.
 
     Serialized by `_conn_lock` — see the module docstring."""
     with _conn_lock:
@@ -88,7 +97,14 @@ async def handle_inbound(
             conversation_store.create(conn, conversation, now=now)
 
         dispatch, tracker = plugin_dispatch.build_dispatch(
-            conversation, plugin_set, stable_prompt=persona, provider=provider, model=model, now=now
+            conversation,
+            plugin_set,
+            stable_prompt=persona,
+            provider=provider,
+            model=model,
+            now=now,
+            record_turn=record_turn,
+            record_plugin_run=record_plugin_run,
         )
         persist = conversation_store.bind_persist(conn, conversation, now=now)
         result, conversation = await plugin_dispatch.take_turn_and_reconcile(
@@ -100,6 +116,7 @@ async def handle_inbound(
             model=model,
             now=now,
             persist=persist,
+            record_turn=record_turn,
         )
         await asyncio.to_thread(conversation_store.save, conn, conversation, now=now)
 

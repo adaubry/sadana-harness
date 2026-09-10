@@ -186,6 +186,29 @@ def _one_ask_node_plugin_set(tmp_path: Path) -> PluginSet:
     return PluginSet(catalog=(), tool_specs=(), by_tool={"do_it": (installed, manifest.entries[0])})
 
 
+def _fake_take_turn_factory(*, final_text: str = "hi"):  # type: ignore[no-untyped-def]
+    """A `_take_turn` stand-in returning a minimal, fully-defaulted
+    `TurnResult` for `conv` unchanged — shared by both
+    `take_turn_and_reconcile` tests below that only care about the
+    wrapper's own behavior (tracker reconciliation, recording), not
+    anything `_take_turn` itself would compute."""
+
+    async def fake_take_turn(conv, **_kwargs):  # type: ignore[no-untyped-def]
+        turn_result = TurnResult(
+            turn_key=TurnKey(conversation=conv.key, turn_seq=0),
+            final_text=final_text,
+            exit_reason=ExitReason.COMPLETED,
+            detail=None,
+            model_calls=1,
+            usage=model_access.Usage(),
+            appended=range(0),
+            context_state=context.ContextState(),
+        )
+        return turn_result, conv  # conv.next_child_seq is left exactly as given
+
+    return fake_take_turn
+
+
 def _one_call_node_plugin_set(tmp_path: Path) -> PluginSet:
     plugin_dir = tmp_path / "p"
     plugin_dir.mkdir()
@@ -246,21 +269,7 @@ def test_take_turn_and_reconcile_applies_the_trackers_seq_onto_the_result(monkey
     since take_turn never learns what a dispatch call's ask callback did.
     This proves the wrapper overrides that stale value with the tracker's,
     not the other way around."""
-
-    async def fake_take_turn(conv, **_kwargs):  # type: ignore[no-untyped-def]
-        turn_result = TurnResult(
-            turn_key=TurnKey(conversation=conv.key, turn_seq=0),
-            final_text="hi",
-            exit_reason=ExitReason.COMPLETED,
-            detail=None,
-            model_calls=1,
-            usage=model_access.Usage(),
-            appended=range(0),
-            context_state=context.ContextState(),
-        )
-        return turn_result, conv  # conv.next_child_seq is stale on purpose
-
-    monkeypatch.setattr(plugin_dispatch, "_take_turn", fake_take_turn)
+    monkeypatch.setattr(plugin_dispatch, "_take_turn", _fake_take_turn_factory())
 
     async def _unused_dispatch(_name: str, _arguments: dict) -> plugin_dispatch.plugins.DagResult:
         raise AssertionError("dispatch should not be called by this test")
@@ -275,6 +284,146 @@ def test_take_turn_and_reconcile_applies_the_trackers_seq_onto_the_result(monkey
 
     assert result.final_text == "hi"
     assert updated.next_child_seq == 5
+
+
+# ── recording (OBSERVABILITY-01) ─────────────────────────────────────────
+
+
+def _fake_recorder():  # type: ignore[no-untyped-def]
+    calls: dict[str, list] = {"turn": [], "plugin_run": []}
+
+    async def record_turn(result, duration_s):  # type: ignore[no-untyped-def]
+        calls["turn"].append((result, duration_s))
+
+    async def record_plugin_run(turn_key, seq, result, duration_s):  # type: ignore[no-untyped-def]
+        calls["plugin_run"].append((turn_key, seq, result, duration_s))
+
+    return record_turn, record_plugin_run, calls
+
+
+@pytest.mark.unit
+def test_take_turn_and_reconcile_calls_record_turn_with_the_result_and_a_duration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(plugin_dispatch, "_take_turn", _fake_take_turn_factory())
+    record_turn, _record_plugin_run, calls = _fake_recorder()
+
+    async def _unused_dispatch(_name: str, _arguments: dict) -> plugin_dispatch.plugins.DagResult:
+        raise AssertionError("dispatch should not be called by this test")
+
+    conversation = _conversation()
+    tracker = ChildSeqTracker(next_seq=0)
+    result, _updated = asyncio.run(
+        take_turn_and_reconcile(
+            conversation,
+            _unused_dispatch,
+            tracker,
+            user_input="hi",
+            provider="p",
+            model="m",
+            now=0.0,
+            record_turn=record_turn,
+        )
+    )
+    assert len(calls["turn"]) == 1
+    recorded_result, duration_s = calls["turn"][0]
+    assert recorded_result is result
+    assert duration_s >= 0.0
+
+
+@pytest.mark.unit
+def test_build_dispatch_calls_record_plugin_run_once_per_dispatch_call(tmp_path: Path) -> None:
+    plugin_set = _one_call_node_plugin_set(tmp_path)
+    _record_turn, record_plugin_run, calls = _fake_recorder()
+    conversation = _conversation()
+
+    dispatch, _tracker = build_dispatch(
+        conversation,
+        plugin_set,
+        stable_prompt="",
+        provider="p",
+        model="m",
+        now=0.0,
+        record_plugin_run=record_plugin_run,
+    )
+
+    asyncio.run(dispatch("do_it", {"a": 1}))
+    asyncio.run(dispatch("do_it", {"a": 2}))
+
+    assert len(calls["plugin_run"]) == 2
+    (turn_key_0, seq_0, result_0, duration_0), (turn_key_1, seq_1, result_1, duration_1) = calls["plugin_run"]
+    assert turn_key_0 == turn_key_1 == TurnKey(conversation=conversation.key, turn_seq=conversation.next_turn_seq)
+    assert (seq_0, seq_1) == (0, 1)
+    assert duration_0 >= 0.0 and duration_1 >= 0.0
+    assert result_0.plugin == "p" and result_1.plugin == "p"
+
+
+@pytest.mark.unit
+def test_build_dispatch_does_not_call_record_plugin_run_for_an_unknown_tool() -> None:
+    plugin_set = PluginSet(catalog=(), tool_specs=(), by_tool={})
+    _record_turn, record_plugin_run, calls = _fake_recorder()
+
+    dispatch, _tracker = build_dispatch(
+        _conversation(),
+        plugin_set,
+        stable_prompt="",
+        provider="p",
+        model="m",
+        now=0.0,
+        record_plugin_run=record_plugin_run,
+    )
+    asyncio.run(dispatch("nonexistent_tool", {}))
+
+    assert calls["plugin_run"] == []
+
+
+@pytest.mark.unit
+def test_build_dispatch_ask_calls_record_turn_with_the_childs_own_turn_result(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake_run_child, _seen = _fake_run_child_factory(exit_reason=ExitReason.COMPLETED, final_text="done")
+    monkeypatch.setattr(plugin_dispatch, "run_child", fake_run_child)
+    plugin_set = _one_ask_node_plugin_set(tmp_path)
+    record_turn, _record_plugin_run, calls = _fake_recorder()
+
+    dispatch, _tracker = build_dispatch(
+        _conversation(), plugin_set, stable_prompt="", provider="p", model="m", now=0.0, record_turn=record_turn
+    )
+    asyncio.run(dispatch("do_it", {}))
+
+    assert len(calls["turn"]) == 1
+    recorded_result, duration_s = calls["turn"][0]
+    assert recorded_result.final_text == "done"
+    assert duration_s >= 0.0
+
+
+@pytest.mark.unit
+def test_build_dispatch_does_not_add_its_own_guard_around_the_given_recorder(tmp_path: Path) -> None:
+    """The best-effort contract (a recording failure never reaches the run
+    being observed) belongs entirely to `observability.py`'s own
+    try/except around a real `sqlite3.Error` — proven in
+    `test_observability.py`. This proves `build_dispatch` doesn't add a
+    second, redundant guard of its own: a recorder that raises something
+    that isn't `observability`'s problem (a plain bug in a test double, a
+    caller-supplied recorder that never went through `make_recorder`)
+    still propagates, exactly like `persist` already does."""
+    plugin_set = _one_call_node_plugin_set(tmp_path)
+
+    async def raising_record_plugin_run(_turn_key, _seq, _result, _duration_s):  # type: ignore[no-untyped-def]
+        raise RuntimeError("boom")
+
+    dispatch, _tracker = build_dispatch(
+        _conversation(),
+        plugin_set,
+        stable_prompt="",
+        provider="p",
+        model="m",
+        now=0.0,
+        record_plugin_run=raising_record_plugin_run,
+    )
+
+    with pytest.raises(RuntimeError, match="boom"):
+        asyncio.run(dispatch("do_it", {"a": 1}))
 
 
 @pytest.mark.unit

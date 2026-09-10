@@ -17,7 +17,7 @@ import sys
 import time
 from contextlib import closing
 
-from sadana import config, conversation_store, model_access, plugin_dispatch, plugin_manifest
+from sadana import config, conversation_store, model_access, observability, plugin_dispatch, plugin_manifest
 from sadana.conversation import (
     Conversation,
     ConversationTemplate,
@@ -49,6 +49,7 @@ async def _chat_loop(
     provider: str,
     model: str,
 ) -> int:
+    recorder = observability.make_recorder(conn)
     while True:
         try:
             user_input = await asyncio.to_thread(input, "> ")
@@ -58,7 +59,14 @@ async def _chat_loop(
 
         now = time.monotonic()
         dispatch, tracker = plugin_dispatch.build_dispatch(
-            conversation, plugin_set, stable_prompt=persona, provider=provider, model=model, now=now
+            conversation,
+            plugin_set,
+            stable_prompt=persona,
+            provider=provider,
+            model=model,
+            now=now,
+            record_turn=recorder.record_turn,
+            record_plugin_run=recorder.record_plugin_run,
         )
         persist = conversation_store.bind_persist(conn, conversation, now=now)
         result, conversation = await plugin_dispatch.take_turn_and_reconcile(
@@ -70,6 +78,7 @@ async def _chat_loop(
             model=model,
             now=now,
             persist=persist,
+            record_turn=recorder.record_turn,
         )
         await asyncio.to_thread(conversation_store.save, conn, conversation, now=now)
 

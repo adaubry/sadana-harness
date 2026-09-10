@@ -12,13 +12,16 @@ from pathlib import Path
 
 import pytest
 
-from sadana import model_access
+from sadana import model_access, plugins
 from sadana.context import ContextState
 from sadana.conversation import (
     Conversation,
+    ExitReason,
     IterationBudget,
     Message,
     ToolSpec,
+    TurnKey,
+    TurnResult,
     WallClockBudget,
     build_surface,
     turn_prompt_hash,
@@ -98,6 +101,38 @@ def plain_response(content: str) -> model_access.Response:
     """A model response with no tool calls — the turn-ending sibling of
     ``tool_call_response``."""
     return model_access.Response(content=content, tool_calls=(), finish_reason="stop", usage=model_access.Usage())
+
+
+def turn_result(
+    *, conversation: str = "c1", turn_seq: int = 0, prompt_tokens: int = 10, completion_tokens: int = 5
+) -> TurnResult:
+    """A minimal, fully-defaulted ``TurnResult`` — shared by
+    ``test_observability.py`` and ``test_subcommands_runs.py``."""
+    return TurnResult(
+        turn_key=TurnKey(conversation=conversation, turn_seq=turn_seq),
+        final_text="hi",
+        exit_reason=ExitReason.COMPLETED,
+        detail=None,
+        model_calls=2,
+        usage=model_access.Usage(prompt_tokens=prompt_tokens, completion_tokens=completion_tokens),
+        appended=range(0),
+        context_state=ContextState(),
+    )
+
+
+def dag_result(*, failed_node: str | None = None) -> plugins.DagResult:
+    """A minimal, fully-defaulted ``DagResult`` — shared by
+    ``test_observability.py`` and ``test_subcommands_runs.py``."""
+    return plugins.DagResult(
+        plugin="p1",
+        entry="do_it",
+        text="ok",
+        trace=(
+            plugins.NodeTrace(node="a", kind="compute", visit=0, ok=True, port=None, detail=None),
+            plugins.NodeTrace(node="b", kind="stop", visit=0, ok=True, port=None, detail=None),
+        ),
+        failed_node=failed_node,
+    )
 
 
 def write_skill(

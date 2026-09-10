@@ -13,7 +13,7 @@ import json
 from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass, replace
 
-from sadana import plugin_manifest, plugins
+from sadana import observability, plugin_manifest, plugins
 from sadana.conversation import (
     ChildSpec,
     Conversation,
@@ -130,6 +130,8 @@ def build_dispatch(
     now: float,
     persist: Callable[[tuple[Message, ...]], Awaitable[None]] = _noop_persist,
     approve: plugins.ApproveFn = plugin_manifest._default_approve,
+    record_turn: observability.RecordTurnFn = observability.noop_record,
+    record_plugin_run: observability.RecordPluginRunFn = observability.noop_record,
 ) -> tuple[DispatchFn, ChildSeqTracker]:
     """Builds one dispatch closure matching `conversation.py`'s own
     `dispatch` contract exactly, and the `ChildSeqTracker` it shares with
@@ -154,28 +156,44 @@ def build_dispatch(
     before doing anything else —
     `conversation = replace(updated_conversation, next_child_seq=tracker.next_seq)`
     — and build a fresh dispatch (and tracker) from that reconciled value
-    before the next turn."""
+    before the next turn.
+
+    **Recording** (`docs/tasks/OBSERVABILITY-01-turn-and-plugin-run-records/spec.md`):
+    `record_turn` is awaited after every `TurnResult` this closure produces
+    — both `ask`'s own child turn and, via `take_turn_and_reconcile`, the
+    parent turn itself — and `record_plugin_run` after every real
+    `run_graph` call `dispatch` makes, keyed by this turn's own `TurnKey`
+    plus a closure-local `seq_in_turn` (fresh per `build_dispatch` call,
+    never shared across turns — the same posture `ChildSeqTracker` and
+    `capturing_dispatch`'s own `captured` list already take). Both default
+    to a no-op, so a caller that never opted in behaves exactly as before."""
     tracker = ChildSeqTracker(next_seq=conversation.next_child_seq)
+    turn_key = conversation.pending_turn_key
+    seq_in_turn = 0
 
     async def ask(skill: plugins.SkillRef, text: str) -> str | None:
         parent = replace(conversation, next_child_seq=tracker.next_seq)
         spec = ChildSpec(node_name=skill.skill, skill=skill, input=text, tools=frozenset())
-        result, _child, updated_parent = await run_child(
-            parent,
-            spec,
-            stable_prompt=stable_prompt,
-            provider=provider,
-            model=model,
-            dispatch=dispatch,
-            persist=persist,
-            now=now,
+        (result, _child, updated_parent), duration_s = await observability.timed(
+            run_child(
+                parent,
+                spec,
+                stable_prompt=stable_prompt,
+                provider=provider,
+                model=model,
+                dispatch=dispatch,
+                persist=persist,
+                now=now,
+            )
         )
         tracker.next_seq = updated_parent.next_child_seq
+        await record_turn(result, duration_s)
         if result.exit_reason == ExitReason.COMPLETED and result.final_text is not None:
             return result.final_text
         return None
 
     async def dispatch(name: str, arguments: dict) -> plugins.DagResult:
+        nonlocal seq_in_turn
         hit = plugin_set.by_tool.get(name)
         if hit is None:
             return plugins.DagResult(
@@ -187,9 +205,14 @@ def build_dispatch(
                 failed_node="entry",
             )
         installed, entry = hit
-        return await plugin_manifest.run_graph(
-            installed.directory, installed.manifest, entry, arguments, ask=ask, approve=approve
+        result, duration_s = await observability.timed(
+            plugin_manifest.run_graph(
+                installed.directory, installed.manifest, entry, arguments, ask=ask, approve=approve
+            )
         )
+        await record_plugin_run(turn_key, seq_in_turn, result, duration_s)
+        seq_in_turn += 1
+        return result
 
     return dispatch, tracker
 
@@ -204,6 +227,7 @@ async def take_turn_and_reconcile(
     model: str,
     now: float,
     persist: Callable[[tuple[Message, ...]], Awaitable[None]] = _noop_persist,
+    record_turn: observability.RecordTurnFn = observability.noop_record,
 ) -> tuple[TurnResult, Conversation]:
     """Self-check addition: `build_dispatch`'s own docstring named the
     reconciliation step as the caller's obligation, enforced by nothing but
@@ -212,8 +236,21 @@ async def take_turn_and_reconcile(
     cannot forget the reconciliation, because there is no second step left
     to forget. Direct use of `dispatch`/`tracker` (this project's own unit
     tests, or a caller that needs `take_turn`'s other parameters) is still
-    supported; this is the recommended path, not the only one."""
-    result, updated = await _take_turn(
-        conversation, user_input=user_input, provider=provider, model=model, dispatch=dispatch, persist=persist, now=now
+    supported; this is the recommended path, not the only one.
+
+    `record_turn` (default a no-op) is awaited with the turn's own
+    `TurnResult` and its wall-clock duration once it's done —
+    OBSERVABILITY-01's other emitter, alongside `build_dispatch`'s own."""
+    (result, updated), duration_s = await observability.timed(
+        _take_turn(
+            conversation,
+            user_input=user_input,
+            provider=provider,
+            model=model,
+            dispatch=dispatch,
+            persist=persist,
+            now=now,
+        )
     )
+    await record_turn(result, duration_s)
     return result, replace(updated, next_child_seq=tracker.next_seq)

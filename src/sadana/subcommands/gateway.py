@@ -21,6 +21,7 @@ from sadana import (
     gateway_dispatch,
     gateway_service,
     model_access,
+    observability,
     plugin_dispatch,
     plugin_manifest,
 )
@@ -66,13 +67,21 @@ def cmd_gateway_run(args: argparse.Namespace) -> int:
     persona = load_or_seed_persona(persona_path_from_config())
     plugin_set = plugin_dispatch.build_plugin_set(plugin_manifest.discover_plugins())
     conn = conversation_store.open_store(conversation_store.store_path_from_config())
+    recorder = observability.make_recorder(conn)  # built once; handle_inbound reuses it every inbound message
 
     # gateway_dispatch.handle_inbound() serializes its own conn access
     # (its module-level _conn_lock) — no lock needed here.
     def on_message(event: MessageEvent) -> tuple[bool, str]:
         return asyncio.run(
             gateway_dispatch.handle_inbound(
-                conn, event, plugin_set=plugin_set, persona=persona, provider=provider, model=model
+                conn,
+                event,
+                plugin_set=plugin_set,
+                persona=persona,
+                provider=provider,
+                model=model,
+                record_turn=recorder.record_turn,
+                record_plugin_run=recorder.record_plugin_run,
             )
         )
 
