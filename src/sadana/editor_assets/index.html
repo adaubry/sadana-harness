@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>sadana — plugin editor</title>
+    <link rel="stylesheet" href="/assets/editor.css" />
+  </head>
+  <body>
+    <header>
+      <h1>Plugins</h1>
+      <span id="hint">Boxes are arranged automatically. Moving one helps you read the shape; it isn't saved.</span>
+    </header>
+
+    <main>
+      <nav id="sidebar">
+        <ul id="plugin-list"></ul>
+        <form id="new-plugin">
+          <input id="new-name" placeholder="new-plugin-name" aria-label="new plugin name" />
+          <button type="submit">Create</button>
+        </form>
+      </nav>
+
+      <section id="canvas-area">
+        <div id="toolbar">
+          <strong id="open-name">No plugin open</strong>
+          <select id="add-kind" aria-label="kind of step to add"></select>
+          <button id="add-step" type="button">Add step</button>
+          <button id="save" type="button">Save</button>
+          <span id="saved-note"></span>
+        </div>
+        <svg id="canvas" role="img" aria-label="the plugin's steps and the arrows joining them">
+          <defs>
+            <marker id="arrowhead" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7"
+                    orient="auto-start-reverse">
+              <path d="M 0 0 L 10 5 L 0 10 z" />
+            </marker>
+          </defs>
+          <g id="arrows"></g>
+          <g id="boxes"></g>
+        </svg>
+      </section>
+
+      <aside id="panel">
+        <div id="step-editor" hidden>
+          <h2>Step</h2>
+          <label>Name <input id="field-name" /></label>
+          <label>Kind <select id="field-kind"></select></label>
+          <label id="label-skill">Skill <input id="field-skill" /></label>
+          <label id="label-body">Code <input id="field-body" placeholder="init:function_name" /></label>
+          <p id="body-note">This step needs a programmer to write its code.</p>
+          <div id="link-controls">
+            <button id="link" type="button">Join to another step…</button>
+            <button id="unlink" type="button">Remove its arrow</button>
+          </div>
+          <button id="delete-step" type="button" class="danger">Delete this step</button>
+        </div>
+        <div id="status">
+          <h2>Status</h2>
+          <ul id="problems"></ul>
+          <ul id="needs-code"></ul>
+        </div>
+      </aside>
+    </main>
+
+    <script src="/assets/editor.js"></script>
+  </body>
+</html>

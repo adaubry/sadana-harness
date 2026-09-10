@@ -381,8 +381,8 @@ async def run_graph(
     while True:
         node = by_name[current]
 
-        if node.kind == "each":
-            return failed(node, "each steps are not runnable yet")
+        if node.kind in plugins.KINDS_NOT_RUNNABLE:
+            return failed(node, f"{node.kind} steps are not runnable yet")
         if node.kind == "wait":
             return plugins.DagResult(
                 plugin=manifest.name,

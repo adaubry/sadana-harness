@@ -56,6 +56,8 @@ WSL only. Python lives in `.venv`; `make` puts it on PATH for you, so there is n
 - A caller-supplied string passed to `git` (or any CLI tool) as a bare, unflagged positional argument is a command-injection vector — a value starting with `-` is parsed as an option, not data (e.g. `--upload-pack=<cmd>` runs it). Always put `--` before the first untrusted positional so everything after it is read literally.
 - An end-user's identity that must outlive one conversation (memory, preferences, billing) is an `AccountKey`, distinct from and never derived by widening a `ConversationKey` — a conversation is one thread, an account is the person having many.
 - A plugin's own execution identity (a memory account, a session key, or anything like it) crosses into `arguments` only via a `_sadana_`-prefixed reserved key, merged in last so it always wins over anything the model supplied under that name — never a hidden parameter threaded through a node body's own call signature.
+- A browser surface holds no logic that can be held in Python — layout, validation and assembly are computed server-side and sent as data, because nothing in this repo can test JavaScript.
+- A caller-supplied name that becomes a filesystem path is checked against an allowlist pattern before it touches a path, and the resolved path is re-checked to be inside its intended root — both, never either.
 
 ## Glossary
 

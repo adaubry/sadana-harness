@@ -1,0 +1,129 @@
+:root {
+  --ink: #1c1c1c;
+  --muted: #666;
+  --line: #c9c9c9;
+  --panel: #f6f6f4;
+  --accent: #2f5d8a;
+  --warn: #8a4b2f;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  font: 15px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+  color: var(--ink);
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+
+header {
+  display: flex;
+  align-items: baseline;
+  gap: 16px;
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--line);
+}
+
+header h1 { font-size: 16px; margin: 0; }
+#hint { color: var(--muted); font-size: 13px; }
+
+main { display: flex; flex: 1; min-height: 0; }
+
+#sidebar {
+  width: 200px;
+  border-right: 1px solid var(--line);
+  background: var(--panel);
+  padding: 12px;
+  overflow-y: auto;
+}
+
+#plugin-list { list-style: none; margin: 0 0 12px; padding: 0; }
+
+#plugin-list button {
+  width: 100%;
+  text-align: left;
+  background: none;
+  border: 0;
+  padding: 6px 8px;
+  border-radius: 4px;
+  cursor: pointer;
+  font: inherit;
+}
+
+#plugin-list button:hover { background: #e8e8e4; }
+#plugin-list button[aria-current="true"] { background: #dde6ef; font-weight: 600; }
+#plugin-list .status { display: block; color: var(--muted); font-size: 12px; }
+
+#new-plugin { display: flex; gap: 6px; }
+#new-plugin input { width: 100%; min-width: 0; padding: 5px; border: 1px solid var(--line); border-radius: 4px; }
+
+#canvas-area { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+
+#toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--line);
+}
+
+#open-name { margin-right: auto; }
+#saved-note { color: var(--muted); font-size: 13px; }
+
+button, select, input { font: inherit; }
+
+button {
+  padding: 5px 10px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: #fff;
+  cursor: pointer;
+}
+
+button:hover { border-color: var(--accent); }
+button.danger { color: var(--warn); }
+
+#canvas { flex: 1; width: 100%; background: #fdfdfc; }
+
+.box rect {
+  fill: #fff;
+  stroke: var(--line);
+  stroke-width: 1.5;
+  rx: 6;
+}
+
+.box.selected rect { stroke: var(--accent); stroke-width: 2.5; }
+.box.needs-code rect { stroke-dasharray: 5 3; stroke: var(--warn); }
+.box.not-runnable rect { fill: #f2f2ef; }
+.box { cursor: grab; }
+.box text { pointer-events: none; }
+.box .name { font-weight: 600; font-size: 13px; }
+.box .kind { fill: var(--muted); font-size: 12px; }
+.box .flag { fill: var(--warn); font-size: 11px; }
+
+#arrows path { stroke: var(--muted); stroke-width: 1.6; fill: none; marker-end: url(#arrowhead); }
+#arrows text { fill: var(--muted); font-size: 11px; }
+#arrowhead path { fill: var(--muted); }
+
+#panel {
+  width: 260px;
+  border-left: 1px solid var(--line);
+  background: var(--panel);
+  padding: 12px;
+  overflow-y: auto;
+}
+
+#panel h2 { font-size: 13px; text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted); }
+#panel label { display: block; margin-bottom: 8px; font-size: 13px; }
+#panel input, #panel select { width: 100%; padding: 5px; border: 1px solid var(--line); border-radius: 4px; }
+
+#body-note { color: var(--warn); font-size: 12px; }
+#link-controls { display: flex; gap: 6px; margin-bottom: 10px; }
+#link-controls button { flex: 1; }
+
+#problems li { color: var(--warn); font-size: 13px; }
+#needs-code li { color: var(--muted); font-size: 13px; }
+
+body.linking #canvas { cursor: crosshair; }

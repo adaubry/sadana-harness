@@ -14,12 +14,13 @@ caller of it ever risks an import cycle."""
 
 from __future__ import annotations
 
+import json
 import tomllib
 from collections import deque
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Literal
+from typing import Literal, get_args
 
 from sadana import config
 
@@ -27,6 +28,31 @@ from sadana import config
 # (the declared graph) and `NodeTrace.kind` (a run of it) — one closed set,
 # declared once.
 NodeKind = Literal["compute", "ask", "route", "stop", "call", "each", "wait"]
+
+NODE_KINDS: tuple[str, ...] = get_args(NodeKind)
+
+# Which of ``Node``'s optional fields each kind actually uses. One table, read
+# by everything that has to present the vocabulary to a person rather than
+# guess at it (`docs/tasks/PLUGIN-EDITOR-01-draw-wire-and-save/spec.md`) —
+# derived from ``NodeKind`` above rather than typed out a second time, which
+# is what keeps "adding a kind is a work item, not a field" true: a new kind
+# is a compile-time-visible hole here, not a silently-empty row.
+KIND_USES: dict[str, tuple[str, ...]] = {
+    "compute": ("body", "next"),
+    "ask": ("skill", "next"),
+    "route": ("body", "ports"),
+    "stop": (),
+    "call": ("body", "next"),
+    "each": ("next",),
+    "wait": ("next",),
+}
+
+# Kinds nothing can execute yet. ``plugin_manifest.run_graph`` refuses these
+# by reading this set rather than naming ``each`` itself, so there is one fact
+# here rather than a matched pair to keep in step. A kind listed here is still
+# drawn in the editor, marked unusable rather than hidden, so a creator can lay
+# out what they mean before the runtime can carry it out.
+KINDS_NOT_RUNNABLE: frozenset[str] = frozenset({"each"})
 
 
 @dataclass(frozen=True)
@@ -246,6 +272,154 @@ def manifest_to_dict(manifest: Manifest) -> dict[str, object]:
     }
 
 
+def _toml_string(value: str) -> str:
+    """One TOML basic string, or ``ValueError`` if TOML cannot carry the
+    text at all.
+
+    Most of the escaping is ``json.dumps``'s job: TOML basic strings and
+    JSON strings agree on ``"``, ``\\`` and every control character below
+    U+0020, which both spell ``\\uXXXX``. Two places they do not agree, both
+    found by a self-check that emitted them and watched ``tomllib`` refuse
+    what came back:
+
+    * **U+007F.** JSON escapes nothing at or above U+0020, so ``json.dumps``
+      passes DEL through raw; TOML forbids it raw in a basic string. Escaped
+      here by hand, because a plugin whose description held one produced a
+      ``plugin.toml`` nothing could reopen.
+    * **A lone surrogate.** ``JSON.stringify`` in a browser emits one
+      happily — half a pasted emoji, or a ``slice()`` through an astral
+      character — and it is not a Unicode scalar, so neither TOML nor UTF-8
+      can carry it. Rejected rather than mangled.
+
+    ``ensure_ascii=False`` is load-bearing rather than cosmetic. With the
+    default, ``json.dumps`` spells a non-BMP character — an emoji in a
+    plugin's description — as a surrogate pair, ``\\ud83d\\ude00``, and TOML
+    accepts neither half as a valid scalar. Emitting the character
+    literally, which TOML allows in a basic string, avoids the question."""
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise ValueError(f"{value!r} contains a character TOML cannot carry (a lone surrogate)") from exc
+    return json.dumps(value, ensure_ascii=False).replace("\x7f", "\\u007F")
+
+
+def manifest_to_toml(manifest: Manifest) -> str:
+    """``manifest`` as the ``plugin.toml`` a programmer would have written —
+    the inverse of ``_parse_manifest`` above, and the first code in this
+    project that writes a plugin file rather than reading one
+    (`docs/tasks/PLUGIN-EDITOR-01-draw-wire-and-save/spec.md`).
+
+    Hand-rolled rather than a TOML-writing dependency: the shape is three
+    string fields and two arrays of tables, with no dates, no numbers and no
+    nesting, and its correctness is pinned by a round-trip test over every
+    real fixture plugin rather than by trust. A field that is ``None`` (or an
+    empty ``ports``) is omitted entirely, which is what makes the round trip
+    exact — ``_parse_manifest`` reads those same fields with ``.get()`` and
+    produces ``None``/``()`` for an absent one."""
+    lines = [
+        "[plugin]",
+        f"name = {_toml_string(manifest.name)}",
+        f"version = {_toml_string(manifest.version)}",
+        f"description = {_toml_string(manifest.description)}",
+    ]
+    for entry in manifest.entries:
+        lines += [
+            "",
+            "[[entry]]",
+            f"tool = {_toml_string(entry.tool)}",
+            f"purpose = {_toml_string(entry.purpose)}",
+            f"parameters = {_toml_string(entry.parameters)}",
+            f"start = {_toml_string(entry.start)}",
+        ]
+    for node in manifest.nodes:
+        lines += ["", "[[node]]", f"name = {_toml_string(node.name)}", f"kind = {_toml_string(node.kind)}"]
+        for field, value in (("body", node.body), ("skill", node.skill), ("next", node.next)):
+            if value is not None:
+                lines.append(f"{field} = {_toml_string(value)}")
+        if node.ports:
+            lines.append("ports = [" + ", ".join(_toml_string(p) for p in node.ports) + "]")
+    return "\n".join(lines) + "\n"
+
+
+def _require_str(data: dict, field: str, where: str) -> str:
+    value = data.get(field)
+    if not isinstance(value, str):
+        raise ValueError(f"{where}: {field!r} must be a string, got {type(value).__name__}")
+    return value
+
+
+def _optional_str(data: dict, field: str, where: str) -> str | None:
+    value = data.get(field)
+    if value is None or isinstance(value, str):
+        return value
+    raise ValueError(f"{where}: {field!r} must be a string or absent, got {type(value).__name__}")
+
+
+def manifest_from_dict(data: dict) -> Manifest:
+    """The inverse of ``manifest_to_dict`` — what a browser posts back turned
+    into a real ``Manifest`` (`docs/tasks/PLUGIN-EDITOR-01-draw-wire-and-save
+    /spec.md`).
+
+    Raises ``ValueError`` naming the offending field, never a bare
+    ``KeyError``/``TypeError`` from an indexing accident: the one caller is an
+    HTTP endpoint that has to turn this into an answer a person can act on.
+    ``kind`` is checked against ``NODE_KINDS`` here because this is the only
+    door through which a node kind arrives from outside a hand-written file —
+    ``_parse_manifest`` trusts what a programmer typed, and nothing
+    downstream re-checks it."""
+    if not isinstance(data, dict):
+        raise ValueError(f"manifest must be an object, got {type(data).__name__}")
+    entries_raw = data.get("entries", [])
+    nodes_raw = data.get("nodes", [])
+    if not isinstance(entries_raw, list) or not isinstance(nodes_raw, list):
+        raise ValueError("'entries' and 'nodes' must both be lists")
+
+    entries = []
+    for index, raw in enumerate(entries_raw):
+        where = f"entry {index}"
+        if not isinstance(raw, dict):
+            raise ValueError(f"{where}: must be an object, got {type(raw).__name__}")
+        entries.append(
+            Entry(
+                tool=_require_str(raw, "tool", where),
+                purpose=_require_str(raw, "purpose", where),
+                parameters=_require_str(raw, "parameters", where),
+                start=_require_str(raw, "start", where),
+            )
+        )
+
+    nodes = []
+    for index, raw in enumerate(nodes_raw):
+        where = f"node {index}"
+        if not isinstance(raw, dict):
+            raise ValueError(f"{where}: must be an object, got {type(raw).__name__}")
+        name = _require_str(raw, "name", where)
+        kind = _require_str(raw, "kind", f"node {name!r}")
+        if kind not in NODE_KINDS:
+            raise ValueError(f"node {name!r}: {kind!r} is not one of {', '.join(NODE_KINDS)}")
+        ports = raw.get("ports", [])
+        if not isinstance(ports, list) or not all(isinstance(p, str) for p in ports):
+            raise ValueError(f"node {name!r}: 'ports' must be a list of strings")
+        nodes.append(
+            Node(
+                name=name,
+                kind=kind,  # type: ignore[arg-type]  # checked against NODE_KINDS above
+                body=_optional_str(raw, "body", f"node {name!r}"),
+                skill=_optional_str(raw, "skill", f"node {name!r}"),
+                next=_optional_str(raw, "next", f"node {name!r}"),
+                ports=tuple(ports),
+            )
+        )
+
+    return Manifest(
+        name=_require_str(data, "name", "plugin"),
+        version=_require_str(data, "version", "plugin"),
+        description=_require_str(data, "description", "plugin"),
+        entries=tuple(entries),
+        nodes=tuple(nodes),
+    )
+
+
 @dataclass(frozen=True)
 class Valid:
     """``plugin.toml`` parsed and every `§8` check held."""
@@ -408,6 +582,91 @@ def _node_index(manifest: Manifest) -> dict[str, Node]:
     return {node.name: node for node in manifest.nodes}
 
 
+def _successors(node: Node) -> list[str]:
+    """Every node name an edge leads from ``node`` to — its ``next``, then
+    its named ports. One definition of "what does this node point at",
+    shared by the reachability walk, the cycle walk and
+    ``editor_layout.positions`` rather than spelled out again at each."""
+    return ([node.next] if node.next is not None else []) + list(node.ports)
+
+
+def rename_node(manifest: Manifest, old: str, new: str) -> Manifest:
+    """``manifest`` with one node renamed and every reference to it
+    followed — its successors' arrows, any route port naming it, and any
+    entry starting at it.
+
+    Pure, and in Python rather than in the editor's JavaScript, because a
+    rename is a graph rewrite: miss one of those three places and a person
+    drawing a plugin silently gets a dangling arrow. CLAUDE.md's rule that a
+    browser surface holds no logic that can be held in Python is exactly
+    about this — nothing in this repository can test JavaScript."""
+    if not new:
+        raise ValueError("a step needs a name")
+    index = _node_index(manifest)
+    if old not in index:
+        raise ValueError(f"no step named {old!r}")
+    if new != old and new in index:
+        raise ValueError(f"a step named {new!r} already exists")
+    swap = lambda name: new if name == old else name  # noqa: E731 - one expression, three call sites below
+    return Manifest(
+        name=manifest.name,
+        version=manifest.version,
+        description=manifest.description,
+        entries=tuple(replace(entry, start=swap(entry.start)) for entry in manifest.entries),
+        nodes=tuple(
+            replace(
+                node,
+                name=swap(node.name),
+                next=None if node.next is None else swap(node.next),
+                ports=tuple(swap(port) for port in node.ports),
+            )
+            for node in manifest.nodes
+        ),
+    )
+
+
+def remove_node(manifest: Manifest, name: str) -> Manifest:
+    """``manifest`` without ``name``, and without any arrow that pointed at
+    it — an arrow to a deleted step would be a dangling reference the person
+    never drew. An entry that started there is left pointing at the first
+    remaining step, or at nothing if none remain."""
+    index = _node_index(manifest)
+    if name not in index:
+        raise ValueError(f"no step named {name!r}")
+    kept = tuple(
+        replace(
+            node,
+            next=None if node.next == name else node.next,
+            ports=tuple(port for port in node.ports if port != name),
+        )
+        for node in manifest.nodes
+        if node.name != name
+    )
+    fallback = kept[0].name if kept else ""
+    return Manifest(
+        name=manifest.name,
+        version=manifest.version,
+        description=manifest.description,
+        entries=tuple(replace(e, start=fallback if e.start == name else e.start) for e in manifest.entries),
+        nodes=kept,
+    )
+
+
+def add_node(manifest: Manifest, kind: str) -> tuple[Manifest, str]:
+    """``manifest`` with one more step of ``kind``, and the name it was
+    given — the lowest ``step_N`` nothing else is using, so a person adding
+    boxes never has to think about naming one before they know what it
+    does."""
+    if kind not in NODE_KINDS:
+        raise ValueError(f"{kind!r} is not one of {', '.join(NODE_KINDS)}")
+    taken = _node_index(manifest)
+    number = 1
+    while f"step_{number}" in taken:
+        number += 1
+    name = f"step_{number}"
+    return replace(manifest, nodes=(*manifest.nodes, Node(name=name, kind=kind))), name  # type: ignore[arg-type]
+
+
 def _first_unreachable(manifest: Manifest) -> UnreachableNode | None:
     """A breadth-first walk of ``manifest``'s own declared edges, from
     every entry's ``start`` — reads the graph's shape, runs nothing. Every
@@ -423,10 +682,7 @@ def _first_unreachable(manifest: Manifest) -> UnreachableNode | None:
         if name in visited:
             continue
         visited.add(name)
-        node = by_name[name]
-        if node.next is not None:
-            queue.append(node.next)
-        queue.extend(node.ports)
+        queue.extend(_successors(by_name[name]))
     for node in manifest.nodes:
         if node.name not in visited:
             return UnreachableNode(node=node.name)
@@ -452,9 +708,7 @@ def _first_cycle(manifest: Manifest) -> CyclicGraph | None:
             return None
         visited.add(name)
         on_path.add(name)
-        node = by_name[name]
-        successors = list(node.ports) + ([node.next] if node.next is not None else [])
-        for successor in successors:
+        for successor in _successors(by_name[name]):
             outcome = visit(successor)
             if outcome is not None:
                 return outcome

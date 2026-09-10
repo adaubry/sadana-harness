@@ -9,6 +9,9 @@ from pathlib import Path
 import pytest
 
 from sadana.plugins import (
+    KIND_USES,
+    KINDS_NOT_RUNNABLE,
+    NODE_KINDS,
     Artifact,
     CyclicGraph,
     DagResult,
@@ -25,8 +28,11 @@ from sadana.plugins import (
     UnresolvedBody,
     UnresolvedSkill,
     Valid,
+    _parse_manifest,
     describe_manifest_outcome,
+    manifest_from_dict,
     manifest_to_dict,
+    manifest_to_toml,
 )
 
 # ── Artifact ─────────────────────────────────────────────────────────────
@@ -334,3 +340,110 @@ def test_installed_plugin_is_frozen() -> None:
     installed = InstalledPlugin(name="p", directory=Path("/plugins/p"), manifest=manifest)
     with pytest.raises(dataclasses.FrozenInstanceError):
         installed.name = "changed"  # type: ignore[misc]
+
+
+# ── the node-kind vocabulary (PLUGIN-EDITOR-01) ──────────────────────────
+
+
+@pytest.mark.unit
+def test_every_declared_kind_has_a_row_in_kind_uses() -> None:
+    """The palette a person is offered is derived from `NodeKind`, not typed
+    out again. A new kind added to the Literal without a row here is a hole
+    this test names rather than a silently-empty box in the editor."""
+    assert set(KIND_USES) == set(NODE_KINDS)
+
+
+@pytest.mark.unit
+def test_kind_uses_matches_what_the_node_fields_are_for() -> None:
+    assert "ports" not in KIND_USES["compute"]
+    assert KIND_USES["route"] == ("body", "ports")  # the only kind with named ports
+    assert KIND_USES["ask"] == ("skill", "next")
+    assert KIND_USES["stop"] == ()  # terminal: no successor, nothing to configure
+    assert frozenset({"each"}) == KINDS_NOT_RUNNABLE
+
+
+# ── manifest_to_toml / manifest_from_dict (PLUGIN-EDITOR-01) ─────────────
+
+_REAL_FIXTURES = Path(__file__).resolve().parent.parent / "fixtures" / "plugins"
+
+
+def _real_manifests() -> list[Manifest]:
+    return [
+        _parse_manifest((_REAL_FIXTURES / name / "plugin.toml").read_text(encoding="utf-8"))
+        for name in ("plugin-a", "plugin-b", "plugin-c", "plugin-d")
+    ]
+
+
+@pytest.mark.unit
+def test_manifest_to_toml_round_trips_every_real_fixture() -> None:
+    """Between them the four fixtures cover call, ask, route, stop, wait and
+    compute steps, an entry's every field, named ports, and nodes with no
+    successor — so this is the whole emitted vocabulary, not a sample."""
+    for manifest in _real_manifests():
+        assert _parse_manifest(manifest_to_toml(manifest)) == manifest
+
+
+@pytest.mark.unit
+def test_manifest_to_toml_round_trips_a_hostile_description() -> None:
+    """A quote and a backslash break naive quoting; a newline and a tab break
+    naive line-joining; the emoji is the one that catches `ensure_ascii`
+    being left at its default, which spells it as a surrogate pair TOML
+    rejects."""
+    manifest = Manifest(
+        name="p",
+        version="0.1.0",
+        description='he said "hi"\\then\na new\tline 😀',
+        entries=(Entry(tool="t", purpose='with "quotes"', parameters="s.json", start="n"),),
+        nodes=(Node(name="n", kind="stop"),),
+    )
+    assert _parse_manifest(manifest_to_toml(manifest)) == manifest
+
+
+@pytest.mark.unit
+def test_manifest_to_toml_omits_absent_fields_rather_than_writing_null() -> None:
+    manifest = Manifest(name="p", version="0.1.0", description="d", entries=(), nodes=(Node(name="n", kind="stop"),))
+    emitted = manifest_to_toml(manifest)
+    assert "body" not in emitted
+    assert "ports" not in emitted
+    assert _parse_manifest(emitted).nodes[0] == Node(name="n", kind="stop")
+
+
+@pytest.mark.unit
+def test_manifest_from_dict_round_trips_every_real_fixture() -> None:
+    for manifest in _real_manifests():
+        assert manifest_from_dict(manifest_to_dict(manifest)) == manifest  # type: ignore[arg-type]
+
+
+@pytest.mark.unit
+def test_manifest_from_dict_raises_value_error_naming_a_missing_name() -> None:
+    with pytest.raises(ValueError, match="'name'"):
+        manifest_from_dict({"version": "0.1.0", "description": "d"})
+
+
+@pytest.mark.unit
+def test_manifest_from_dict_raises_value_error_naming_a_missing_kind() -> None:
+    data = {"name": "p", "version": "0.1.0", "description": "d", "nodes": [{"name": "n"}]}
+    with pytest.raises(ValueError, match="'kind'"):
+        manifest_from_dict(data)
+
+
+@pytest.mark.unit
+def test_manifest_from_dict_rejects_a_kind_that_is_not_declared() -> None:
+    """The only door a node kind arrives through from outside a hand-written
+    file — `_parse_manifest` trusts what a programmer typed, and nothing
+    downstream re-checks it."""
+    data = {"name": "p", "version": "0.1.0", "description": "d", "nodes": [{"name": "n", "kind": "banana"}]}
+    with pytest.raises(ValueError, match="banana"):
+        manifest_from_dict(data)
+
+
+@pytest.mark.unit
+def test_manifest_from_dict_raises_value_error_for_non_list_ports() -> None:
+    data = {
+        "name": "p",
+        "version": "0.1.0",
+        "description": "d",
+        "nodes": [{"name": "n", "kind": "route", "ports": "left"}],
+    }
+    with pytest.raises(ValueError, match="'ports'"):
+        manifest_from_dict(data)
