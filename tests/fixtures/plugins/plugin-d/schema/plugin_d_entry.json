@@ -1,0 +1,10 @@
+{
+  "type": "object",
+  "properties": {
+    "job": {
+      "type": "string",
+      "description": "A short description of the external job to start."
+    }
+  },
+  "required": ["job"]
+}

@@ -24,6 +24,7 @@ from sadana.plugins import (
     ManifestParseError,
     Node,
     NodeTrace,
+    ResumeState,
     SkillLoadError,
     SkillRef,
     UnreachableNode,
@@ -651,11 +652,80 @@ def test_run_graph_refuses_each_nodes(tmp_path: Path) -> None:
 
 
 @pytest.mark.unit
-def test_run_graph_refuses_wait_nodes(tmp_path: Path) -> None:
+def test_run_graph_pauses_at_wait_nodes(tmp_path: Path) -> None:
+    """Behavior intentionally changed by
+    docs/tasks/GATEWAY-DAEMON-02-scheduled-and-resumable-triggers/spec.md: a
+    `wait` node used to fail closed like `each` still does; it now pauses
+    the run instead. Not a bug fix — the old assertion (`failed_node ==
+    "future"`) is gone, not preserved alongside the new one."""
     plugin_dir = _write_init_py(tmp_path, "")
     manifest = _manifest(Node(name="future", kind="wait"))
     result = asyncio.run(run_graph(plugin_dir, manifest, _entry("future"), {}, ask=_stub_ask_ok))
-    assert result.failed_node == "future"
+    assert result.failed_node is None
+    assert result.paused_node == "future"
+    assert result.text != ""
+    assert result.trace == ()  # the wait node hasn't "run" yet — nothing to record
+
+
+@pytest.mark.unit
+def test_run_graph_resume_continues_past_the_wait_node_with_the_resumed_value(tmp_path: Path) -> None:
+    plugin_dir = _write_init_py(tmp_path, "def step(value):\n    return f'processed: {value}'\n")
+    nodes = (
+        Node(name="future", kind="wait", next="after"),
+        Node(name="after", kind="compute", body="init:step"),
+    )
+    manifest = _manifest(*nodes)
+    resume = ResumeState(node="future", value="answer", trace=(), artifacts=())
+    result = asyncio.run(run_graph(plugin_dir, manifest, _entry("future"), {}, ask=_stub_ask_ok, resume=resume))
+    assert result.failed_node is None
+    assert result.paused_node is None
+    assert result.text == "processed: answer"
+    assert [t.node for t in result.trace] == ["future", "after"]
+    assert result.trace[0].detail == "resumed"
+
+
+@pytest.mark.unit
+def test_run_graph_resume_carries_the_prior_trace_and_artifacts_forward(tmp_path: Path) -> None:
+    plugin_dir = _write_init_py(tmp_path, "def step(value):\n    return value\n")
+    nodes = (
+        Node(name="before", kind="compute", body="init:step", next="future"),
+        Node(name="future", kind="wait"),
+    )
+    manifest = _manifest(*nodes)
+    prior_trace = (NodeTrace(node="before", kind="compute", visit=0, ok=True, port=None, detail=None),)
+    prior_artifacts = (Artifact(kind="link", name="n", ref="r"),)
+    resume = ResumeState(node="future", value="done", trace=prior_trace, artifacts=prior_artifacts)
+    result = asyncio.run(run_graph(plugin_dir, manifest, _entry("before"), {}, ask=_stub_ask_ok, resume=resume))
+    assert result.failed_node is None
+    assert result.text == "done"
+    assert [t.node for t in result.trace] == ["before", "future"]
+    assert result.artifacts == prior_artifacts
+
+
+@pytest.mark.unit
+def test_run_graph_resume_at_a_wait_node_with_no_successor_returns_the_answer_as_the_terminal_text(
+    tmp_path: Path,
+) -> None:
+    plugin_dir = _write_init_py(tmp_path, "")
+    manifest = _manifest(Node(name="future", kind="wait"))
+    resume = ResumeState(node="future", value="answer", trace=(), artifacts=())
+    result = asyncio.run(run_graph(plugin_dir, manifest, _entry("future"), {}, ask=_stub_ask_ok, resume=resume))
+    assert result.failed_node is None
+    assert result.paused_node is None
+    assert result.text == "answer"
+
+
+@pytest.mark.unit
+def test_run_graph_resume_hitting_a_second_wait_node_pauses_again(tmp_path: Path) -> None:
+    plugin_dir = _write_init_py(tmp_path, "")
+    nodes = (Node(name="future1", kind="wait", next="future2"), Node(name="future2", kind="wait"))
+    manifest = _manifest(*nodes)
+    resume = ResumeState(node="future1", value="first-answer", trace=(), artifacts=())
+    result = asyncio.run(run_graph(plugin_dir, manifest, _entry("future1"), {}, ask=_stub_ask_ok, resume=resume))
+    assert result.failed_node is None
+    assert result.paused_node == "future2"
+    assert [t.node for t in result.trace] == ["future1"]
+    assert result.trace[0].detail == "resumed"
 
 
 @pytest.mark.unit
@@ -828,3 +898,29 @@ def test_real_plugin_b_end_to_end() -> None:
     )
     assert result.failed_node is None
     assert [t.node for t in result.trace] == ["ask_helper"]
+
+
+@pytest.mark.unit
+def test_real_plugin_d_pauses_then_resumes_end_to_end() -> None:
+    """Cross-checks the hand-built-`Manifest` pause/resume tests above
+    against `plugin-d`'s real on-disk `call` -> `wait` -> `compute` chain —
+    the concrete "waiting on a slow external answer" scenario from
+    docs/tasks/GATEWAY-DAEMON-02-scheduled-and-resumable-triggers/intent.md."""
+    installed = _find_real_plugin("plugin-d")
+    entry = installed.manifest.entries[0]
+
+    first = asyncio.run(
+        run_graph(
+            installed.directory, installed.manifest, entry, {"job": "demo"}, ask=_stub_ask_ok, approve=_stub_approve_ok
+        )
+    )
+    assert first.failed_node is None
+    assert first.paused_node == "await_answer"
+    assert [t.node for t in first.trace] == ["start_job"]
+
+    resume = ResumeState(node="await_answer", value="42", trace=first.trace, artifacts=first.artifacts)
+    second = asyncio.run(run_graph(installed.directory, installed.manifest, entry, {}, ask=_stub_ask_ok, resume=resume))
+    assert second.failed_node is None
+    assert second.paused_node is None
+    assert second.text == "the external job answered: 42"
+    assert [t.node for t in second.trace] == ["start_job", "await_answer", "summarize"]

@@ -11,7 +11,8 @@ from pathlib import Path
 import pytest
 
 from conftest import open_conn
-from sadana import context, model_access, plugin_dispatch
+from conftest import wait_then_summarize_installed as _wait_then_summarize_installed
+from sadana import context, conversation_store, model_access, plugin_dispatch, plugins
 from sadana.conversation import (
     Conversation,
     ConversationTemplate,
@@ -448,7 +449,7 @@ def test_build_dispatch_threads_a_given_approve_to_run_graph(tmp_path: Path) -> 
     result = asyncio.run(dispatch("do_it", {"a": 1}))
 
     assert result.failed_node is None
-    assert result.text == json.dumps({"reached": {"a": 1}})
+    assert json.loads(result.text)["reached"]["a"] == 1
     assert seen == [("p", "call_step")]
 
 
@@ -504,9 +505,14 @@ def test_build_dispatch_memory_context_wins_over_a_model_supplied_value(tmp_path
 
 
 @pytest.mark.unit
-def test_build_dispatch_memory_context_none_leaves_arguments_unchanged(tmp_path: Path) -> None:
+def test_build_dispatch_memory_context_none_omits_the_memory_key_but_keeps_the_session_key(
+    tmp_path: Path,
+) -> None:
     """`memory_context` defaults to `None` — a caller that never passes it
-    gets exactly today's behavior, with no `_sadana_memory_ctx` key at all."""
+    gets no `_sadana_memory_ctx` key at all. `_sadana_session_key`
+    (`docs/tasks/GATEWAY-DAEMON-02-scheduled-and-resumable-triggers/spec.md`)
+    is unconditional, unlike `_sadana_memory_ctx` — every call gets it,
+    `memory_context` or not."""
     plugin_set = _one_call_node_plugin_set(tmp_path)
 
     async def approve_ok(_plugin: str, _node: str, _value: object) -> bool:
@@ -518,4 +524,134 @@ def test_build_dispatch_memory_context_none_leaves_arguments_unchanged(tmp_path:
     result = asyncio.run(dispatch("do_it", {"a": 1}))
 
     assert result.failed_node is None
-    assert result.text == json.dumps({"reached": {"a": 1}})
+    reached = json.loads(result.text)["reached"]
+    assert "_sadana_memory_ctx" not in reached
+    assert reached["_sadana_session_key"] == "c1"
+    assert reached["a"] == 1
+
+
+@pytest.mark.unit
+def test_build_dispatch_session_key_wins_over_a_model_supplied_value(tmp_path: Path) -> None:
+    """The same MEMORY-01 convention `_sadana_memory_ctx` established,
+    applied to `_sadana_session_key`: merged in last, so a model that
+    happened to supply its own value under that key can never make a node
+    body see anything but the real conversation key."""
+    plugin_set = _one_call_node_plugin_set(tmp_path)
+
+    async def approve_ok(_plugin: str, _node: str, _value: object) -> bool:
+        return True
+
+    dispatch, _tracker = build_dispatch(
+        _conversation(), plugin_set, stable_prompt="", provider="p", model="m", now=0.0, approve=approve_ok
+    )
+    result = asyncio.run(dispatch("do_it", {"_sadana_session_key": "attacker-supplied"}))
+
+    assert result.failed_node is None
+    assert json.loads(result.text)["reached"]["_sadana_session_key"] == "c1"
+
+
+# ── resume_paused_run ────────────────────────────────────────────────────
+
+
+@pytest.mark.unit
+def test_resume_paused_run_continues_the_walk_and_clears_the_pause_row(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _wait_then_summarize_installed(tmp_path)  # writes tmp_path/p/plugin.toml et al.
+    monkeypatch.setattr(plugins, "_plugins_root", lambda: tmp_path)
+    conn = open_conn()
+    conversation_store.save_pause(
+        conn, conversation_key="k1", plugin="p", entry="do_it", node="future", trace=(), artifacts=()
+    )
+
+    result = asyncio.run(plugin_dispatch.resume_paused_run(conn, "k1", "the-answer"))
+
+    assert result.failed_node is None
+    assert result.paused_node is None
+    assert result.text == "answered: the-answer"
+    assert conversation_store.load_pause(conn, conversation_key="k1") is None
+
+
+@pytest.mark.unit
+def test_resume_paused_run_clears_the_pause_row_and_fails_closed_when_the_plugin_no_longer_resolves(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(plugins, "_plugins_root", lambda: tmp_path)  # empty: no tmp_path/gone/plugin.toml
+    conn = open_conn()
+    conversation_store.save_pause(
+        conn, conversation_key="k1", plugin="gone", entry="do_it", node="future", trace=(), artifacts=()
+    )
+
+    result = asyncio.run(plugin_dispatch.resume_paused_run(conn, "k1", "the-answer"))
+
+    assert result.failed_node == "future"
+    assert result.paused_node is None
+    assert conversation_store.load_pause(conn, conversation_key="k1") is None
+
+
+@pytest.mark.unit
+def test_resume_paused_run_clears_the_pause_row_and_fails_closed_when_the_entry_no_longer_resolves(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _wait_then_summarize_installed(tmp_path)
+    monkeypatch.setattr(plugins, "_plugins_root", lambda: tmp_path)
+    conn = open_conn()
+    conversation_store.save_pause(
+        conn, conversation_key="k1", plugin="p", entry="a-renamed-tool", node="future", trace=(), artifacts=()
+    )
+
+    result = asyncio.run(plugin_dispatch.resume_paused_run(conn, "k1", "the-answer"))
+
+    assert result.failed_node == "future"
+    assert conversation_store.load_pause(conn, conversation_key="k1") is None
+
+
+@pytest.mark.unit
+def test_resume_paused_run_clears_the_pause_row_and_fails_closed_when_the_node_was_renamed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Deploy-stage cold review: a plugin redeployed with its paused node
+    renamed (plugin and entry both still resolving) used to reach
+    `run_graph`'s own unguarded `by_name[resume.node]` and raise an
+    uncaught `KeyError` before this function's own delete/save branches
+    ever ran — permanently stranding the pause row and repeating the crash
+    on every later message. Fixed by checking the node exists before
+    calling `run_graph` at all."""
+    _wait_then_summarize_installed(tmp_path)  # its real plugin.toml only ever declares node "future"
+    monkeypatch.setattr(plugins, "_plugins_root", lambda: tmp_path)
+    conn = open_conn()
+    conversation_store.save_pause(
+        conn, conversation_key="k1", plugin="p", entry="do_it", node="a-renamed-node", trace=(), artifacts=()
+    )
+
+    result = asyncio.run(plugin_dispatch.resume_paused_run(conn, "k1", "the-answer"))
+
+    assert result.failed_node == "a-renamed-node"
+    assert conversation_store.load_pause(conn, conversation_key="k1") is None
+
+
+@pytest.mark.unit
+def test_resume_paused_run_hitting_a_second_wait_node_overwrites_the_pause_row(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    plugin_dir = tmp_path / "p"
+    plugin_dir.mkdir()
+    plugin_dir.joinpath("plugin.toml").write_text(
+        '[plugin]\nname = "p"\nversion = "0.1.0"\ndescription = "d"\n\n'
+        '[[entry]]\ntool = "do_it"\npurpose = "p"\nparameters = "s.json"\nstart = "future1"\n\n'
+        '[[node]]\nname = "future1"\nkind = "wait"\nnext = "future2"\n\n'
+        '[[node]]\nname = "future2"\nkind = "wait"\n'
+    )
+    plugin_dir.joinpath("s.json").write_text('{"type": "object"}')
+    monkeypatch.setattr(plugins, "_plugins_root", lambda: tmp_path)
+    conn = open_conn()
+    conversation_store.save_pause(
+        conn, conversation_key="k1", plugin="p", entry="do_it", node="future1", trace=(), artifacts=()
+    )
+
+    result = asyncio.run(plugin_dispatch.resume_paused_run(conn, "k1", "first-answer"))
+
+    assert result.paused_node == "future2"
+    pause = conversation_store.load_pause(conn, conversation_key="k1")
+    assert pause is not None
+    assert pause.node == "future2"

@@ -289,6 +289,7 @@ async def run_graph(
     *,
     ask: plugins.AskFn,
     approve: plugins.ApproveFn = _default_approve,
+    resume: plugins.ResumeState | None = None,
 ) -> plugins.DagResult:
     """Walks ``manifest``'s declared steps from ``entry.start``, exactly as
     ``validate()`` already proved they connect and never loop back on
@@ -304,12 +305,26 @@ async def run_graph(
     other `§8` check this function never re-runs. Every node kind's own
     failure — a
     raised exception, a ``route`` body naming an undeclared port, a
-    ``call`` step declined by ``approve``, an ``each``/``wait`` node this
-    vocabulary doesn't execute yet, an
+    ``call`` step declined by ``approve``, an ``each`` node this vocabulary
+    doesn't execute yet, an
     ``ask`` whose sub-task didn't finish cleanly — ends the walk at that
     node: ``failed_node`` names it, ``text`` is one fixed, generic sentence
     naming the plugin and the step (never the raw exception or its
-    traceback), and nothing raises out of this function for any of them.
+    traceback), and nothing raises out of this function for any of them. A
+    ``wait`` node is not a failure: reaching one for the first time ends the
+    walk with ``paused_node`` set instead (`docs/tasks/GATEWAY-DAEMON-02
+    -scheduled-and-resumable-triggers/spec.md`), and ``resume`` is how a
+    caller continues past it later.
+
+    ``resume``, when given, replaces the walk's usual starting position
+    (``entry.start`` with ``arguments`` as ``value``) with
+    ``resume.node``'s own successor and ``resume.value`` — the resuming
+    event's payload standing in for that ``wait`` node's own output, exactly
+    as any other node's output would. ``resume.trace``/``resume.artifacts``
+    seed the walk's own record of everything that already happened before
+    the pause, plus one new entry recording the ``wait`` node itself as
+    resumed. Nothing else about the walk changes: it does not know or care
+    whether it started fresh or resumed.
 
     A ``call`` node is asked about, via ``approve``, before anything else
     happens for it — no other kind is (`docs/tasks/F1-call-node-approval/
@@ -327,10 +342,6 @@ async def run_graph(
     history")."""
     by_name = plugins._node_index(manifest)
     modules: dict[str, ModuleType | None] = {}
-    trace: list[plugins.NodeTrace] = []
-    artifacts: list[plugins.Artifact] = []
-    value: object = arguments
-    current = entry.start
 
     def result(text: str, failed_node: str | None) -> plugins.DagResult:
         return plugins.DagResult(
@@ -346,11 +357,42 @@ async def run_graph(
         trace.append(plugins.NodeTrace(node=node.name, kind=node.kind, visit=0, ok=False, port=None, detail=detail))
         return result(f"{manifest.name}'s {node.name!r} step did not complete.", node.name)
 
+    trace: list[plugins.NodeTrace]
+    artifacts: list[plugins.Artifact]
+    value: object
+    current: str
+    if resume is None:
+        trace = []
+        artifacts = []
+        value = arguments
+        current = entry.start
+    else:
+        wait_node = by_name[resume.node]
+        trace = list(resume.trace)
+        trace.append(
+            plugins.NodeTrace(node=wait_node.name, kind=wait_node.kind, visit=0, ok=True, port=None, detail="resumed")
+        )
+        artifacts = list(resume.artifacts)
+        value = resume.value
+        if wait_node.next is None:
+            return result(_coerce_text(value), None)
+        current = wait_node.next
+
     while True:
         node = by_name[current]
 
-        if node.kind in ("each", "wait"):
-            return failed(node, f"{node.kind} steps are not runnable yet")
+        if node.kind == "each":
+            return failed(node, "each steps are not runnable yet")
+        if node.kind == "wait":
+            return plugins.DagResult(
+                plugin=manifest.name,
+                entry=entry.tool,
+                text=f"{manifest.name}'s {node.name!r} step is waiting for an external answer.",
+                artifacts=tuple(artifacts),
+                trace=tuple(trace),
+                failed_node=None,
+                paused_node=node.name,
+            )
 
         port: str | None = None
         detail: str | None = None

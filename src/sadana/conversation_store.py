@@ -22,10 +22,10 @@ import contextlib
 import json
 import sqlite3
 from collections.abc import Awaitable, Callable, Iterator
-from dataclasses import replace
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
-from sadana import config, context
+from sadana import config, context, plugins
 from sadana.conversation import (
     Conversation,
     ConversationKey,
@@ -61,6 +61,26 @@ CREATE TABLE IF NOT EXISTS messages (
     tool_calls_json   TEXT NOT NULL,
     tool_call_id      TEXT,
     PRIMARY KEY (conversation_key, msg_seq)
+);
+
+-- GATEWAY-DAEMON-02 (docs/tasks/GATEWAY-DAEMON-02-scheduled-and-resumable-triggers
+-- /spec.md § Design #5). New tables, not new columns on an existing one —
+-- no `_migrate_columns()`-style guard needed.
+
+CREATE TABLE IF NOT EXISTS scheduled_triggers (
+    name              TEXT PRIMARY KEY,
+    trigger_text      TEXT NOT NULL,
+    next_run_at       REAL NOT NULL,
+    interval_seconds  REAL
+);
+
+CREATE TABLE IF NOT EXISTS plugin_pauses (
+    conversation_key  TEXT PRIMARY KEY REFERENCES conversations(key),
+    plugin            TEXT NOT NULL,
+    entry             TEXT NOT NULL,
+    node              TEXT NOT NULL,
+    trace_json        TEXT NOT NULL,
+    artifacts_json    TEXT NOT NULL
 );
 """
 
@@ -371,3 +391,165 @@ def bind_persist(
         flushed = len(messages)
 
     return _persist
+
+
+# ── GATEWAY-DAEMON-02: scheduled triggers and plugin pauses ────────────────
+# Its full contract is `docs/tasks/GATEWAY-DAEMON-02-scheduled-and-resumable-triggers/spec.md`.
+
+
+@dataclass(frozen=True)
+class ScheduledTrigger:
+    """One row of ``scheduled_triggers``. ``name`` is the natural key a
+    plugin's own setup code, or a future CLI command, addresses this by —
+    CLAUDE.md's names-not-pointers rule, backed here by a real ``PRIMARY
+    KEY``. ``interval_seconds`` of ``None`` means fire once."""
+
+    name: str
+    trigger_text: str
+    next_run_at: float
+    interval_seconds: float | None
+
+
+def upsert_scheduled_trigger(
+    conn: sqlite3.Connection, *, name: str, trigger_text: str, next_run_at: float, interval_seconds: float | None
+) -> None:
+    """Insert-or-replace by ``name`` — registering an existing trigger again
+    updates it in place rather than raising, the same posture ``save()``
+    already takes toward an existing ``conversations`` row."""
+    with write_txn(conn) as c:
+        c.execute(
+            "INSERT INTO scheduled_triggers (name, trigger_text, next_run_at, interval_seconds) "
+            "VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(name) DO UPDATE SET "
+            "trigger_text=excluded.trigger_text, next_run_at=excluded.next_run_at, "
+            "interval_seconds=excluded.interval_seconds",
+            (name, trigger_text, next_run_at, interval_seconds),
+        )
+
+
+def due_triggers(conn: sqlite3.Connection, *, now: float) -> tuple[ScheduledTrigger, ...]:
+    """Every trigger whose ``next_run_at`` has arrived, ordered by name for
+    a deterministic firing order within one tick."""
+    rows = conn.execute(
+        "SELECT name, trigger_text, next_run_at, interval_seconds FROM scheduled_triggers "
+        "WHERE next_run_at <= ? ORDER BY name",
+        (now,),
+    ).fetchall()
+    return tuple(
+        ScheduledTrigger(
+            name=r["name"],
+            trigger_text=r["trigger_text"],
+            next_run_at=r["next_run_at"],
+            interval_seconds=r["interval_seconds"],
+        )
+        for r in rows
+    )
+
+
+def advance_scheduled_trigger(conn: sqlite3.Connection, *, name: str, next_run_at: float) -> None:
+    """Moves a recurring trigger's own next firing forward. The caller
+    (``scheduling.tick()``) always computes ``next_run_at`` as
+    ``now + interval_seconds``, never ``old_next_run_at + interval_seconds``
+    — that's what keeps a long gap (the daemon was down) from producing a
+    backlog of already-past firings instead of exactly one."""
+    with write_txn(conn) as c:
+        c.execute("UPDATE scheduled_triggers SET next_run_at = ? WHERE name = ?", (next_run_at, name))
+
+
+def delete_scheduled_trigger(conn: sqlite3.Connection, *, name: str) -> None:
+    """Removes a one-shot trigger once it has fired. A name with no row is
+    a silent no-op, matching ``DELETE``'s own natural idempotence."""
+    with write_txn(conn) as c:
+        c.execute("DELETE FROM scheduled_triggers WHERE name = ?", (name,))
+
+
+@dataclass(frozen=True)
+class Pause:
+    """One row of ``plugin_pauses`` — everything ``plugin_dispatch.
+    resume_paused_run()`` needs to continue a `wait`-paused
+    ``run_graph()`` walk later. Never the plugin's directory or ``Manifest``
+    object, only its name — re-resolved fresh at resume time (see
+    ``plugins.ResumeState``'s own docstring)."""
+
+    plugin: str
+    entry: str
+    node: str
+    trace: tuple[plugins.NodeTrace, ...]
+    artifacts: tuple[plugins.Artifact, ...]
+
+
+def save_pause(
+    conn: sqlite3.Connection,
+    *,
+    conversation_key: str,
+    plugin: str,
+    entry: str,
+    node: str,
+    trace: tuple[plugins.NodeTrace, ...],
+    artifacts: tuple[plugins.Artifact, ...],
+) -> None:
+    """Upserts by ``conversation_key`` — a run that pauses a second time
+    (at a second `wait` node) overwrites its own prior pause row cleanly
+    rather than leaving two, matching ``PRIMARY KEY``'s own "at most one
+    outstanding pause per conversation" constraint."""
+    with write_txn(conn) as c:
+        c.execute(
+            "INSERT INTO plugin_pauses (conversation_key, plugin, entry, node, trace_json, artifacts_json) "
+            "VALUES (?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(conversation_key) DO UPDATE SET "
+            "plugin=excluded.plugin, entry=excluded.entry, node=excluded.node, "
+            "trace_json=excluded.trace_json, artifacts_json=excluded.artifacts_json",
+            (
+                conversation_key,
+                plugin,
+                entry,
+                node,
+                json.dumps([asdict(t) for t in trace]),
+                json.dumps([asdict(a) for a in artifacts]),
+            ),
+        )
+
+
+def save_pause_from_result(conn: sqlite3.Connection, *, conversation_key: str, result: plugins.DagResult) -> None:
+    """`save_pause()`, unpacking a `paused_node`-bearing `DagResult` — the
+    one place that knows how a paused run's fields map onto a
+    `plugin_pauses` row, called from both of this project's two paths that
+    can produce one (`plugin_dispatch.build_dispatch()`'s own `dispatch`
+    closure, for a run's first pause; `plugin_dispatch.resume_paused_run()`,
+    for a second). `result.paused_node is None` is the caller's own error —
+    this function trusts it was already checked, the same posture
+    `save_pause()` itself takes toward its own arguments."""
+    assert result.paused_node is not None, "save_pause_from_result called with a non-paused DagResult"
+    save_pause(
+        conn,
+        conversation_key=conversation_key,
+        plugin=result.plugin,
+        entry=result.entry,
+        node=result.paused_node,
+        trace=result.trace,
+        artifacts=result.artifacts,
+    )
+
+
+def load_pause(conn: sqlite3.Connection, *, conversation_key: str) -> Pause | None:
+    """``None`` when the conversation has no outstanding pause — the normal
+    case every inbound message not resuming something checks first."""
+    row = conn.execute(
+        "SELECT plugin, entry, node, trace_json, artifacts_json FROM plugin_pauses WHERE conversation_key = ?",
+        (conversation_key,),
+    ).fetchone()
+    if row is None:
+        return None
+    return Pause(
+        plugin=row["plugin"],
+        entry=row["entry"],
+        node=row["node"],
+        trace=tuple(plugins.NodeTrace(**t) for t in json.loads(row["trace_json"])),
+        artifacts=tuple(plugins.Artifact(**a) for a in json.loads(row["artifacts_json"])),
+    )
+
+
+def delete_pause(conn: sqlite3.Connection, *, conversation_key: str) -> None:
+    """A key with no row is a silent no-op, same as ``delete_scheduled_trigger``."""
+    with write_txn(conn) as c:
+        c.execute("DELETE FROM plugin_pauses WHERE conversation_key = ?", (conversation_key,))

@@ -9,10 +9,11 @@ job (spec.md's acceptance criteria), not this suite's.
 from __future__ import annotations
 
 import argparse
+import threading
 
 import pytest
 
-from sadana import gateway_daemon
+from sadana import gateway_daemon, scheduling
 from sadana.subcommands.gateway import (
     build_gateway_parser,
     cmd_gateway_install,
@@ -44,6 +45,41 @@ def test_cmd_gateway_run_refuses_to_start_when_secret_is_unset(
 
     assert result == 1
     assert "SADANA_GATEWAY_WEBHOOK_SECRET" in capsys.readouterr().err
+
+
+@pytest.mark.unit
+def test_cmd_gateway_run_starts_the_scheduling_tick_thread_before_the_daemon(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The only other existing test for this function
+    (`..._refuses_to_start_when_secret_is_unset`) returns before reaching
+    this code at all, so this is the first real coverage of the thread-start
+    line GATEWAY-DAEMON-02 added. Both `gateway_daemon.run` and
+    `scheduling.run_tick_loop` are monkeypatched — the former to avoid a
+    real socket bind, the latter (real code, real `daemon=True` thread) to
+    avoid an actual infinite tick loop running in the background. Waits on
+    a real `threading.Event` rather than a fixed sleep, since the thread
+    genuinely races this test's own assertions (testing-conventions: no
+    timing-based flakiness)."""
+    monkeypatch.setenv("SADANA_GATEWAY_WEBHOOK_SECRET", "s")
+    monkeypatch.setattr(gateway_daemon, "run", lambda **_kwargs: 0)
+
+    called = threading.Event()
+    seen: dict[str, object] = {}
+
+    def _fake_run_tick_loop(**kwargs: object) -> None:
+        seen.update(kwargs)
+        called.set()
+
+    monkeypatch.setattr(scheduling, "run_tick_loop", _fake_run_tick_loop)
+
+    result = cmd_gateway_run(argparse.Namespace(host=None, port=None))
+
+    assert result == 0
+    assert called.wait(timeout=5), "scheduling.run_tick_loop was never started"
+    assert seen["interval_seconds"] == 30
+    assert "conn" in seen
+    assert "plugin_set" in seen
 
 
 @pytest.mark.unit

@@ -138,6 +138,39 @@ def dag_result(*, failed_node: str | None = None) -> plugins.DagResult:
     )
 
 
+def wait_then_summarize_installed(tmp_path: Path) -> plugins.InstalledPlugin:
+    """A minimal `call` -> `wait` -> `compute` plugin, on a real `tmp_path`
+    directory — including a real ``plugin.toml`` (not just an in-memory
+    ``Manifest``), since ``plugin_manifest.validate()`` parses one fresh
+    from disk and ``resume_paused_run()`` calls it directly rather than
+    `discover_plugins()` (GATEWAY-DAEMON-02: re-resolving one named plugin
+    should not have to scan and validate every other installed one).
+    Shared by ``test_gateway_dispatch.py`` and ``test_plugin_dispatch.py``,
+    both of which need the identical fixture for GATEWAY-DAEMON-02's own
+    pause/resume tests."""
+    plugin_dir = tmp_path / "p"
+    plugin_dir.mkdir()
+    plugin_dir.joinpath("init.py").write_text("def summarize(value):\n    return f'answered: {value}'\n")
+    plugin_dir.joinpath("s.json").write_text('{"type": "object"}')
+    plugin_dir.joinpath("plugin.toml").write_text(
+        '[plugin]\nname = "p"\nversion = "0.1.0"\ndescription = "d"\n\n'
+        '[[entry]]\ntool = "do_it"\npurpose = "p"\nparameters = "s.json"\nstart = "future"\n\n'
+        '[[node]]\nname = "future"\nkind = "wait"\nnext = "summarize"\n\n'
+        '[[node]]\nname = "summarize"\nkind = "compute"\nbody = "init:summarize"\n'
+    )
+    manifest = plugins.Manifest(
+        name="p",
+        version="0.1.0",
+        description="d",
+        entries=(plugins.Entry(tool="do_it", purpose="p", parameters="s.json", start="future"),),
+        nodes=(
+            plugins.Node(name="future", kind="wait", next="summarize"),
+            plugins.Node(name="summarize", kind="compute", body="init:summarize"),
+        ),
+    )
+    return plugins.InstalledPlugin(name="p", directory=plugin_dir, manifest=manifest)
+
+
 def write_skill(
     tmp_path: Path,
     *,

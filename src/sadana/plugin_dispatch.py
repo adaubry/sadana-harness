@@ -10,10 +10,11 @@ plugin_manifest.py never import conversation.py"), and an `ask` node needs
 from __future__ import annotations
 
 import json
+import sqlite3
 from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass, replace
 
-from sadana import memory_store, observability, plugin_manifest, plugins
+from sadana import conversation_store, memory_store, observability, plugin_manifest, plugins
 from sadana.conversation import (
     ChildSpec,
     Conversation,
@@ -120,6 +121,13 @@ class ChildSeqTracker:
     next_seq: int
 
 
+async def _noop_persist_pause(_result: plugins.DagResult) -> None:
+    """The default ``persist_pause``: a caller that never opted in behaves
+    exactly as before this parameter existed — same posture as
+    ``conversation.py``'s own ``_noop_persist``."""
+    return None
+
+
 def build_dispatch(
     conversation: Conversation,
     plugin_set: PluginSet,
@@ -133,6 +141,7 @@ def build_dispatch(
     record_turn: observability.RecordTurnFn = observability.noop_record,
     record_plugin_run: observability.RecordPluginRunFn = observability.noop_record,
     memory_context: memory_store.DispatchContext | None = None,
+    persist_pause: Callable[[plugins.DagResult], Awaitable[None]] = _noop_persist_pause,
 ) -> tuple[DispatchFn, ChildSeqTracker]:
     """Builds one dispatch closure matching `conversation.py`'s own
     `dispatch` contract exactly, and the `ChildSeqTracker` it shares with
@@ -175,8 +184,26 @@ def build_dispatch(
     over anything the model itself supplied under that name — the only way
     a plugin's node body can learn the account it is running for without
     that identity ever being something the model controls. Defaults to
-    `None`, in which case `arguments` reaches `run_graph` completely
-    unchanged from before this parameter existed."""
+    `None`, in which case `arguments` reaches `run_graph` with only the
+    session key below added.
+
+    **Session identity** (`docs/tasks/GATEWAY-DAEMON-02-scheduled-and-resumable-triggers
+    /spec.md`): every call's `arguments` also always gets
+    `_sadana_session_key` (`conversation.key`), the second occurrence of
+    the same reserved-key convention `_sadana_memory_ctx` established —
+    now a CLAUDE.md rule. A `call` node that starts a slow external job
+    reads this to tell that job where to call back once it's done; nothing
+    else in this project threads a session's identity through a node
+    body's own call signature.
+
+    **Pausing** (same spec): `persist_pause` is awaited with the real
+    `DagResult` right where it's produced — the same point `record_plugin_run`
+    already reads it, one line below — whenever `run_graph` returns one
+    with `paused_node` set. This is the *only* place a run's first pause is
+    persisted; `gateway_dispatch.handle_inbound()` passes a closure over its
+    own `conn`/`conversation.key` (`conversation_store.save_pause_from_result`)
+    rather than reconstructing what happened after the turn is over. Defaults
+    to a no-op, matching every other optional callback here."""
     tracker = ChildSeqTracker(next_seq=conversation.next_child_seq)
     turn_key = conversation.pending_turn_key
     seq_in_turn = 0
@@ -215,9 +242,9 @@ def build_dispatch(
                 failed_node="entry",
             )
         installed, entry = hit
-        call_arguments = (
-            {**arguments, "_sadana_memory_ctx": memory_context} if memory_context is not None else arguments
-        )
+        call_arguments = {**arguments, "_sadana_session_key": conversation.key}
+        if memory_context is not None:
+            call_arguments["_sadana_memory_ctx"] = memory_context
         result, duration_s = await observability.timed(
             plugin_manifest.run_graph(
                 installed.directory, installed.manifest, entry, call_arguments, ask=ask, approve=approve
@@ -225,9 +252,101 @@ def build_dispatch(
         )
         await record_plugin_run(turn_key, seq_in_turn, result, duration_s)
         seq_in_turn += 1
+        if result.paused_node is not None:
+            await persist_pause(result)
         return result
 
     return dispatch, tracker
+
+
+async def _unsupported_ask(_skill: plugins.SkillRef, _text: str) -> str | None:
+    """A resumed walk cannot yet reach a real `ask` node
+    (`docs/tasks/GATEWAY-DAEMON-02-scheduled-and-resumable-triggers/spec.md`'s
+    own Non-goal): supporting it would mean threading a full `Conversation`
+    and `run_child` through the resume path, duplicating `build_dispatch`'s
+    own `ask` closure, for a scenario nothing concrete needs yet. Always
+    returns `None` — the same "child did not complete" outcome `run_graph`
+    already gives any other `ask` failure, so a resumed walk that reaches
+    one still ends as a clean, named `DagResult`, never a crash."""
+    return None
+
+
+async def resume_paused_run(
+    conn: sqlite3.Connection,
+    conversation_key: str,
+    payload_text: str,
+    *,
+    approve: plugins.ApproveFn = plugin_manifest._default_approve,
+) -> plugins.DagResult:
+    """Continues a conversation's own outstanding `plugin_pauses` row with
+    `payload_text` as the resuming answer
+    (`docs/tasks/GATEWAY-DAEMON-02-scheduled-and-resumable-triggers/spec.md`).
+
+    Caller's obligation: check `conversation_store.load_pause()` first —
+    this function trusts a row exists, matching the case
+    `gateway_dispatch.handle_inbound()` already established before calling
+    it.
+
+    The plugin is re-resolved fresh, by name, via `plugin_manifest.validate()`
+    on exactly `pause.plugin`'s own directory — never cached across the
+    pause, the same "never cached... re-validated per call would be pure
+    waste, not extra safety" posture `InstalledPlugin`'s own docstring
+    already takes, and this project's own names-not-pointers rule
+    (`plugins.ResumeState`'s own docstring). Deliberately *not*
+    `discover_plugins()`: that scans and validates every installed plugin,
+    not just the one this resume needs — wasted work scaling with total
+    plugin count, repeated on every resume, for a lookup that only ever
+    wants one name. A plugin/entry/node that no longer resolves is a clean,
+    `failed_node`-set `DagResult`, never an exception — the pause row is
+    cleared either way, since any terminal result means this run is over.
+    The node check matters on its own, not just as a variant of the
+    plugin/entry one: a deploy-stage cold review found that a plugin
+    redeployed with its paused node renamed (plugin and entry still
+    resolving) reached `run_graph`'s own unguarded `by_name[resume.node]`
+    and raised an uncaught `KeyError` — before this function's own
+    delete/save branches ever ran, so the pause row was never cleared and
+    every later message on that session key repeated the same crash. A run
+    that pauses again (a second `wait` node) has its pause row overwritten
+    in place, matching `save_pause()`'s own upsert shape."""
+    pause = conversation_store.load_pause(conn, conversation_key=conversation_key)
+    assert pause is not None, f"resume_paused_run called with no pause row for {conversation_key!r}"
+
+    outcome = plugin_manifest.validate(plugins._plugins_root() / pause.plugin)
+    entry = (
+        next((e for e in outcome.manifest.entries if e.tool == pause.entry), None)
+        if isinstance(outcome, plugins.Valid)
+        else None
+    )
+    node_missing = isinstance(outcome, plugins.Valid) and pause.node not in plugins._node_index(outcome.manifest)
+    if not isinstance(outcome, plugins.Valid) or entry is None or node_missing:
+        conversation_store.delete_pause(conn, conversation_key=conversation_key)
+        detail = "the plugin's graph no longer has this step" if node_missing else "the plugin no longer resolves"
+        return plugins.DagResult(
+            plugin=pause.plugin,
+            entry=pause.entry,
+            text=f"{pause.plugin}'s {pause.node!r} step could not resume: {detail}.",
+            artifacts=pause.artifacts,
+            trace=pause.trace,
+            failed_node=pause.node,
+        )
+
+    resume_state = plugins.ResumeState(
+        node=pause.node, value=payload_text, trace=pause.trace, artifacts=pause.artifacts
+    )
+    result = await plugin_manifest.run_graph(
+        plugins._plugins_root() / pause.plugin,
+        outcome.manifest,
+        entry,
+        {},
+        ask=_unsupported_ask,
+        approve=approve,
+        resume=resume_state,
+    )
+    if result.paused_node is None:
+        conversation_store.delete_pause(conn, conversation_key=conversation_key)
+    else:
+        conversation_store.save_pause_from_result(conn, conversation_key=conversation_key, result=result)
+    return result
 
 
 async def take_turn_and_reconcile(

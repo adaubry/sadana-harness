@@ -1,0 +1,26 @@
+[plugin]
+name = "plugin-d"
+version = "0.1.0"
+description = "Starts a slow external job, then waits for its answer — GATEWAY-DAEMON-02's own concrete scenario."
+
+[[entry]]
+tool = "plugin_d_entry"
+purpose = "Starts a slow external job and waits for it to call back with an answer."
+parameters = "schema/plugin_d_entry.json"
+start = "start_job"
+
+[[node]]
+name = "start_job"
+kind = "call"
+body = "init:start_job"
+next = "await_answer"
+
+[[node]]
+name = "await_answer"
+kind = "wait"
+next = "summarize"
+
+[[node]]
+name = "summarize"
+kind = "compute"
+body = "init:summarize"

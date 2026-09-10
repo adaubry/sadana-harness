@@ -140,7 +140,16 @@ class DagResult:
     """What a plugin's dispatch call hands back. ``text`` is always
     present and always safe to render as-is, whether or not
     ``failed_node`` is set — it is the one field ``run_turn`` renders
-    unconditionally into the tool-result message."""
+    unconditionally into the tool-result message.
+
+    ``paused_node`` (`docs/tasks/GATEWAY-DAEMON-02-scheduled-and-resumable-triggers
+    /spec.md`) is the third, additive state a run can end in: a ``wait``
+    node was reached and the run stopped there, not because anything
+    failed. Deliberately one more optional field rather than a
+    ``DagResult | DagPaused`` union — a paused result's ``text``/
+    ``artifacts``/``trace`` mean exactly what a terminal result's do, only
+    the resume position is genuinely new (CLAUDE.md: "a result whose
+    branches differ only by one field... doesn't need this shape")."""
 
     plugin: str
     entry: str
@@ -148,6 +157,25 @@ class DagResult:
     artifacts: tuple[Artifact, ...] = ()
     trace: tuple[NodeTrace, ...] = ()
     failed_node: str | None = None  # None == the run reached a terminal node
+    paused_node: str | None = None  # set only when the run stopped at a `wait` node
+
+
+@dataclass(frozen=True)
+class ResumeState:
+    """Where a paused run left off, handed back to ``run_graph`` (alongside
+    that same call's own ``manifest``/``entry`` parameters — never
+    duplicated here) to continue it
+    (`docs/tasks/GATEWAY-DAEMON-02-scheduled-and-resumable-triggers/spec.md`).
+    The plugin's directory and ``Manifest`` object are re-resolved fresh by
+    ``plugin_dispatch.resume_paused_run`` from a stored plugin *name* before
+    ``run_graph`` is ever called — the same "never cached... re-validated
+    per call" posture ``InstalledPlugin``'s own docstring already takes, and
+    this project's own names-not-pointers rule."""
+
+    node: str  # the `wait` node's own name
+    value: object  # the resuming event's payload, standing in for a predecessor's output
+    trace: tuple[NodeTrace, ...]
+    artifacts: tuple[Artifact, ...]
 
 
 # ── D2: manifest validation ──────────────────────────────────────────────

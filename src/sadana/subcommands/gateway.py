@@ -15,6 +15,7 @@ import argparse
 import asyncio
 import http.server
 import sys
+import threading
 
 from sadana import (
     channel_webhook,
@@ -29,6 +30,7 @@ from sadana import (
     plugin_dispatch,
     plugin_manifest,
     plugins,
+    scheduling,
 )
 from sadana.gateway import MessageEvent
 from sadana.persona import load_or_seed_persona, persona_path_from_config
@@ -80,7 +82,7 @@ def cmd_gateway_run(args: argparse.Namespace) -> int:
     recorder = observability.make_recorder(conn)  # built once; handle_inbound reuses it every inbound message
 
     # gateway_dispatch.handle_inbound() serializes its own conn access
-    # (its module-level _conn_lock) — no lock needed here.
+    # (gateway_dispatch.conn_lock) — no lock needed here.
     def on_message(event: MessageEvent) -> tuple[bool, str]:
         return asyncio.run(
             gateway_dispatch.handle_inbound(
@@ -97,6 +99,27 @@ def cmd_gateway_run(args: argparse.Namespace) -> int:
 
     def make_server() -> http.server.ThreadingHTTPServer:
         return channel_webhook.make_server(host, port, secret=secret, on_message=on_message)
+
+    # A daemon thread — needs no coordination with gateway_daemon.run()'s
+    # own SIGTERM/lock/shutdown sequence (scheduling.run_tick_loop's own
+    # docstring: it dies with the process, and this project's "best-effort,
+    # no catch-up" posture already accepts an abrupt mid-tick kill).
+    tick_interval = config.env_int("SADANA_SCHEDULING_TICK_SECONDS", 30)
+    threading.Thread(
+        target=scheduling.run_tick_loop,
+        kwargs={
+            "conn": conn,
+            "interval_seconds": tick_interval,
+            "plugin_set": plugin_set,
+            "persona": persona,
+            "provider": provider,
+            "model": model,
+            "record_turn": recorder.record_turn,
+            "record_plugin_run": recorder.record_plugin_run,
+        },
+        daemon=True,
+        name="sadana-scheduling-tick",
+    ).start()
 
     return gateway_daemon.run(make_server=make_server, lock_filename="gateway.lock")
 

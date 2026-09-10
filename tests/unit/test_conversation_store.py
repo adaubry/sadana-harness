@@ -27,13 +27,20 @@ from sadana.conversation import (
 from sadana.conversation_store import (
     ConversationAlreadyExists,
     ConversationNotFound,
+    advance_scheduled_trigger,
     bind_persist,
     create,
+    delete_pause,
+    delete_scheduled_trigger,
+    due_triggers,
     load,
+    load_pause,
     open_store,
     save,
+    save_pause,
     search_conversations,
     store_path_from_config,
+    upsert_scheduled_trigger,
     write_txn,
 )
 
@@ -456,3 +463,125 @@ def test_search_escapes_percent_and_underscore_as_literals(tmp_path: Path) -> No
 
     assert [c.key for c in search_conversations(conn, "50%off", now=0.0)] == ["50%off"]
     assert search_conversations(conn, "50_off", now=0.0) == []
+
+
+# ── scheduled_triggers ────────────────────────────────────────────────────
+
+
+@pytest.mark.unit
+def test_due_triggers_returns_only_triggers_whose_time_has_arrived(tmp_path: Path) -> None:
+    conn = open_store(tmp_path / "c.db")
+    upsert_scheduled_trigger(conn, name="past", trigger_text="fire", next_run_at=100.0, interval_seconds=None)
+    upsert_scheduled_trigger(conn, name="future", trigger_text="fire", next_run_at=200.0, interval_seconds=None)
+
+    due = due_triggers(conn, now=150.0)
+
+    assert [t.name for t in due] == ["past"]
+
+
+@pytest.mark.unit
+def test_upsert_scheduled_trigger_replaces_an_existing_row_by_name(tmp_path: Path) -> None:
+    conn = open_store(tmp_path / "c.db")
+    upsert_scheduled_trigger(conn, name="t", trigger_text="first", next_run_at=100.0, interval_seconds=None)
+    upsert_scheduled_trigger(conn, name="t", trigger_text="second", next_run_at=200.0, interval_seconds=604800.0)
+
+    (due,) = due_triggers(conn, now=1_000_000.0)
+    assert due.trigger_text == "second"
+    assert due.next_run_at == 200.0
+    assert due.interval_seconds == 604800.0
+
+
+@pytest.mark.unit
+def test_advance_scheduled_trigger_moves_next_run_at(tmp_path: Path) -> None:
+    conn = open_store(tmp_path / "c.db")
+    upsert_scheduled_trigger(conn, name="t", trigger_text="fire", next_run_at=100.0, interval_seconds=604800.0)
+
+    advance_scheduled_trigger(conn, name="t", next_run_at=999.0)
+
+    assert due_triggers(conn, now=100.0) == ()
+    (due,) = due_triggers(conn, now=1000.0)
+    assert due.next_run_at == 999.0
+
+
+@pytest.mark.unit
+def test_delete_scheduled_trigger_removes_the_row(tmp_path: Path) -> None:
+    conn = open_store(tmp_path / "c.db")
+    upsert_scheduled_trigger(conn, name="t", trigger_text="fire", next_run_at=100.0, interval_seconds=None)
+
+    delete_scheduled_trigger(conn, name="t")
+
+    assert due_triggers(conn, now=1_000_000.0) == ()
+
+
+@pytest.mark.unit
+def test_delete_scheduled_trigger_on_an_unknown_name_is_a_silent_no_op(tmp_path: Path) -> None:
+    conn = open_store(tmp_path / "c.db")
+    delete_scheduled_trigger(conn, name="never-existed")  # must not raise
+
+
+# ── plugin_pauses ─────────────────────────────────────────────────────────
+
+
+def _trace() -> tuple[plugins.NodeTrace, ...]:
+    return (plugins.NodeTrace(node="start", kind="call", visit=0, ok=True, port=None, detail=None),)
+
+
+def _artifacts() -> tuple[plugins.Artifact, ...]:
+    return (plugins.Artifact(kind="link", name="n", ref="https://example.test"),)
+
+
+@pytest.mark.unit
+def test_load_pause_returns_none_for_a_conversation_with_no_pause(tmp_path: Path) -> None:
+    conn = open_store(tmp_path / "c.db")
+    assert load_pause(conn, conversation_key="k1") is None
+
+
+@pytest.mark.unit
+def test_save_pause_then_load_pause_roundtrips(tmp_path: Path) -> None:
+    conn = open_store(tmp_path / "c.db")
+    save_pause(
+        conn,
+        conversation_key="k1",
+        plugin="plugin-d",
+        entry="plugin_d_entry",
+        node="await_answer",
+        trace=_trace(),
+        artifacts=_artifacts(),
+    )
+
+    pause = load_pause(conn, conversation_key="k1")
+
+    assert pause is not None
+    assert pause.plugin == "plugin-d"
+    assert pause.entry == "plugin_d_entry"
+    assert pause.node == "await_answer"
+    assert pause.trace == _trace()
+    assert pause.artifacts == _artifacts()
+
+
+@pytest.mark.unit
+def test_save_pause_upserts_by_conversation_key(tmp_path: Path) -> None:
+    conn = open_store(tmp_path / "c.db")
+    save_pause(conn, conversation_key="k1", plugin="plugin-d", entry="e", node="first", trace=(), artifacts=())
+    save_pause(conn, conversation_key="k1", plugin="plugin-d", entry="e", node="second", trace=_trace(), artifacts=())
+
+    pause = load_pause(conn, conversation_key="k1")
+
+    assert pause is not None
+    assert pause.node == "second"
+
+
+@pytest.mark.unit
+def test_delete_pause_removes_the_row(tmp_path: Path) -> None:
+    conn = open_store(tmp_path / "c.db")
+    save_pause(conn, conversation_key="k1", plugin="p", entry="e", node="n", trace=(), artifacts=())
+
+    delete_pause(conn, conversation_key="k1")
+
+    assert load_pause(conn, conversation_key="k1") is None
+
+
+@pytest.mark.unit
+def test_delete_pause_on_an_unknown_key_is_a_silent_no_op(tmp_path: Path) -> None:
+    conn = open_store(tmp_path / "c.db")
+    delete_pause(conn, conversation_key="never-existed")  # must not raise
