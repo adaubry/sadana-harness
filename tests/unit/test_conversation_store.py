@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import sqlite3
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -161,6 +163,72 @@ def test_resaving_same_messages_does_not_duplicate_rows(tmp_path: Path) -> None:
 
     count = conn.execute("SELECT COUNT(*) FROM messages WHERE conversation_key = ?", (conv.key,)).fetchone()[0]
     assert count == len(_messages())
+
+
+# ── context state / cache boundary survive a resume (C12) ──────────────
+
+
+@pytest.mark.unit
+def test_load_reconstructs_context_state_and_stable_prompt_len_across_a_second_connection(tmp_path: Path) -> None:
+    path = tmp_path / "c.db"
+    conv = _conversation()
+    conv = replace(
+        conv,
+        stable_prompt_len=10,  # narrower than the full system prompt
+        context_state=ContextState(total_prompt_tokens=123, total_completion_tokens=45),
+    )
+
+    conn = open_store(path)
+    create(conn, conv, now=0.0)
+    conn.close()  # the failure mode this fix targets only shows up across a real reconnect
+
+    reopened = open_store(path)
+    loaded = load(reopened, conv.key, now=0.0)
+
+    assert loaded == conv
+
+
+@pytest.mark.unit
+def test_load_falls_back_for_a_legacy_row_and_migration_is_idempotent(tmp_path: Path) -> None:
+    path = tmp_path / "c.db"
+    raw = sqlite3.connect(path)
+    raw.execute(
+        """CREATE TABLE conversations (
+            key                    TEXT PRIMARY KEY,
+            template_name          TEXT NOT NULL,
+            system_prompt          TEXT NOT NULL,
+            prompt_sha256          TEXT NOT NULL,
+            prompt_epoch           INTEGER NOT NULL,
+            tool_surface_json      TEXT NOT NULL,
+            next_turn_seq          INTEGER NOT NULL,
+            iteration_max_total    INTEGER NOT NULL,
+            iteration_used         INTEGER NOT NULL,
+            wall_clock_remaining_s REAL,
+            next_child_seq         INTEGER NOT NULL
+        )"""
+    )
+    raw.execute(
+        "CREATE TABLE messages (conversation_key TEXT NOT NULL, msg_seq INTEGER NOT NULL, role TEXT NOT NULL, "
+        "content TEXT, tool_calls_json TEXT NOT NULL, tool_call_id TEXT, "
+        "PRIMARY KEY (conversation_key, msg_seq))"
+    )
+    raw.execute(
+        "INSERT INTO conversations (key, template_name, system_prompt, prompt_sha256, prompt_epoch, "
+        "tool_surface_json, next_turn_seq, iteration_max_total, iteration_used, wall_clock_remaining_s, "
+        "next_child_seq) VALUES ('legacy', 't1', ?, 'h', 0, '[]', 0, 10, 0, NULL, 0)",
+        (_SYSTEM_PROMPT,),
+    )
+    raw.commit()
+    raw.close()
+
+    first = open_store(path)  # must migrate: adds the three new columns
+    first.close()
+    second = open_store(path)  # must not raise: migration runs again, columns already present
+
+    loaded = load(second, "legacy", now=0.0)
+
+    assert loaded.context_state == ContextState()
+    assert loaded.stable_prompt_len == len(_SYSTEM_PROMPT)
 
 
 # ── wall-clock budget portability ───────────────────────────────────────

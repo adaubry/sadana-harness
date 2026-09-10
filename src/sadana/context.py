@@ -37,8 +37,12 @@ if TYPE_CHECKING:
 @dataclass(frozen=True)
 class ContextState:
     """A conversation's own running account — created once when the
-    conversation begins, lives across every turn, discarded when the
-    conversation ends. Not persisted (spec.md's own requirement 7)."""
+    conversation begins, lives across every turn. This module never
+    persists it directly (spec.md's own requirement 7 — CONTEXT has no
+    disk/network access); ``conversation_store.py``'s ``create()``/``save()``/
+    ``load()`` do that at the SESSION-STORE seam instead, so its values
+    (unlike the dataclass instance itself) do survive a save/reload round
+    trip (docs/tasks/C12-context-resume-round-trip/spec.md)."""
 
     total_prompt_tokens: int = 0
     total_completion_tokens: int = 0

@@ -49,6 +49,7 @@ WSL only. Python lives in `.venv`; `make` puts it on PATH for you, so there is n
 - A registry or dispatch seam for a family of pluggable backends earns its cost only once a second real member exists to register — build the single member as a direct call, not a lookup table of one, no matter how certain a second member seems.
 - A CLI subcommand's handler returns an int for its own exit code; argparse's own `--version`/`--help`/parse-error exits are never wrapped or re-raised as something else.
 - `conversation_store.bind_persist()` is rebuilt fresh before every turn, never reused across turns — its snapshot-at-bind-time budgets/`next_turn_seq`/`context_state` go stale otherwise, the same shape of risk `build_dispatch()` already documents in `docs/reference/dispatch_closure_state_bug.md`.
+- A new persisted column on an existing SQLite table is added via an idempotent `PRAGMA table_info` + guarded `ALTER TABLE ... ADD COLUMN` check, never a backfill migration — a column with no safe default falls back to matching pre-fix behavior at read time, so legacy rows keep loading and self-correct only once genuinely rewritten.
 
 ## Glossary
 

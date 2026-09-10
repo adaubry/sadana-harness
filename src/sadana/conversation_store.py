@@ -37,17 +37,20 @@ from sadana.conversation import (
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS conversations (
-    key                    TEXT PRIMARY KEY,
-    template_name          TEXT NOT NULL,
-    system_prompt          TEXT NOT NULL,
-    prompt_sha256          TEXT NOT NULL,
-    prompt_epoch           INTEGER NOT NULL,
-    tool_surface_json      TEXT NOT NULL,
-    next_turn_seq          INTEGER NOT NULL,
-    iteration_max_total    INTEGER NOT NULL,
-    iteration_used         INTEGER NOT NULL,
-    wall_clock_remaining_s REAL,
-    next_child_seq         INTEGER NOT NULL
+    key                            TEXT PRIMARY KEY,
+    template_name                  TEXT NOT NULL,
+    system_prompt                  TEXT NOT NULL,
+    prompt_sha256                  TEXT NOT NULL,
+    prompt_epoch                   INTEGER NOT NULL,
+    tool_surface_json              TEXT NOT NULL,
+    next_turn_seq                  INTEGER NOT NULL,
+    iteration_max_total            INTEGER NOT NULL,
+    iteration_used                 INTEGER NOT NULL,
+    wall_clock_remaining_s         REAL,
+    next_child_seq                 INTEGER NOT NULL,
+    stable_prompt_len              INTEGER,
+    context_total_prompt_tokens    INTEGER NOT NULL DEFAULT 0,
+    context_total_completion_tokens INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS messages (
@@ -73,6 +76,9 @@ _CONVERSATION_COLUMNS = (
     "iteration_used",
     "wall_clock_remaining_s",
     "next_child_seq",
+    "stable_prompt_len",
+    "context_total_prompt_tokens",
+    "context_total_completion_tokens",
 )
 _CONVERSATION_COLUMNS_SQL = ", ".join(_CONVERSATION_COLUMNS)
 _CONVERSATION_PLACEHOLDERS_SQL = ", ".join("?" * len(_CONVERSATION_COLUMNS))
@@ -118,7 +124,44 @@ def open_store(path: Path) -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.executescript(_SCHEMA)
+    _migrate_columns(conn)
     return conn
+
+
+# Columns added after the original schema shipped — ``CREATE TABLE IF NOT
+# EXISTS`` above only covers a brand-new store; a store that already exists
+# needs each one added explicitly. C12 (docs/tasks/C12-context-resume-round-trip)
+# added the three below.
+_MIGRATED_COLUMNS = (
+    ("stable_prompt_len", "INTEGER"),
+    ("context_total_prompt_tokens", "INTEGER NOT NULL DEFAULT 0"),
+    ("context_total_completion_tokens", "INTEGER NOT NULL DEFAULT 0"),
+)
+
+
+def _migrate_columns(conn: sqlite3.Connection) -> None:
+    """Adds any column in ``_MIGRATED_COLUMNS`` missing from an existing
+    ``conversations`` table — the ``PRAGMA table_info`` check below (adapted
+    from hermes-agent's own guarded ``ALTER TABLE ... ADD COLUMN`` pattern,
+    ``gateway/delivery_ledger.py:130-141``, kind: production-code) is what
+    makes a second ``open_store()`` call in this same process a no-op:
+    a column already present (a store this function already migrated, or
+    one created fresh with it already in ``_SCHEMA``) is simply skipped.
+    No exception guard is needed for that — declined hermes's own
+    concurrent-first-use ``sqlite3.OperationalError`` catch, since this
+    store's single-writer posture (spec.md's Non-goals) already excludes
+    the race it exists to survive. Runs any missing columns' ``ALTER
+    TABLE``s inside one ``write_txn`` — self-check caught that the
+    realistic first-run case (a store predating all three columns) would
+    otherwise cost three separate autocommitted DDL statements, three WAL
+    commits for one logical migration, where one does the job."""
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(conversations)")}
+    missing = [(name, ddl_type) for name, ddl_type in _MIGRATED_COLUMNS if name not in existing]
+    if not missing:
+        return
+    with write_txn(conn) as c:
+        for name, ddl_type in missing:
+            c.execute(f"ALTER TABLE conversations ADD COLUMN {name} {ddl_type}")
 
 
 @contextlib.contextmanager
@@ -159,6 +202,9 @@ def _conversation_row(conversation: Conversation, now: float) -> tuple:
         conversation.iteration_budget.used,
         remaining,
         conversation.next_child_seq,
+        conversation.stable_prompt_len,
+        conversation.context_state.total_prompt_tokens,
+        conversation.context_state.total_completion_tokens,
     )
 
 
@@ -248,15 +294,21 @@ def load(conn: sqlite3.Connection, key: ConversationKey, *, now: float) -> Conve
         next_turn_seq=row["next_turn_seq"],
         iteration_budget=IterationBudget(max_total=row["iteration_max_total"], used=row["iteration_used"]),
         wall_clock_budget=wall_clock_budget,
-        # CONTEXT's own state is never persisted (docs/tasks/C10-context-lifecycle/spec.md's
-        # requirement 7): a resumed conversation's running usage total
-        # restarts at zero, and the whole stored system prompt is treated
-        # as the cacheable prefix — always correct (nothing here makes
-        # system_prompt partially volatile after creation), just narrower
-        # than the cross-conversation-reuse boundary create_conversation()
-        # used, since the originating recipe isn't stored.
-        stable_prompt_len=len(row["system_prompt"]),
-        context_state=context.ContextState(),
+        # C12 (docs/tasks/C12-context-resume-round-trip): both of these are
+        # now genuinely persisted, not reset. ``stable_prompt_len`` only
+        # falls back to the full ``system_prompt`` length for a row written
+        # before this fix (``_migrate_columns`` leaves it ``NULL`` on an
+        # existing store rather than backfilling a guessed value) — the
+        # same too-wide boundary that row already had. ``context_state``
+        # needs no such fallback: ``_MIGRATED_COLUMNS``' ``DEFAULT 0``
+        # already matches the old reset-to-zero value exactly.
+        stable_prompt_len=(
+            row["stable_prompt_len"] if row["stable_prompt_len"] is not None else len(row["system_prompt"])
+        ),
+        context_state=context.ContextState(
+            total_prompt_tokens=row["context_total_prompt_tokens"],
+            total_completion_tokens=row["context_total_completion_tokens"],
+        ),
         next_child_seq=row["next_child_seq"],
     )
 
