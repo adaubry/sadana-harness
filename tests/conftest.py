@@ -8,6 +8,7 @@ has already learned to depend on the developer's machine.
 
 from __future__ import annotations
 
+import sqlite3
 import subprocess
 from pathlib import Path
 
@@ -27,6 +28,7 @@ from sadana.conversation import (
     build_surface,
     turn_prompt_hash,
 )
+from sadana.conversation_store import open_store, store_path_from_config
 
 
 @pytest.fixture(autouse=True)
@@ -184,3 +186,11 @@ def make_upstream_repo(tmp_path: Path, *, plugin_name: str = "greeter", tag: str
     run_git(["commit", "-q", "-m", "initial"], cwd=repo)
     run_git(["tag", tag], cwd=repo)
     return repo
+
+
+def open_conn() -> sqlite3.Connection:
+    """A fresh connection to this test's own isolated store — shared by
+    ``test_plugin_install.py`` and ``test_marketplace.py``, both of which
+    open and close a connection per test rather than across a whole
+    module."""
+    return open_store(store_path_from_config())

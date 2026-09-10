@@ -261,6 +261,41 @@ def test_validate_returns_unresolved_body_for_a_missing_function(tmp_path: Path)
 
 
 @pytest.mark.unit
+def test_validate_with_check_bodies_true_executes_init_py_at_import(tmp_path: Path) -> None:
+    """The default preserves today's behavior exactly — proven here by a
+    real, observable side effect (a sentinel file `init.py`'s own
+    top-level code writes), not just by trusting `Valid` came back."""
+    plugin_dir = _write_plugin(tmp_path)
+    sentinel = plugin_dir / "executed.marker"
+    (plugin_dir / "init.py").write_text(
+        (plugin_dir / "init.py").read_text() + f"\nopen({str(sentinel)!r}, 'w').close()\n"
+    )
+
+    outcome = validate(plugin_dir)
+
+    assert isinstance(outcome, Valid)
+    assert sentinel.exists()
+
+
+@pytest.mark.unit
+def test_validate_with_check_bodies_false_never_imports_init_py(tmp_path: Path) -> None:
+    """The one thing this parameter exists for
+    (`docs/tasks/PLUGIN-MARKET-01-submit-vet-and-browse-safely/spec.md`):
+    an untrusted plugin's own code must never run just to describe its
+    shape."""
+    plugin_dir = _write_plugin(tmp_path)
+    sentinel = plugin_dir / "executed.marker"
+    (plugin_dir / "init.py").write_text(
+        (plugin_dir / "init.py").read_text() + f"\nopen({str(sentinel)!r}, 'w').close()\n"
+    )
+
+    outcome = validate(plugin_dir, check_bodies=False)
+
+    assert isinstance(outcome, Valid)
+    assert not sentinel.exists()
+
+
+@pytest.mark.unit
 def test_validate_returns_unreachable_node_for_a_node_no_edge_reaches(tmp_path: Path) -> None:
     toml = _VALID_TOML + '\n[[node]]\nname = "orphan"\nkind = "stop"\n'
     plugin_dir = _write_plugin(tmp_path, toml=toml)

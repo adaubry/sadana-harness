@@ -13,8 +13,11 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import http.server
+import sys
 
 from sadana import (
+    channel_webhook,
     config,
     conversation_store,
     gateway_daemon,
@@ -61,6 +64,9 @@ def cmd_gateway_run(args: argparse.Namespace) -> int:
     host = args.host or config.env("SADANA_GATEWAY_HOST", "127.0.0.1")
     port = args.port or config.env_int("SADANA_GATEWAY_PORT", 8765)
     secret = config.env("SADANA_GATEWAY_WEBHOOK_SECRET", "")
+    if not secret:
+        print("SADANA_GATEWAY_WEBHOOK_SECRET is not set; refusing to start", file=sys.stderr)
+        return 1
 
     provider = config.env("SADANA_MODEL_ACCESS_PROVIDER", model_access.DEFAULT_PROVIDER)
     model = config.env("SADANA_MODEL_ACCESS_MODEL", model_access.DEFAULT_MODEL)
@@ -85,7 +91,10 @@ def cmd_gateway_run(args: argparse.Namespace) -> int:
             )
         )
 
-    return gateway_daemon.run(host=host, port=port, secret=secret, on_message=on_message)
+    def make_server() -> http.server.ThreadingHTTPServer:
+        return channel_webhook.make_server(host, port, secret=secret, on_message=on_message)
+
+    return gateway_daemon.run(make_server=make_server, lock_filename="gateway.lock")
 
 
 def cmd_gateway_install(args: argparse.Namespace) -> int:

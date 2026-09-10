@@ -52,6 +52,7 @@ WSL only. Python lives in `.venv`; `make` puts it on PATH for you, so there is n
 - A new persisted column on an existing SQLite table is added via an idempotent `PRAGMA table_info` + guarded `ALTER TABLE ... ADD COLUMN` check, never a backfill migration — a column with no safe default falls back to matching pre-fix behavior at read time, so legacy rows keep loading and self-correct only once genuinely rewritten.
 - An observability/recording write's failure is caught and logged, never raised to the caller of the run it is observing.
 - A derived/observability record's key reuses whatever unique key its producing call already minted — never invent a synthetic id where one already exists.
+- A check that can execute code as a side effect of validating it (e.g. importing a module to confirm a symbol exists) must offer a mode that never executes anything, and any caller handling input from a source it doesn't already trust uses that mode.
 
 ## Glossary
 

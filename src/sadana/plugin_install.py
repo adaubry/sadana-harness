@@ -119,6 +119,20 @@ class FetchFailed:
 InstallOutcome = Installed | UnknownPluginName | AlreadyInstalled | NameMismatch | TagMismatch | FetchFailed
 
 
+def describe_fetch_failure(outcome: TagMismatch | FetchFailed) -> str:
+    """A one-line, human-readable account of either failure — lives
+    beside the two types it describes so `install()`'s own CLI and
+    `marketplace.submit()`'s own CLI (PLUGIN-MARKET-01) report the exact
+    same wording for the exact same outcome, instead of each re-deriving
+    it."""
+    if isinstance(outcome, TagMismatch):
+        return (
+            f"tag {outcome.tag!r} resolved to {outcome.expected_revision}, "
+            f"but the clone checked out {outcome.actual_revision}"
+        )
+    return outcome.detail
+
+
 def _ensure_schema(conn: sqlite3.Connection) -> None:
     """Idempotent, the same `CREATE TABLE IF NOT EXISTS` posture
     `observability.make_recorder()` already takes on this same
@@ -197,9 +211,17 @@ def _resolve_tag_commit(repo_url: str, tag: str) -> str | None:
     isn't a tag there (including: doesn't exist, is only a branch, or the
     remote couldn't be reached at all — all the same "can't install this"
     outcome from the caller's side). Prefers the peeled `^{}` entry, an
-    annotated tag's real commit, over the tag object's own SHA."""
+    annotated tag's real commit, over the tag object's own SHA.
+
+    The `--` before `repo_url` is load-bearing, not stylistic: `repo_url`
+    is caller-supplied (PLUGIN-MARKET-01 routes it straight from an
+    anonymous submission), and without `--` a value starting with `-`
+    (e.g. `--upload-pack=<command>`) is parsed by git as an option, not a
+    repository — arbitrary command execution, independent of anything
+    `check_bodies` guards. `--` forces every argument after it to be
+    read literally."""
     try:
-        output = _git("ls-remote", repo_url, f"refs/tags/{tag}", f"refs/tags/{tag}^{{}}")
+        output = _git("ls-remote", "--", repo_url, f"refs/tags/{tag}", f"refs/tags/{tag}^{{}}")
     except _GitError:
         return None
     commit_by_ref: dict[str, str] = {}
@@ -214,6 +236,40 @@ def _resolve_tag_commit(repo_url: str, tag: str) -> str | None:
 
 def _head_revision(repo: Path) -> str:
     return _git("rev-parse", "HEAD", cwd=repo).strip()
+
+
+@dataclass(frozen=True)
+class FetchedTag:
+    """A tag fetched into `dest` and confirmed to be what it claims."""
+
+    directory: Path
+    revision: str
+
+
+def fetch_verified_tag(repo_url: str, tag: str, dest: Path) -> FetchedTag | TagMismatch | FetchFailed:
+    """Resolve `tag`'s real commit on `repo_url`, clone it into `dest`,
+    and confirm what got checked out really is that commit. `dest` must
+    not already exist; its parent must. The one place this project
+    fetches and verifies a tag — `install()` and
+    `marketplace.submit()` (PLUGIN-MARKET-01) both call this rather than
+    each re-deriving the same resolve→clone→verify sequence.
+
+    Same `--` reasoning as `_resolve_tag_commit()`: `repo_url` is
+    caller-supplied and must never be readable by git as an option."""
+    try:
+        expected_revision = _resolve_tag_commit(repo_url, tag)
+        if expected_revision is None:
+            return FetchFailed(detail=f"{tag!r} is not a tag on {repo_url!r}")
+
+        _git("clone", "--depth", "1", "--branch", tag, "--", repo_url, str(dest))
+
+        actual_revision = _head_revision(dest)
+        if actual_revision != expected_revision:
+            return TagMismatch(tag=tag, expected_revision=expected_revision, actual_revision=actual_revision)
+
+        return FetchedTag(directory=dest, revision=actual_revision)
+    except _GitError as exc:
+        return FetchFailed(detail=str(exc))
 
 
 def install(
@@ -239,43 +295,34 @@ def install(
     if target.exists() and not replace:
         return AlreadyInstalled(name=name)
 
-    try:
-        expected_revision = _resolve_tag_commit(repo_url, tag)
-        if expected_revision is None:
-            return FetchFailed(detail=f"{tag!r} is not a tag on {repo_url!r}")
+    plugins_root.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix=".install-", dir=plugins_root) as tmp:
+        tmp_clone = Path(tmp) / "plugin"
+        fetched = fetch_verified_tag(repo_url, tag, tmp_clone)
+        if isinstance(fetched, TagMismatch | FetchFailed):
+            return fetched
 
-        plugins_root.mkdir(parents=True, exist_ok=True)
-        with tempfile.TemporaryDirectory(prefix=".install-", dir=plugins_root) as tmp:
-            tmp_clone = Path(tmp) / "plugin"
-            _git("clone", "--depth", "1", "--branch", tag, repo_url, str(tmp_clone))
+        manifest_path = fetched.directory / "plugin.toml"
+        try:
+            manifest = plugins._parse_manifest(manifest_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            return FetchFailed(detail=f"plugin.toml is invalid: {exc}")
+        if manifest.name != name:
+            return NameMismatch(expected=name, found=manifest.name)
 
-            actual_revision = _head_revision(tmp_clone)
-            if actual_revision != expected_revision:
-                return TagMismatch(tag=tag, expected_revision=expected_revision, actual_revision=actual_revision)
+        backup = Path(tmp) / "previous-plugin"
+        replaced_existing = target.exists()
+        moved_existing_aside = False
+        try:
+            if replaced_existing:
+                os.replace(target, backup)
+                moved_existing_aside = True
+            os.replace(fetched.directory, target)
+        except OSError as exc:
+            if moved_existing_aside:
+                if target.exists():
+                    shutil.rmtree(target, ignore_errors=True)
+                os.replace(backup, target)
+            return FetchFailed(detail=f"could not place plugin: {exc}")
 
-            manifest_path = tmp_clone / "plugin.toml"
-            try:
-                manifest = plugins._parse_manifest(manifest_path.read_text(encoding="utf-8"))
-            except Exception as exc:
-                return FetchFailed(detail=f"plugin.toml is invalid: {exc}")
-            if manifest.name != name:
-                return NameMismatch(expected=name, found=manifest.name)
-
-            backup = Path(tmp) / "previous-plugin"
-            replaced_existing = target.exists()
-            moved_existing_aside = False
-            try:
-                if replaced_existing:
-                    os.replace(target, backup)
-                    moved_existing_aside = True
-                os.replace(tmp_clone, target)
-            except OSError as exc:
-                if moved_existing_aside:
-                    if target.exists():
-                        shutil.rmtree(target, ignore_errors=True)
-                    os.replace(backup, target)
-                return FetchFailed(detail=f"could not place plugin: {exc}")
-
-        return Installed(name=name, directory=target, revision=actual_revision)
-    except _GitError as exc:
-        return FetchFailed(detail=str(exc))
+    return Installed(name=name, directory=target, revision=fetched.revision)

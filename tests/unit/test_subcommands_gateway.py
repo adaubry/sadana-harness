@@ -12,6 +12,7 @@ import argparse
 
 import pytest
 
+from sadana import gateway_daemon
 from sadana.subcommands.gateway import (
     build_gateway_parser,
     cmd_gateway_install,
@@ -21,6 +22,28 @@ from sadana.subcommands.gateway import (
     cmd_gateway_status,
     cmd_gateway_stop,
 )
+
+
+@pytest.mark.unit
+def test_cmd_gateway_run_refuses_to_start_when_secret_is_unset(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Migrated from `test_gateway_daemon.py` (PLUGIN-MARKET-01): this
+    check moved from `gateway_daemon.run()` into its one caller, since the
+    daemon's own generic lifecycle has no business knowing what a
+    "secret" is. `gateway_daemon.run` is monkeypatched to fail the test
+    outright if reached, proving the guard fires first."""
+    monkeypatch.delenv("SADANA_GATEWAY_WEBHOOK_SECRET", raising=False)
+
+    def _fail_if_reached(**_kwargs: object) -> int:
+        raise AssertionError("gateway_daemon.run should not have been reached")
+
+    monkeypatch.setattr(gateway_daemon, "run", _fail_if_reached)
+
+    result = cmd_gateway_run(argparse.Namespace(host=None, port=None))
+
+    assert result == 1
+    assert "SADANA_GATEWAY_WEBHOOK_SECRET" in capsys.readouterr().err
 
 
 @pytest.mark.unit

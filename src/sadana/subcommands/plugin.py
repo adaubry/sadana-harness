@@ -66,12 +66,6 @@ def cmd_plugin_install(args: argparse.Namespace) -> int:
         case plugin_install.NameMismatch(expected=expected, found=found):
             print(f"error: plugin.toml declares {found!r}, expected {expected!r}", file=sys.stderr)
             return 1
-        case plugin_install.TagMismatch(tag=tag, expected_revision=expected_revision, actual_revision=actual_revision):
-            print(
-                f"error: tag {tag!r} resolved to {expected_revision}, but the clone checked out {actual_revision}",
-                file=sys.stderr,
-            )
-            return 1
-        case plugin_install.FetchFailed(detail=detail):
-            print(f"error: {detail}", file=sys.stderr)
+        case plugin_install.TagMismatch() | plugin_install.FetchFailed():
+            print(f"error: {plugin_install.describe_fetch_failure(outcome)}", file=sys.stderr)
             return 1

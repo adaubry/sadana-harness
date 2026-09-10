@@ -189,6 +189,35 @@ class Manifest:
     nodes: tuple[Node, ...]
 
 
+def manifest_to_dict(manifest: Manifest) -> dict[str, object]:
+    """``manifest`` as JSON-safe primitives — the plugin's own declared
+    name, version, description, entries and node graph, exactly as
+    `plugin_blueprint.md §3.5` describes ("boxes and arrows... displayable
+    without executing the plugin"). A direct field walk, not a new
+    vocabulary: a `Manifest` already is that data, so this is the whole
+    function."""
+    return {
+        "name": manifest.name,
+        "version": manifest.version,
+        "description": manifest.description,
+        "entries": [
+            {"tool": e.tool, "purpose": e.purpose, "parameters": e.parameters, "start": e.start}
+            for e in manifest.entries
+        ],
+        "nodes": [
+            {
+                "name": n.name,
+                "kind": n.kind,
+                "body": n.body,
+                "skill": n.skill,
+                "next": n.next,
+                "ports": list(n.ports),
+            }
+            for n in manifest.nodes
+        ],
+    }
+
+
 @dataclass(frozen=True)
 class Valid:
     """``plugin.toml`` parsed and every `§8` check held."""
@@ -282,6 +311,33 @@ ManifestOutcome = (
     | UnreachableNode
     | CyclicGraph
 )
+
+
+def describe_manifest_outcome(outcome: ManifestOutcome) -> str:
+    """A one-line, human-readable account of any non-`Valid`
+    `ManifestOutcome` — lives beside the type family it describes rather
+    than at whichever caller first needed prose for it (PLUGIN-MARKET-01's
+    own reviewer/creator-facing rejection reason), so a second future
+    caller needing the same words doesn't re-derive this match."""
+    match outcome:
+        case ManifestParseError(detail=detail):
+            return f"plugin.toml does not parse: {detail}"
+        case InvalidSchema(entry=entry, path=path, detail=detail):
+            return f"entry {entry!r}'s schema at {path} is invalid: {detail}"
+        case UnresolvedSkill(node=node, detail=detail):
+            return f"node {node!r}: {detail}"
+        case DuplicateNodeName(name=name):
+            return f"duplicate node name {name!r}"
+        case DanglingTarget(node=node, target=target):
+            return f"node {node!r} targets undeclared node {target!r}"
+        case UnresolvedBody(node=node, body=body):
+            return f"node {node!r}'s body {body!r} does not resolve"
+        case UnreachableNode(node=node):
+            return f"node {node!r} is never reached from any entry"
+        case CyclicGraph(node=node):
+            return f"the graph cycles back through node {node!r}"
+        case _:  # pragma: no cover - Valid has no rejection reason; ManifestOutcome is exhausted above
+            return "plugin.toml does not validate"
 
 
 def _parse_manifest(text: str) -> Manifest:

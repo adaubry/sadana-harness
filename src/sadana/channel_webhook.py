@@ -21,7 +21,7 @@ import json
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 
-from sadana.gateway import MessageEvent
+from sadana.gateway import MessageEvent, header_value
 
 _PATH = "/webhook"
 _SECRET_HEADER = "X-Sadana-Webhook-Secret"  # pragma: allowlist secret - a header name, not a secret value
@@ -39,24 +39,10 @@ class WebhookBadRequest:
     detail: str
 
 
-def _header(headers: Mapping[str, str], name: str) -> str:
-    """HTTP header names are case-insensitive (RFC 7230 §3.2); a plain
-    `Mapping[str, str]` is not. `channel_webhook.make_server()`'s real caller
-    hands this function `dict(self.headers)`, which preserves whatever
-    casing arrived on the wire — a `Mapping.get()` alone would silently
-    reject a correct secret sent under different casing than this repo's own
-    tests happen to use."""
-    lowered = name.lower()
-    for key, value in headers.items():
-        if key.lower() == lowered:
-            return value
-    return ""
-
-
 def parse_webhook_request(
     body: bytes, headers: Mapping[str, str], *, secret: str
 ) -> MessageEvent | WebhookUnauthorized | WebhookBadRequest:
-    given = _header(headers, _SECRET_HEADER)
+    given = header_value(headers, _SECRET_HEADER)
     if not hmac.compare_digest(given, secret):
         return WebhookUnauthorized()
 

@@ -17,6 +17,7 @@ conversation.py" rule for no behavioral gain.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 
 
@@ -43,3 +44,16 @@ def session_key_for(event: MessageEvent) -> str:
     if event.thread_id is not None:
         return f"{event.platform}:{event.chat_id}:{event.thread_id}"
     return f"{event.platform}:{event.chat_id}"
+
+
+def header_value(headers: Mapping[str, str], name: str) -> str:
+    """HTTP header names are case-insensitive (RFC 7230 §3.2); a plain
+    `Mapping[str, str]` is not. Shared by every channel adapter that reads
+    an incoming webhook's headers (`channel_webhook.py`,
+    `marketplace_webhook.py`, PLUGIN-MARKET-01) rather than each keeping
+    its own copy — moved here once a second real caller existed."""
+    lowered = name.lower()
+    for key, value in headers.items():
+        if key.lower() == lowered:
+            return value
+    return ""

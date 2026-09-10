@@ -1,4 +1,5 @@
-"""Tests for sadana.plugin_install: register(), resolve(), install()."""
+"""Tests for sadana.plugin_install: register(), resolve(), install(),
+fetch_verified_tag()."""
 
 from __future__ import annotations
 
@@ -8,9 +9,9 @@ from pathlib import Path
 import pytest
 
 from conftest import make_upstream_repo as _make_upstream_repo
+from conftest import open_conn as _conn
 from conftest import run_git as _run_git
 from sadana import plugin_install, plugin_manifest
-from sadana.conversation_store import open_store, store_path_from_config
 
 
 def _retag(repo: Path, *, plugin_name: str, tag: str, content: str) -> None:
@@ -22,10 +23,6 @@ def _retag(repo: Path, *, plugin_name: str, tag: str, content: str) -> None:
     _run_git(["add", "."], cwd=repo)
     _run_git(["commit", "-q", "-m", "update"], cwd=repo)
     _run_git(["tag", "-f", tag], cwd=repo)
-
-
-def _conn():
-    return open_store(store_path_from_config())
 
 
 @pytest.mark.unit
@@ -58,6 +55,68 @@ def test_resolve_unknown_name_returns_none() -> None:
         assert plugin_install.resolve(conn, "does-not-exist") is None
     finally:
         conn.close()
+
+
+@pytest.mark.unit
+def test_fetch_verified_tag_clones_into_dest_and_reports_the_revision(tmp_path: Path) -> None:
+    repo = _make_upstream_repo(tmp_path, plugin_name="greeter", tag="v1.0.0")
+    dest = tmp_path / "clone"
+
+    outcome = plugin_install.fetch_verified_tag(str(repo), "v1.0.0", dest)
+
+    assert isinstance(outcome, plugin_install.FetchedTag)
+    assert outcome.directory == dest
+    assert (dest / "plugin.toml").is_file()
+
+
+@pytest.mark.unit
+def test_fetch_verified_tag_unknown_tag_is_fetch_failed(tmp_path: Path) -> None:
+    repo = _make_upstream_repo(tmp_path, plugin_name="greeter", tag="v1.0.0")
+    outcome = plugin_install.fetch_verified_tag(str(repo), "no-such-tag", tmp_path / "clone")
+    assert isinstance(outcome, plugin_install.FetchFailed)
+
+
+@pytest.mark.unit
+def test_fetch_verified_tag_a_repo_url_starting_with_dash_is_never_read_as_a_git_option(tmp_path: Path) -> None:
+    """A caller-supplied `repo_url` reaching `git` as a bare positional
+    let a value like `--upload-pack=<command>` be parsed as an option
+    instead of a repository, running `<command>` for real — reproduced
+    live during PLUGIN-MARKET-01's cold review. The `--` separator in
+    `fetch_verified_tag()`/`_resolve_tag_commit()` is the fix; this test
+    proves the sentinel command genuinely never runs, not just that the
+    outcome type looks like a normal failure."""
+    sentinel = tmp_path / "should-not-exist"
+    malicious_repo_url = f"--upload-pack=touch {sentinel}; #"
+
+    outcome = plugin_install.fetch_verified_tag(malicious_repo_url, "v1.0.0", tmp_path / "clone")
+
+    assert isinstance(outcome, plugin_install.FetchFailed)
+    assert not sentinel.exists()
+
+
+@pytest.mark.unit
+def test_fetch_verified_tag_mismatch_when_remote_disagrees(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    repo = _make_upstream_repo(tmp_path, plugin_name="greeter", tag="v1.0.0")
+    monkeypatch.setattr(plugin_install, "_resolve_tag_commit", lambda repo_url, tag: "0" * 40)
+
+    outcome = plugin_install.fetch_verified_tag(str(repo), "v1.0.0", tmp_path / "clone")
+
+    assert isinstance(outcome, plugin_install.TagMismatch)
+    assert outcome.expected_revision == "0" * 40
+
+
+@pytest.mark.unit
+def test_describe_fetch_failure_names_both_revisions_for_a_mismatch() -> None:
+    outcome = plugin_install.TagMismatch(tag="v1.0.0", expected_revision="a" * 40, actual_revision="b" * 40)
+    description = plugin_install.describe_fetch_failure(outcome)
+    assert "a" * 40 in description
+    assert "b" * 40 in description
+
+
+@pytest.mark.unit
+def test_describe_fetch_failure_passes_through_a_fetch_failed_detail() -> None:
+    outcome = plugin_install.FetchFailed(detail="git is not installed or not in PATH")
+    assert plugin_install.describe_fetch_failure(outcome) == "git is not installed or not in PATH"
 
 
 @pytest.mark.unit

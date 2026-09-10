@@ -25,6 +25,8 @@ from sadana.plugins import (
     UnresolvedBody,
     UnresolvedSkill,
     Valid,
+    describe_manifest_outcome,
+    manifest_to_dict,
 )
 
 # ── Artifact ─────────────────────────────────────────────────────────────
@@ -181,6 +183,60 @@ def test_manifest_is_frozen() -> None:
         manifest.name = "changed"  # type: ignore[misc]
 
 
+# ── manifest_to_dict ─────────────────────────────────────────────────────
+
+
+@pytest.mark.unit
+def test_manifest_to_dict_round_trips_every_field_as_json_safe_primitives() -> None:
+    entries = (Entry(tool="do_thing", purpose="p", parameters="s.json", start="fetch"),)
+    nodes = (
+        Node(name="fetch", kind="compute", body="init:fetch_record", next="route_on_kind"),
+        Node(name="route_on_kind", kind="route", body="init:classify", ports=("urgent", "normal")),
+    )
+    manifest = Manifest(
+        name="example-plugin", version="0.3.1", description="One sentence.", entries=entries, nodes=nodes
+    )
+
+    result = manifest_to_dict(manifest)
+
+    assert result == {
+        "name": "example-plugin",
+        "version": "0.3.1",
+        "description": "One sentence.",
+        "entries": [{"tool": "do_thing", "purpose": "p", "parameters": "s.json", "start": "fetch"}],
+        "nodes": [
+            {
+                "name": "fetch",
+                "kind": "compute",
+                "body": "init:fetch_record",
+                "skill": None,
+                "next": "route_on_kind",
+                "ports": [],
+            },
+            {
+                "name": "route_on_kind",
+                "kind": "route",
+                "body": "init:classify",
+                "skill": None,
+                "next": None,
+                "ports": ["urgent", "normal"],
+            },
+        ],
+    }
+
+
+@pytest.mark.unit
+def test_manifest_to_dict_handles_no_entries_and_no_nodes() -> None:
+    manifest = Manifest(name="p", version="0.1.0", description="d", entries=(), nodes=())
+    assert manifest_to_dict(manifest) == {
+        "name": "p",
+        "version": "0.1.0",
+        "description": "d",
+        "entries": [],
+        "nodes": [],
+    }
+
+
 # ── ManifestOutcome ──────────────────────────────────────────────────────
 
 
@@ -238,6 +294,25 @@ def test_unreachable_node_carries_the_node() -> None:
 @pytest.mark.unit
 def test_cyclic_graph_carries_a_node_on_the_cycle() -> None:
     assert CyclicGraph(node="a").node == "a"
+
+
+# ── describe_manifest_outcome ────────────────────────────────────────────
+
+
+@pytest.mark.unit
+def test_describe_manifest_outcome_names_the_actual_problem_for_every_variant() -> None:
+    cases = [
+        (ManifestParseError(detail="bad toml"), "bad toml"),
+        (InvalidSchema(entry="do_thing", path="s.json", detail="not an object"), "do_thing"),
+        (UnresolvedSkill(node="interpret", detail="no SKILL.md"), "interpret"),
+        (DuplicateNodeName(name="fetch"), "fetch"),
+        (DanglingTarget(node="fetch", target="nope"), "nope"),
+        (UnresolvedBody(node="fetch", body="init:missing"), "init:missing"),
+        (UnreachableNode(node="orphan"), "orphan"),
+        (CyclicGraph(node="a"), "a"),
+    ]
+    for outcome, expected_substring in cases:
+        assert expected_substring in describe_manifest_outcome(outcome)
 
 
 # ── InstalledPlugin ──────────────────────────────────────────────────────

@@ -132,7 +132,7 @@ def _check_body(
     return None
 
 
-def validate(plugin_dir: Path) -> plugins.ManifestOutcome:
+def validate(plugin_dir: Path, *, check_bodies: bool = True) -> plugins.ManifestOutcome:
     """Read ``plugin_dir``'s own ``plugin.toml`` and run the `§8` checks
     against it, in order, stopping at the first failure — the original
     seven, plus an eighth added at D3's own Deploy-stage review:
@@ -141,7 +141,20 @@ def validate(plugin_dir: Path) -> plugins.ManifestOutcome:
     a graph that loops back on itself has no other way to be caught before
     it makes a walk run forever. Runs no step of the plugin's declared
     sequence — a ``body`` reference is only imported far enough to confirm
-    the named function exists."""
+    the named function exists.
+
+    ``check_bodies=False`` skips that one step. It is the only step that
+    imports and executes ``plugin_dir``'s own code
+    (``_load_body_module()``): safe for this function's original caller,
+    ``discover_plugins()``, which only ever scans plugins already sitting
+    under ``_plugins_root()`` — already fetched, already first-party by
+    this project's current posture (`plugin_blueprint.md` §10 Risk 1).
+    Unsafe for anything nobody has reviewed yet. CLAUDE.md: "A check that
+    can execute code as a side effect of validating it... must offer a
+    mode that never executes anything, and any caller handling input from
+    a source it doesn't already trust uses that mode" —
+    `docs/tasks/PLUGIN-MARKET-01-submit-vet-and-browse-safely/spec.md`'s
+    own reason for this parameter existing at all."""
     manifest_path = plugin_dir / "plugin.toml"
     if not manifest_path.exists():
         return plugins.ManifestParseError(detail=f"no plugin.toml at {manifest_path}")
@@ -178,12 +191,13 @@ def validate(plugin_dir: Path) -> plugins.ManifestOutcome:
             if port not in seen:
                 return plugins.DanglingTarget(node=node.name, target=port)
 
-    modules: dict[str, ModuleType | None] = {}
-    for node in manifest.nodes:
-        if node.body is not None:
-            body_outcome = _check_body(plugin_dir, node, node.body, modules)
-            if body_outcome is not None:
-                return body_outcome
+    if check_bodies:
+        modules: dict[str, ModuleType | None] = {}
+        for node in manifest.nodes:
+            if node.body is not None:
+                body_outcome = _check_body(plugin_dir, node, node.body, modules)
+                if body_outcome is not None:
+                    return body_outcome
 
     unreachable = plugins._first_unreachable(manifest)
     if unreachable is not None:
