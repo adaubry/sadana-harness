@@ -1,0 +1,15 @@
+[plugin]
+name = "memory"
+version = "0.1.0"
+description = "Remembers a durable fact or decision about the person in this conversation."
+
+[[entry]]
+tool = "memory.remember"
+purpose = "Call this when you notice something worth keeping about this person for later conversations."
+parameters = "schema/remember.json"
+start = "write"
+
+[[node]]
+name = "write"
+kind = "call"
+body = "init:write_entry"

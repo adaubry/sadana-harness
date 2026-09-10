@@ -18,6 +18,7 @@ from sadana.subcommands.chat import build_chat_parser
 from sadana.subcommands.conversations import build_conversations_parser
 from sadana.subcommands.gateway import build_gateway_parser
 from sadana.subcommands.marketplace import build_marketplace_parser
+from sadana.subcommands.memory import build_memory_parser
 from sadana.subcommands.plugin import build_plugin_parser
 from sadana.subcommands.runs import build_runs_parser
 from sadana.subcommands.setup import build_setup_parser
@@ -31,6 +32,7 @@ def build_parser() -> argparse.ArgumentParser:
     build_chat_parser(subparsers)
     build_gateway_parser(subparsers)
     build_marketplace_parser(subparsers)
+    build_memory_parser(subparsers)
     build_plugin_parser(subparsers)
     build_runs_parser(subparsers)
     build_setup_parser(subparsers)

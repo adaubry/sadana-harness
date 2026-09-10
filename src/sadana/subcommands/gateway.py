@@ -23,10 +23,12 @@ from sadana import (
     gateway_daemon,
     gateway_dispatch,
     gateway_service,
+    memory_store,
     model_access,
     observability,
     plugin_dispatch,
     plugin_manifest,
+    plugins,
 )
 from sadana.gateway import MessageEvent
 from sadana.persona import load_or_seed_persona, persona_path_from_config
@@ -71,8 +73,10 @@ def cmd_gateway_run(args: argparse.Namespace) -> int:
     provider = config.env("SADANA_MODEL_ACCESS_PROVIDER", model_access.DEFAULT_PROVIDER)
     model = config.env("SADANA_MODEL_ACCESS_MODEL", model_access.DEFAULT_MODEL)
     persona = load_or_seed_persona(persona_path_from_config())
+    memory_store.ensure_plugin_seeded(plugins._plugins_root())
     plugin_set = plugin_dispatch.build_plugin_set(plugin_manifest.discover_plugins())
     conn = conversation_store.open_store(conversation_store.store_path_from_config())
+    memory_store.ensure_schema(conn)  # once, not per message — handle_inbound assumes this already ran
     recorder = observability.make_recorder(conn)  # built once; handle_inbound reuses it every inbound message
 
     # gateway_dispatch.handle_inbound() serializes its own conn access

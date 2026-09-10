@@ -17,7 +17,17 @@ import sys
 import time
 from contextlib import closing
 
-from sadana import config, conversation_store, model_access, observability, plugin_dispatch, plugin_manifest
+from sadana import (
+    config,
+    conversation_store,
+    memory,
+    memory_store,
+    model_access,
+    observability,
+    plugin_dispatch,
+    plugin_manifest,
+    plugins,
+)
 from sadana.conversation import (
     Conversation,
     ConversationTemplate,
@@ -37,6 +47,7 @@ def build_chat_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentPa
     target.add_argument("--key", metavar="NAME", help="name a new conversation; a name is generated if omitted")
     parser.add_argument("--provider", help="override the configured default provider for this run")
     parser.add_argument("--model", help="override the configured default model for this run")
+    parser.add_argument("--account", help="the person this conversation remembers things about")
     parser.set_defaults(func=cmd_chat)
 
 
@@ -48,6 +59,7 @@ async def _chat_loop(
     persona: str,
     provider: str,
     model: str,
+    account_key: memory.AccountKey,
 ) -> int:
     recorder = observability.make_recorder(conn)
     while True:
@@ -67,6 +79,7 @@ async def _chat_loop(
             now=now,
             record_turn=recorder.record_turn,
             record_plugin_run=recorder.record_plugin_run,
+            memory_context=memory_store.DispatchContext(account_key=account_key, conn=conn),
         )
         persist = conversation_store.bind_persist(conn, conversation, now=now)
         result, conversation = await plugin_dispatch.take_turn_and_reconcile(
@@ -97,10 +110,13 @@ async def _chat_loop(
 def cmd_chat(args: argparse.Namespace) -> int:
     provider = args.provider or config.env("SADANA_MODEL_ACCESS_PROVIDER", model_access.DEFAULT_PROVIDER)
     model = args.model or config.env("SADANA_MODEL_ACCESS_MODEL", model_access.DEFAULT_MODEL)
+    account_key = args.account or config.env("SADANA_MEMORY_ACCOUNT", "local")
 
     persona = load_or_seed_persona(persona_path_from_config())
+    memory_store.ensure_plugin_seeded(plugins._plugins_root())
     plugin_set = plugin_dispatch.build_plugin_set(plugin_manifest.discover_plugins())
     with closing(conversation_store.open_store(conversation_store.store_path_from_config())) as conn:
+        memory_store.ensure_schema(conn)
         now = time.monotonic()
         if args.resume:
             conversation = conversation_store.load(conn, args.resume, now=now)
@@ -112,10 +128,13 @@ def cmd_chat(args: argparse.Namespace) -> int:
                     stable_prompt=persona, catalog=plugin_set.catalog, tool_specs=plugin_set.tool_specs
                 ),
             )
+            entries = memory_store.list_entries(conn, account_key)
+            override = memory_store.get_rubric_override(conn, account_key)
+            system_message = memory.system_message_for(entries, memory.default_rubric(), override)
             conversation, _template = create_conversation(
                 template,
                 key,
-                system_message="",
+                system_message=system_message,
                 iteration_budget=iteration_budget_from_config(),
                 wall_clock_budget=wall_clock_budget_from_config(now),
             )
@@ -123,7 +142,15 @@ def cmd_chat(args: argparse.Namespace) -> int:
 
         try:
             return asyncio.run(
-                _chat_loop(conn, conversation, plugin_set=plugin_set, persona=persona, provider=provider, model=model)
+                _chat_loop(
+                    conn,
+                    conversation,
+                    plugin_set=plugin_set,
+                    persona=persona,
+                    provider=provider,
+                    model=model,
+                    account_key=account_key,
+                )
             )
         except KeyboardInterrupt:
             print()

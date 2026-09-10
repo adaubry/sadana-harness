@@ -1,0 +1,15 @@
+{
+  "type": "object",
+  "properties": {
+    "entry_key": {
+      "type": "string",
+      "description": "A short, stable slug for this fact, e.g. \"dog_name\"."
+    },
+    "content": {
+      "type": "string",
+      "description": "The fact or decision to remember, in plain prose."
+    }
+  },
+  "required": ["entry_key", "content"],
+  "additionalProperties": false
+}

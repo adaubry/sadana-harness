@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pytest
 
+from conftest import open_conn
 from sadana import context, model_access, plugin_dispatch
 from sadana.conversation import (
     Conversation,
@@ -24,6 +25,7 @@ from sadana.conversation import (
     build_surface,
     create_conversation,
 )
+from sadana.memory_store import DispatchContext
 from sadana.plugin_dispatch import ChildSeqTracker, PluginSet, build_dispatch, build_plugin_set, take_turn_and_reconcile
 from sadana.plugins import Entry, InstalledPlugin, Manifest, Node
 
@@ -448,3 +450,72 @@ def test_build_dispatch_threads_a_given_approve_to_run_graph(tmp_path: Path) -> 
     assert result.failed_node is None
     assert result.text == json.dumps({"reached": {"a": 1}})
     assert seen == [("p", "call_step")]
+
+
+def _account_reporting_plugin_set(tmp_path: Path) -> PluginSet:
+    """A `call` node whose body reports only the account key it saw on
+    `_sadana_memory_ctx` — never the raw value — so a `DispatchContext`
+    (not JSON-serializable) never has to survive into `run_graph`'s own
+    final `_coerce_text` call."""
+    plugin_dir = tmp_path / "p"
+    plugin_dir.mkdir()
+    plugin_dir.joinpath("init.py").write_text(
+        "def report(value):\n"
+        "    ctx = value.get('_sadana_memory_ctx')\n"
+        "    return {'saw_account': getattr(ctx, 'account_key', None)}\n"
+    )
+    manifest = Manifest(
+        name="p",
+        version="0.1.0",
+        description="d",
+        entries=(Entry(tool="do_it", purpose="p", parameters="s.json", start="call_step"),),
+        nodes=(Node(name="call_step", kind="call", body="init:report"),),
+    )
+    installed = InstalledPlugin(name="p", directory=plugin_dir, manifest=manifest)
+    return PluginSet(catalog=(), tool_specs=(), by_tool={"do_it": (installed, manifest.entries[0])})
+
+
+@pytest.mark.unit
+def test_build_dispatch_memory_context_wins_over_a_model_supplied_value(tmp_path: Path) -> None:
+    """MEMORY-01: `_sadana_memory_ctx` is merged into `arguments` *last*, so
+    a model that happened to supply its own value under that key can never
+    make a node body see anything but the trusted context."""
+    plugin_set = _account_reporting_plugin_set(tmp_path)
+    conn = open_conn()
+    trusted = DispatchContext(account_key="real-account", conn=conn)
+
+    async def approve_ok(_plugin: str, _node: str, _value: object) -> bool:
+        return True
+
+    dispatch, _tracker = build_dispatch(
+        _conversation(),
+        plugin_set,
+        stable_prompt="",
+        provider="p",
+        model="m",
+        now=0.0,
+        approve=approve_ok,
+        memory_context=trusted,
+    )
+    result = asyncio.run(dispatch("do_it", {"_sadana_memory_ctx": "attacker-supplied"}))
+
+    assert result.failed_node is None
+    assert result.text == json.dumps({"saw_account": "real-account"})
+
+
+@pytest.mark.unit
+def test_build_dispatch_memory_context_none_leaves_arguments_unchanged(tmp_path: Path) -> None:
+    """`memory_context` defaults to `None` — a caller that never passes it
+    gets exactly today's behavior, with no `_sadana_memory_ctx` key at all."""
+    plugin_set = _one_call_node_plugin_set(tmp_path)
+
+    async def approve_ok(_plugin: str, _node: str, _value: object) -> bool:
+        return True
+
+    dispatch, _tracker = build_dispatch(
+        _conversation(), plugin_set, stable_prompt="", provider="p", model="m", now=0.0, approve=approve_ok
+    )
+    result = asyncio.run(dispatch("do_it", {"a": 1}))
+
+    assert result.failed_node is None
+    assert result.text == json.dumps({"reached": {"a": 1}})

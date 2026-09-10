@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import argparse
+import shutil
+from pathlib import Path
 
 import pytest
 
 from conftest import conversation as _build_conversation
 from conftest import plain_response, tool_call_response
-from sadana import model_access
+from sadana import memory_store, model_access
 from sadana.conversation import Conversation
 from sadana.conversation_store import ConversationNotFound, create, load, open_store, store_path_from_config
 from sadana.persona import persona_path_from_config
@@ -16,7 +18,7 @@ from sadana.subcommands.chat import build_chat_parser, cmd_chat
 
 
 def _args(**overrides: object) -> argparse.Namespace:
-    defaults: dict[str, object] = {"resume": None, "key": None, "provider": None, "model": None}
+    defaults: dict[str, object] = {"resume": None, "key": None, "provider": None, "model": None, "account": None}
     defaults.update(overrides)
     return argparse.Namespace(**defaults)
 
@@ -177,8 +179,14 @@ def test_cmd_chat_resume_keeps_original_persona_after_a_later_edit(monkeypatch: 
 
 
 @pytest.mark.unit
-def test_cmd_chat_declined_approval_stops_the_call_node_safely(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("SADANA_PLUGINS_DIR", "tests/fixtures/plugins")
+def test_cmd_chat_declined_approval_stops_the_call_node_safely(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    # A copy, not the repo's own `tests/fixtures/plugins` in place: MEMORY-01's
+    # `cmd_chat` now seeds a `memory` plugin directory under whatever
+    # `SADANA_PLUGINS_DIR` resolves to, and this is the one test that ever
+    # pointed that env var at a real, tracked repository path.
+    plugins_root = tmp_path / "plugins"
+    shutil.copytree("tests/fixtures/plugins", plugins_root)
+    monkeypatch.setenv("SADANA_PLUGINS_DIR", str(plugins_root))
     responses = iter([tool_call_response("plugin_a_entry"), plain_response("ok, noted")])
     monkeypatch.setattr(model_access, "send", lambda request: next(responses))
     _feed(monkeypatch, "please call plugin_a_entry", "n")  # 2nd input() is the approval prompt
@@ -187,3 +195,36 @@ def test_cmd_chat_declined_approval_stops_the_call_node_safely(monkeypatch: pyte
 
     loaded = _load("approval-test")
     assert loaded.next_turn_seq == 1  # the turn still completed; the call node just didn't run
+
+
+# ── cmd_chat: MEMORY-01 recall folded into a new conversation's prompt ──
+
+
+@pytest.mark.unit
+def test_cmd_chat_new_conversation_recalls_the_given_accounts_memories(monkeypatch: pytest.MonkeyPatch) -> None:
+    conn = open_store(store_path_from_config())
+    try:
+        memory_store.ensure_schema(conn)
+        memory_store.write_entry(conn, "a1", "dog_name", "Their dog is named Buddy.", now=0.0)
+    finally:
+        conn.close()
+    _feed(monkeypatch)  # immediate EOF; only conversation creation matters here
+
+    assert cmd_chat(_args(key="recall-test", account="a1")) == 0
+
+    assert "Their dog is named Buddy." in _load("recall-test").system_prompt
+
+
+@pytest.mark.unit
+def test_cmd_chat_new_conversation_never_recalls_a_different_accounts_memories(monkeypatch: pytest.MonkeyPatch) -> None:
+    conn = open_store(store_path_from_config())
+    try:
+        memory_store.ensure_schema(conn)
+        memory_store.write_entry(conn, "a1", "dog_name", "Their dog is named Buddy.", now=0.0)
+    finally:
+        conn.close()
+    _feed(monkeypatch)
+
+    assert cmd_chat(_args(key="other-account-test", account="a2")) == 0
+
+    assert "Their dog is named Buddy." not in _load("other-account-test").system_prompt

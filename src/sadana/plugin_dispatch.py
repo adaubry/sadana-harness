@@ -13,7 +13,7 @@ import json
 from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass, replace
 
-from sadana import observability, plugin_manifest, plugins
+from sadana import memory_store, observability, plugin_manifest, plugins
 from sadana.conversation import (
     ChildSpec,
     Conversation,
@@ -132,6 +132,7 @@ def build_dispatch(
     approve: plugins.ApproveFn = plugin_manifest._default_approve,
     record_turn: observability.RecordTurnFn = observability.noop_record,
     record_plugin_run: observability.RecordPluginRunFn = observability.noop_record,
+    memory_context: memory_store.DispatchContext | None = None,
 ) -> tuple[DispatchFn, ChildSeqTracker]:
     """Builds one dispatch closure matching `conversation.py`'s own
     `dispatch` contract exactly, and the `ChildSeqTracker` it shares with
@@ -166,7 +167,16 @@ def build_dispatch(
     plus a closure-local `seq_in_turn` (fresh per `build_dispatch` call,
     never shared across turns — the same posture `ChildSeqTracker` and
     `capturing_dispatch`'s own `captured` list already take). Both default
-    to a no-op, so a caller that never opted in behaves exactly as before."""
+    to a no-op, so a caller that never opted in behaves exactly as before.
+
+    **Memory** (`docs/tasks/MEMORY-01-write-recall-and-forget/spec.md`):
+    when `memory_context` is given, every call's `arguments` gets one
+    reserved key, `_sadana_memory_ctx`, merged in *last* so it always wins
+    over anything the model itself supplied under that name — the only way
+    a plugin's node body can learn the account it is running for without
+    that identity ever being something the model controls. Defaults to
+    `None`, in which case `arguments` reaches `run_graph` completely
+    unchanged from before this parameter existed."""
     tracker = ChildSeqTracker(next_seq=conversation.next_child_seq)
     turn_key = conversation.pending_turn_key
     seq_in_turn = 0
@@ -205,9 +215,12 @@ def build_dispatch(
                 failed_node="entry",
             )
         installed, entry = hit
+        call_arguments = (
+            {**arguments, "_sadana_memory_ctx": memory_context} if memory_context is not None else arguments
+        )
         result, duration_s = await observability.timed(
             plugin_manifest.run_graph(
-                installed.directory, installed.manifest, entry, arguments, ask=ask, approve=approve
+                installed.directory, installed.manifest, entry, call_arguments, ask=ask, approve=approve
             )
         )
         await record_plugin_run(turn_key, seq_in_turn, result, duration_s)

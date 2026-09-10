@@ -29,7 +29,7 @@ import sqlite3
 import threading
 import time
 
-from sadana import conversation_store, observability, plugin_dispatch
+from sadana import conversation_store, memory, memory_store, observability, plugin_dispatch
 from sadana.conversation import (
     ConversationTemplate,
     ExitReason,
@@ -74,9 +74,18 @@ async def handle_inbound(
     same connection, so there is nothing to build here that would differ
     call to call.
 
-    Serialized by `_conn_lock` — see the module docstring."""
+    Serialized by `_conn_lock` — see the module docstring. `conn`'s
+    `memory_store` schema is assumed already present, ensured once by
+    `cmd_gateway_run` before the daemon starts serving — not re-checked
+    here on every inbound message, the same "ensure once, not per-turn"
+    posture `cmd_chat` already takes for the same tables. A caller that
+    calls `handle_inbound` directly (this module's own tests) is
+    responsible for that setup itself, matching how those same tests
+    already call `observability.make_recorder(conn)` themselves rather
+    than relying on `handle_inbound` to do it."""
     with _conn_lock:
         key = session_key_for(event)
+        account_key = memory.account_key_for(event.platform, event.chat_id)
         now = time.monotonic()
         try:
             conversation = conversation_store.load(conn, key, now=now)
@@ -87,10 +96,13 @@ async def handle_inbound(
                     stable_prompt=persona, catalog=plugin_set.catalog, tool_specs=plugin_set.tool_specs
                 ),
             )
+            entries = memory_store.list_entries(conn, account_key)
+            override = memory_store.get_rubric_override(conn, account_key)
+            system_message = memory.system_message_for(entries, memory.default_rubric(), override)
             conversation, _template = create_conversation(
                 template,
                 key,
-                system_message="",
+                system_message=system_message,
                 iteration_budget=iteration_budget_from_config(),
                 wall_clock_budget=wall_clock_budget_from_config(now),
             )
@@ -105,6 +117,7 @@ async def handle_inbound(
             now=now,
             record_turn=record_turn,
             record_plugin_run=record_plugin_run,
+            memory_context=memory_store.DispatchContext(account_key=account_key, conn=conn),
         )
         persist = conversation_store.bind_persist(conn, conversation, now=now)
         result, conversation = await plugin_dispatch.take_turn_and_reconcile(
