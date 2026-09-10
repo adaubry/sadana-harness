@@ -8,6 +8,7 @@ has already learned to depend on the developer's machine.
 
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -156,3 +157,30 @@ def write_skill(
         lines.append(f"description: {description}")
     (skill_dir / "SKILL.md").write_text("---\n" + "\n".join(lines) + f"\n---\n{body}")
     return tmp_path / "plugins"
+
+
+def run_git(args: list[str], *, cwd: Path) -> None:
+    """A real ``git`` subprocess call — shared by ``test_plugin_install.py``
+    and ``test_subcommands_plugin.py``, both of which exercise
+    ``plugin_install.py`` against a real, local repository rather than a
+    mocked one (`testing-conventions`: no network, real behavior)."""
+    subprocess.run(["git", *args], cwd=str(cwd), check=True, capture_output=True, text=True)
+
+
+def make_upstream_repo(tmp_path: Path, *, plugin_name: str = "greeter", tag: str = "v1.0.0") -> Path:
+    """A real, local git repository — one commit tagged ``tag``, whose
+    ``plugin.toml`` declares ``plugin_name`` — cloned in tests via its
+    plain filesystem path. Shared by ``test_plugin_install.py`` and
+    ``test_subcommands_plugin.py``."""
+    repo = tmp_path / "upstream"
+    repo.mkdir()
+    run_git(["init", "-q", "-b", "main"], cwd=repo)
+    run_git(["config", "user.email", "test@example.com"], cwd=repo)
+    run_git(["config", "user.name", "Test"], cwd=repo)
+    (repo / "plugin.toml").write_text(
+        f'[plugin]\nname = "{plugin_name}"\nversion = "{tag}"\ndescription = "a test plugin"\n'
+    )
+    run_git(["add", "."], cwd=repo)
+    run_git(["commit", "-q", "-m", "initial"], cwd=repo)
+    run_git(["tag", tag], cwd=repo)
+    return repo
