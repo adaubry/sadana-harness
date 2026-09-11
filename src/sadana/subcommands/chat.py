@@ -18,7 +18,6 @@ import time
 from contextlib import closing
 
 from sadana import (
-    builtin_seed,
     config,
     conversation_store,
     memory,
@@ -27,7 +26,6 @@ from sadana import (
     observability,
     plugin_dispatch,
     plugin_manifest,
-    plugins,
 )
 from sadana.conversation import (
     Conversation,
@@ -114,7 +112,6 @@ def cmd_chat(args: argparse.Namespace) -> int:
     account_key = args.account or config.env("SADANA_MEMORY_ACCOUNT", "local")
 
     persona = load_or_seed_persona(persona_path_from_config())
-    builtin_seed.seed_all(plugins._plugins_root())
     plugin_set = plugin_dispatch.build_plugin_set(plugin_manifest.discover_plugins())
     with closing(conversation_store.open_store(conversation_store.store_path_from_config())) as conn:
         memory_store.ensure_schema(conn)

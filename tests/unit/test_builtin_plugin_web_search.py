@@ -198,18 +198,3 @@ def test_a_true_count_does_not_become_a_one_result_search(monkeypatch: pytest.Mo
     _run({"query": "q", "count": True})
 
     assert "count=5" in seen[0].url
-
-
-@pytest.mark.unit
-def test_an_error_body_from_the_service_is_defanged_too(monkeypatch: pytest.MonkeyPatch) -> None:
-    """`execution.run_http` builds its detail from up to 200 bytes of the
-    response body — a second path by which somebody else's bytes reach the
-    model, and it gets the same filter the results do."""
-    monkeypatch.setenv(_KEY_VAR, "secret-token")  # pragma: allowlist secret
-    monkeypatch.setattr(execution, "run_http", lambda _r: execution.Failure(detail="HTTP 403: \x1b[31mdenied​‮"))
-
-    result = _run({"query": "q"})
-
-    assert "\x1b" not in result.text  # type: ignore[attr-defined]
-    assert "​" not in result.text  # type: ignore[attr-defined]
-    assert "‮" not in result.text  # type: ignore[attr-defined]

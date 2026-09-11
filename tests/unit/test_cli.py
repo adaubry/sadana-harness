@@ -99,3 +99,23 @@ def test_main_load_dotenv_never_overrides_live_env(monkeypatch: pytest.MonkeyPat
     monkeypatch.setenv("SADANA_CLI_TEST_KEY", "from-shell")
     assert main(["conversations"]) == 0
     assert sadana_config.env("SADANA_CLI_TEST_KEY", "") == "from-shell"
+
+
+@pytest.mark.unit
+def test_a_shipped_plugins_settings_are_reachable_before_the_agent_has_ever_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The first-run trap, closed at the entry point rather than per handler.
+
+    A builtin plugin used to appear only once `sadana chat` had seeded it;
+    `plugin set` refuses a plugin that is not installed; and the first chat is
+    exactly what fails for want of the key. There was no way out but calling
+    the seeder by hand. Asserted through `main()` because that is where the
+    seeding now happens — and `editor` had the same hole from the other side.
+    """
+    monkeypatch.setenv("SADANA_PLUGINS_DIR", str(tmp_path / "plugins"))
+
+    assert main(["plugin", "settings", "image-gen"]) == 0
+
+    assert "api_key" in capsys.readouterr().out
+    assert (tmp_path / "plugins" / "image-gen" / "plugin.toml").is_file()

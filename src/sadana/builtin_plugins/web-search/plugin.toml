@@ -12,7 +12,7 @@ start = "search"
 [[node]]
 name = "search"
 kind = "call"
-body = "init:search"
+body = "search:search"
 
 [[setting]]
 name = "api_key"

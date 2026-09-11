@@ -16,9 +16,15 @@ PLUGIN = "web-search"
 
 
 def search(value: dict) -> str:
+    # No no-key branch here on purpose. `PLUGIN-CONFIG-01`'s preflight in
+    # `run_graph` refuses the run before any node starts when a declared
+    # setting is unset, so a check written again here is unreachable — and
+    # unreachable code a reader trusts as the live behaviour, with wording
+    # that differs from what the preflight actually prints, is worse than
+    # none. `assert` rather than a branch: if this ever fires, the preflight
+    # stopped working and that is the bug worth hearing about.
     api_key = plugins.read_setting(PLUGIN, "api_key")
-    if api_key is None:
-        return f"No search API key is set. Run: sadana plugin set {PLUGIN} api_key"
+    assert api_key is not None, "run_graph's missing-settings preflight should have refused this run"
 
     query = str(value.get("query", "")).strip()
     if not query:
@@ -40,11 +46,7 @@ def search(value: dict) -> str:
         )
     )
     if isinstance(outcome, execution.Failure):
-        # Defanged too: `execution.run_http` builds this detail from up to 200
-        # bytes of the *response body*, so a captive portal or an error page
-        # is a second path by which somebody else's bytes reach the model.
-        # It gets the same character filter the results do.
-        return f"The search could not be completed: {web_search.defang(outcome.detail)}"
+        return f"The search could not be completed: {outcome.detail}"
 
     parsed = web_search.parse(outcome.body)
     if isinstance(parsed, str):

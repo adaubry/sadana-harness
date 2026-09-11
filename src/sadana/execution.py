@@ -21,6 +21,7 @@ import urllib.request
 from dataclasses import dataclass, field
 
 from sadana import config
+from sadana.untrusted_text import defang
 
 
 class _NoRedirects(urllib.request.HTTPRedirectHandler):
@@ -41,6 +42,21 @@ class _NoRedirects(urllib.request.HTTPRedirectHandler):
         return None
 
 
+# How much of a `Failure.detail` a caller may hand onward. A model reads it.
+_MAX_DETAIL_CHARS = 200
+
+# What one reply may be. Nothing else here bounds it: `resp.read()` with no
+# ceiling means a reply's size is whatever the other end decides to send, and
+# the first caller that both expects megabytes and commits them to disk
+# (`image-gen`) also asks for a 180-second window to receive them.
+MAX_BODY_BYTES = 32 * 1024 * 1024
+
+
+def _safe(detail: str) -> str:
+    """One `Failure.detail`, filtered and bounded."""
+    return defang(detail)[:_MAX_DETAIL_CHARS]
+
+
 def _open(req: urllib.request.Request, timeout_s: int):  # type: ignore[no-untyped-def]
     """This module's one network boundary, named so it can be stubbed.
 
@@ -59,6 +75,15 @@ class HttpRequest:
     url: str
     headers: dict[str, str] = field(default_factory=dict)
     body: bytes | None = None
+    # How long this one call may take, when the config default is wrong for
+    # it. `None` means the default, which is every caller that predates this
+    # field. Drawing a picture takes tens of seconds where every other caller
+    # here returns in under one, and raising the default instead would make a
+    # search that should fail fast hang for as long as the slowest caller
+    # needs (`docs/tasks/IMAGE-GEN-01-the-first-plugin-that-makes-a-file
+    # /spec.md`). The default itself stays a config key — CLAUDE.md keeps
+    # behaviours in config; this is an override, not a second source of truth.
+    timeout_s: int | None = None
 
 
 @dataclass(frozen=True)
@@ -80,14 +105,26 @@ def run_http(request: HttpRequest) -> Outcome:
     if not request.url.lower().startswith(("http://", "https://")):
         # Bounds what a call step can reach through this path: outward HTTP
         # only, never a local file or another scheme urllib also understands.
-        return Failure(f"unsupported URL scheme: {request.url!r} (only http/https are allowed)")
-    timeout_s = config.env_int("SADANA_EXECUTION_HTTP_TIMEOUT_S", 30)
+        return Failure(_safe(f"unsupported URL scheme: {request.url!r} (only http/https are allowed)"))
+    timeout_s = (
+        request.timeout_s if request.timeout_s is not None else config.env_int("SADANA_EXECUTION_HTTP_TIMEOUT_S", 30)
+    )
     try:
         req = urllib.request.Request(request.url, data=request.body, headers=request.headers, method=request.method)
         with _open(req, timeout_s) as resp:
-            return Success(status=resp.status, body=resp.read())
+            body = resp.read(MAX_BODY_BYTES + 1)
+            if len(body) > MAX_BODY_BYTES:
+                return Failure(f"the reply was larger than {MAX_BODY_BYTES} bytes and was not read")
+            return Success(status=resp.status, body=body)
     except urllib.error.HTTPError as exc:
+        # Every `Failure.detail` this function builds is a string a model
+        # will read, and every one of them can carry third-party text — so
+        # the filter goes on the composed value, not on one ingredient of it.
+        # The reason phrase is as much theirs as the body: `http.client`
+        # reads it off the status line and decodes it latin-1, so escapes and
+        # C1 controls pass straight through. Defanging only the body was this
+        # filter's first placement and it was a narrowing, not a centralising.
         detail = exc.read().decode(errors="replace").strip() or exc.reason
-        return Failure(f"HTTP {exc.code}: {detail[:200]}")
+        return Failure(_safe(f"HTTP {exc.code}: {detail}"))
     except (OSError, ValueError) as exc:
-        return Failure(str(exc))
+        return Failure(_safe(str(exc)))

@@ -64,7 +64,8 @@ def _installed(name: str) -> plugins.InstalledPlugin | None:
     """The installed plugin of that name, or ``None``. Reuses
     ``discover_plugins`` rather than reading one directory directly, so an
     installed-but-invalid plugin is not-found here for exactly the same
-    reason it is not-found to the agent."""
+    reason it is not-found to the agent.
+    """
     for installed in plugin_manifest.discover_plugins():
         if installed.name == name:
             return installed
