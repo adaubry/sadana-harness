@@ -26,7 +26,9 @@ from sadana import client_surface, memory
 from sadana.gateway import MessageEvent, session_key_for
 
 
-async def handle_inbound(runtime: client_surface.Runtime, event: MessageEvent) -> tuple[bool, str]:
+async def handle_inbound(
+    runtime: client_surface.Runtime, event: MessageEvent, *, account: memory.AccountKey | None = None
+) -> tuple[bool, str]:
     """Run one turn for one inbound channel message and return
     `(ok, text)` — `ok` is the turn's own, and `text` is the reply to send.
 
@@ -45,6 +47,15 @@ async def handle_inbound(runtime: client_surface.Runtime, event: MessageEvent) -
     recovered from `text` after the fact — a `BUDGET_EXHAUSTED` turn still
     carries a real summary — which is why both values cross back.
 
+    `account` overrides that derivation, and exists for exactly one caller:
+    `scheduling.tick()`, where the work was set in motion by the owner rather
+    than by whoever is on the other end of a socket, so it runs as the owner
+    (PERSONA-02). It is keyword-only and has no field on `MessageEvent` on
+    purpose — a keyword can only be passed by a Python caller that already
+    decided who this is, while an envelope field gets filled by whatever
+    parses the payload next. CLAUDE.md: an inbound channel envelope never
+    carries the account it belongs to. A channel adapter must never pass this.
+
     Never raises for an expected turn outcome. Cannot raise
     `ConversationNotFound` either: a channel always passes `create_as`, since
     a message arriving for a conversation nobody has started yet is the
@@ -52,7 +63,7 @@ async def handle_inbound(runtime: client_surface.Runtime, event: MessageEvent) -
     """
     outcome = await client_surface.take_turn(
         runtime,
-        account=memory.account_key_for(event.platform, event.chat_id),
+        account=account if account is not None else memory.account_key_for(event.platform, event.chat_id),
         conversation=session_key_for(event),
         text=event.text,
         create_as="webhook",

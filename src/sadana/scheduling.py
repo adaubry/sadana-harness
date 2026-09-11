@@ -22,7 +22,7 @@ import asyncio
 import logging
 import time
 
-from sadana import client_surface, conversation_store, gateway_dispatch
+from sadana import client_surface, conversation_store, gateway_dispatch, memory
 from sadana.gateway import MessageEvent
 
 logger = logging.getLogger(__name__)
@@ -71,7 +71,12 @@ async def tick(runtime: client_surface.Runtime) -> int:
     for trigger in due:
         event = MessageEvent(platform="schedule", chat_id=trigger.name, thread_id=None, text=trigger.trigger_text)
         try:
-            await gateway_dispatch.handle_inbound(runtime, event)
+            # A trigger the owner wrote is the owner's own machinery, so it
+            # runs as the owner — their voice, their memory (PERSONA-02). The
+            # conversation key is still `schedule:<name>`: whose the work is
+            # and which thread it continues are different questions, and only
+            # the first one changed.
+            await gateway_dispatch.handle_inbound(runtime, event, account=memory.owner_account())
         except Exception:
             logger.warning("scheduled trigger %r failed to fire", trigger.name, exc_info=True)
             continue

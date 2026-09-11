@@ -15,7 +15,7 @@ from pathlib import Path
 
 import pytest
 
-from sadana import client_surface, memory_store, model_access, observability, persona_store, plugin_dispatch, plugins
+from sadana import client_surface, model_access, observability, persona_store, plugin_dispatch, plugins, stores
 from sadana.context import ContextState
 from sadana.conversation import (
     Conversation,
@@ -267,8 +267,7 @@ def make_runtime(
     that as the obligation of whoever builds a ``Runtime`` by hand, the same
     way ``test_gateway_dispatch.py`` already called ``ensure_schema`` for a
     direct bridge call."""
-    memory_store.ensure_schema(conn)
-    persona_store.ensure_schema(conn)
+    stores.ensure_schemas(conn)
     return client_surface.Runtime(
         conn=conn,
         plugin_set=plugin_set,

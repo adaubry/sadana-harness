@@ -7,9 +7,12 @@ from pathlib import Path
 
 import pytest
 
+from conftest import conversation as _build_conversation
 from conftest import open_conn, write_character
 from sadana import persona, persona_store
+from sadana.conversation_store import create
 from sadana.subcommands.persona import (
+    cmd_persona_accounts,
     cmd_persona_list,
     cmd_persona_new,
     cmd_persona_show,
@@ -48,7 +51,8 @@ def test_list_with_no_characters_says_where_they_go(capsys: pytest.CaptureFixtur
 
 
 @pytest.mark.unit
-def test_list_marks_the_account_selection(capsys: pytest.CaptureFixture[str]) -> None:
+def test_list_marks_the_account_selection(capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SADANA_MEMORY_ACCOUNT", "a1")
     _write("working")
     _write("terse", description="clipped, one line")
     assert cmd_persona_use(argparse.Namespace(account="a1", name="terse")) == 0
@@ -61,7 +65,10 @@ def test_list_marks_the_account_selection(capsys: pytest.CaptureFixture[str]) ->
 
 
 @pytest.mark.unit
-def test_list_says_when_the_selected_character_is_gone(capsys: pytest.CaptureFixture[str]) -> None:
+def test_list_says_when_the_selected_character_is_gone(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("SADANA_MEMORY_ACCOUNT", "a1")
     path = _write("working")
     assert cmd_persona_use(argparse.Namespace(account="a1", name="working")) == 0
     path.unlink()
@@ -89,14 +96,18 @@ def test_show_refuses_an_unknown_or_unsafe_name(name: str, capsys: pytest.Captur
 
 
 @pytest.mark.unit
-def test_use_selects_a_character() -> None:
+def test_use_selects_a_character(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SADANA_MEMORY_ACCOUNT", "a1")
     _write("working")
     assert cmd_persona_use(argparse.Namespace(account="a1", name="working")) == 0
     assert _selection("a1") == "working"
 
 
 @pytest.mark.unit
-def test_use_leaves_the_prior_selection_alone_when_the_name_is_unknown(capsys: pytest.CaptureFixture[str]) -> None:
+def test_use_leaves_the_prior_selection_alone_when_the_name_is_unknown(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("SADANA_MEMORY_ACCOUNT", "a1")
     _write("working")
     assert cmd_persona_use(argparse.Namespace(account="a1", name="working")) == 0
 
@@ -106,7 +117,8 @@ def test_use_leaves_the_prior_selection_alone_when_the_name_is_unknown(capsys: p
 
 
 @pytest.mark.unit
-def test_use_none_returns_the_account_to_the_neutral_voice() -> None:
+def test_use_none_returns_the_account_to_the_neutral_voice(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SADANA_MEMORY_ACCOUNT", "a1")
     _write("working")
     assert cmd_persona_use(argparse.Namespace(account="a1", name="working")) == 0
     assert cmd_persona_use(argparse.Namespace(account="a1", name=persona.NEUTRAL_NAME)) == 0
@@ -140,3 +152,99 @@ def test_new_reports_a_filesystem_failure_instead_of_a_traceback(
     monkeypatch.setattr(persona_store, "write_template", _refuse)
     assert cmd_persona_new(argparse.Namespace(name="fresh")) == 1
     assert capsys.readouterr().err.startswith("error:")
+
+
+# ── PERSONA-02: looking accounts up, and refusing the ones that don't exist ──
+
+
+@pytest.mark.unit
+def test_accounts_lists_someone_who_has_only_ever_chatted(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The case the listing exists for: a webhook correspondent with no
+    memories and no selection, whose key the owner would otherwise have to
+    guess."""
+    monkeypatch.setenv("SADANA_MEMORY_ACCOUNT", "adam")
+    conn = open_conn()
+    try:
+        create(
+            conn,
+            _build_conversation(key="webhook:chat-9"),
+            now=0.0,
+            account_key="webhook:chat-9",  # pragma: allowlist secret
+        )  # pragma: allowlist secret
+    finally:
+        conn.close()
+
+    assert cmd_persona_accounts(argparse.Namespace()) == 0
+
+    out = capsys.readouterr().out
+    assert "webhook:chat-9" in out
+    assert "adam (owner)" in out
+
+
+@pytest.mark.unit
+def test_accounts_shows_the_owner_even_before_they_have_said_anything(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("SADANA_MEMORY_ACCOUNT", "adam")
+    assert cmd_persona_accounts(argparse.Namespace()) == 0
+    assert "adam (owner)" in capsys.readouterr().out
+
+
+@pytest.mark.unit
+def test_accounts_shows_each_selected_character(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("SADANA_MEMORY_ACCOUNT", "adam")
+    _write("working")
+    assert cmd_persona_use(argparse.Namespace(account="adam", name="working")) == 0
+    capsys.readouterr()
+
+    assert cmd_persona_accounts(argparse.Namespace()) == 0
+    assert "adam (owner): working" in capsys.readouterr().out
+
+
+@pytest.mark.unit
+def test_use_refuses_an_account_nothing_has_used(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A selection nothing would ever read is worse than an error: it
+    confirms, and then nobody hears it."""
+    monkeypatch.setenv("SADANA_MEMORY_ACCOUNT", "adam")
+    _write("working")
+
+    assert cmd_persona_use(argparse.Namespace(account="nobody", name="working")) == 1
+
+    assert capsys.readouterr().err.startswith("error:")
+    assert _selection("nobody") is None
+
+
+@pytest.mark.unit
+def test_use_always_accepts_the_owner_on_a_store_with_no_history(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Choosing a voice before you have said anything is an ordinary first
+    move, and it is the one account that cannot be a typo."""
+    monkeypatch.setenv("SADANA_MEMORY_ACCOUNT", "adam")
+    _write("working")
+
+    assert cmd_persona_use(argparse.Namespace(account="adam", name="working")) == 0
+    assert _selection("adam") == "working"
+
+
+@pytest.mark.unit
+def test_use_accepts_an_account_that_has_only_a_conversation(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SADANA_MEMORY_ACCOUNT", "adam")
+    _write("working")
+    conn = open_conn()
+    try:
+        create(
+            conn,
+            _build_conversation(key="webhook:chat-9"),
+            now=0.0,
+            account_key="webhook:chat-9",  # pragma: allowlist secret
+        )
+    finally:
+        conn.close()
+
+    assert cmd_persona_use(argparse.Namespace(account="webhook:chat-9", name="working")) == 0
+    assert _selection("webhook:chat-9") == "working"

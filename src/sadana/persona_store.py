@@ -24,7 +24,7 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
-from sadana import config, memory, persona
+from sadana import config, conversation_store, memory, memory_store, persona
 from sadana.conversation_store import write_txn
 from sadana.persona import Character
 
@@ -146,6 +146,36 @@ def set_selection(conn: sqlite3.Connection, account_key: memory.AccountKey, name
 def clear_selection(conn: sqlite3.Connection, account_key: memory.AccountKey) -> None:
     with write_txn(conn) as c:
         c.execute("DELETE FROM persona_selections WHERE account_key = ?", (account_key,))
+
+
+def known_accounts(conn: sqlite3.Connection) -> tuple[memory.AccountKey, ...]:
+    """Every account this assistant has spoken with, sorted.
+
+    The union of three sources, because no one of them sees everybody: an
+    account that chatted and never had anything remembered about it exists
+    only in `conversation_accounts`; one that only ever had a character
+    chosen for it exists only in `persona_selections`; and a store written
+    before PERSONA-02 has conversations with no account recorded at all,
+    whose people show up here only through what was remembered about them.
+
+    Derived on every call. No index, no cached list, nothing to go stale.
+    """
+    selections = conn.execute("SELECT DISTINCT account_key FROM persona_selections").fetchall()
+    return tuple(
+        sorted(
+            conversation_store.accounts_with_conversations(conn)
+            | memory_store.accounts_with_memories(conn)
+            | {row["account_key"] for row in selections}
+        )
+    )
+
+
+def account_exists(conn: sqlite3.Connection, account_key: memory.AccountKey) -> bool:
+    """Whether anything in this store has ever used `account_key`. What
+    `persona use` asks before it agrees to write a selection nothing would
+    ever read (PERSONA-02 requirement 8) — the owner's own account is
+    exempt, and that exemption belongs to the command, not here."""
+    return account_key in known_accounts(conn)
 
 
 def resolve_voice(conn: sqlite3.Connection, account_key: memory.AccountKey, characters_dir: Path) -> str:

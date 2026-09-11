@@ -35,6 +35,7 @@ and means the *tool* surface (`conversation.ToolSurface`, `build_surface`,
 from __future__ import annotations
 
 import asyncio
+import logging
 import sqlite3
 import threading
 import time
@@ -51,6 +52,7 @@ from sadana import (
     plugin_dispatch,
     plugin_manifest,
     plugins,
+    stores,
 )
 from sadana.conversation import (
     Conversation,
@@ -64,6 +66,8 @@ from sadana.conversation import (
     iteration_budget_from_config,
     wall_clock_budget_from_config,
 )
+
+logger = logging.getLogger(__name__)
 
 # Serializes every `take_turn` call against every other, and against a
 # caller's own direct `conn` touches (`scheduling.tick`).
@@ -160,8 +164,8 @@ def open_runtime(*, provider: str | None = None, model: str | None = None) -> Ru
     memory_store.ensure_plugin_seeded(plugins._plugins_root())
     plugin_set = plugin_dispatch.build_plugin_set(plugin_manifest.discover_plugins())
     conn = conversation_store.open_store(conversation_store.store_path_from_config())
-    memory_store.ensure_schema(conn)
-    persona_store.ensure_schema(conn)
+    stores.ensure_schemas(conn)
+    _adopt_scheduled_memories(conn)
     return Runtime(
         conn=conn,
         plugin_set=plugin_set,
@@ -169,6 +173,29 @@ def open_runtime(*, provider: str | None = None, model: str | None = None) -> Ru
         model=model or config.env("SADANA_MODEL_ACCESS_MODEL", model_access.DEFAULT_MODEL),
         recorder=observability.make_recorder(conn),
     )
+
+
+def _adopt_scheduled_memories(conn: sqlite3.Connection) -> None:
+    """Move what scheduled runs remembered under their own names onto the
+    owner, once (PERSONA-02 requirement 4). A no-op on every start after the
+    first, which is why it can live on the open path instead of in a command
+    somebody has to remember to run.
+
+    What it survives: its own failure. A store that cannot be migrated — a
+    locked database, a shape nobody anticipated — logs and lets the process
+    start anyway. The alternative, refusing to open, turns a data-shape
+    surprise into an outage on every surface at once, and this is not
+    something a turn depends on. The cost is that a partial move can go
+    unnoticed until somebody looks for a fact that is in neither place
+    (spec.md § Concerns).
+    """
+    try:
+        moved = memory_store.adopt_scheduled_memories(conn, memory.owner_account())
+    except sqlite3.Error:
+        logger.warning("could not adopt scheduled memories into the owner's account", exc_info=True)
+        return
+    if moved:
+        logger.info("adopted %d remembered entries from scheduled runs into the owner's account", moved)
 
 
 @dataclass(frozen=True)
@@ -247,7 +274,7 @@ def _create(
         iteration_budget=iteration_budget_from_config(),
         wall_clock_budget=wall_clock_budget_from_config(now),
     )
-    conversation_store.create(runtime.conn, convo, now=now)
+    conversation_store.create(runtime.conn, convo, now=now, account_key=account)
     return convo
 
 

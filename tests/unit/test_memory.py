@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pytest
 
+from sadana import memory
 from sadana.memory import (
     MemoryEntry,
     account_key_for,
@@ -101,3 +102,28 @@ def test_system_message_for_with_no_entries_still_carries_guidance() -> None:
     message = system_message_for((), "the default rubric", "")
     assert "Their dog" not in message
     assert "the default rubric" in message
+
+
+# ── PERSONA-02: the installation's owner ─────────────────────────────────
+
+
+@pytest.mark.unit
+def test_owner_account_defaults_when_nothing_is_configured(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("SADANA_MEMORY_ACCOUNT", raising=False)
+    assert memory.owner_account() == "local"
+
+
+@pytest.mark.unit
+def test_owner_account_is_whatever_the_installation_configured(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SADANA_MEMORY_ACCOUNT", "adam")
+    assert memory.owner_account() == "adam"
+
+
+@pytest.mark.unit
+def test_owner_account_is_resolved_fresh_not_captured(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Nothing stores who the owner is, so changing it takes effect on the
+    next call rather than the next process."""
+    monkeypatch.setenv("SADANA_MEMORY_ACCOUNT", "before")
+    assert memory.owner_account() == "before"
+    monkeypatch.setenv("SADANA_MEMORY_ACCOUNT", "after")
+    assert memory.owner_account() == "after"

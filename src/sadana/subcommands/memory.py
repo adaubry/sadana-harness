@@ -12,22 +12,9 @@ Owns both its parser and its handlers in one file, mirroring
 from __future__ import annotations
 
 import argparse
-import sqlite3
 import time
-from collections.abc import Iterator
-from contextlib import closing, contextmanager
 
-from sadana import memory_store
-from sadana.conversation_store import open_store, store_path_from_config
-
-
-@contextmanager
-def _open_schema_ensured_store() -> Iterator[sqlite3.Connection]:
-    """The `open the store, ensure memory_store's schema, close it` scaffold
-    every handler below needs, in one place instead of three copies."""
-    with closing(open_store(store_path_from_config())) as conn:
-        memory_store.ensure_schema(conn)
-        yield conn
+from sadana import memory_store, stores
 
 
 def build_memory_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
@@ -52,7 +39,7 @@ def build_memory_parser(subparsers: argparse._SubParsersAction[argparse.Argument
 
 
 def cmd_memory_list(args: argparse.Namespace) -> int:
-    with _open_schema_ensured_store() as conn:
+    with stores.open_cli_store() as conn:
         entries = memory_store.list_entries(conn, args.account)
     if not entries:
         print("Nothing remembered.")
@@ -63,14 +50,14 @@ def cmd_memory_list(args: argparse.Namespace) -> int:
 
 
 def cmd_memory_forget(args: argparse.Namespace) -> int:
-    with _open_schema_ensured_store() as conn:
+    with stores.open_cli_store() as conn:
         memory_store.delete_entry(conn, args.account, args.entry_key)
     print(f"forgot {args.entry_key!r} for {args.account!r}")
     return 0
 
 
 def cmd_memory_set_rubric(args: argparse.Namespace) -> int:
-    with _open_schema_ensured_store() as conn:
+    with stores.open_cli_store() as conn:
         memory_store.set_rubric_override(conn, args.account, args.text, now=time.time())
     print(f"rubric addition set for {args.account!r}")
     return 0

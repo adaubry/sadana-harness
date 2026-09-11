@@ -19,7 +19,7 @@ from sadana.subcommands.conversations import (
 def _save(conversation: Conversation) -> None:
     conn = open_store(store_path_from_config())
     try:
-        create(conn, conversation, now=0.0)
+        create(conn, conversation, now=0.0, account_key="local")  # pragma: allowlist secret
     finally:
         conn.close()
 

@@ -78,6 +78,27 @@ def account_key_for(platform: str, chat_id: str) -> str:
     return f"{platform}:{chat_id}"
 
 
+def owner_account() -> AccountKey:
+    """The account this installation belongs to — the person running it.
+
+    `SADANA_MEMORY_ACCOUNT`, else `"local"`: the same variable and default
+    `subcommands/chat.py` resolved inline before PERSONA-02, so an
+    installation that had set it keeps the identity it already had.
+
+    Resolved from config on every call, never stored: nothing in this project
+    writes down who the owner is, so nothing goes stale when it changes.
+
+    Three callers need the same answer and would otherwise each pick their
+    own: the terminal (whose default this was), the scheduler (work the owner
+    set in motion is the owner's work, `scheduling.tick`), and
+    `persona use`, which always accepts the owner's own name because choosing
+    a voice before you have said anything is an ordinary first move. A
+    *channel* is never one of them — an inbound envelope names its own sender
+    and can never name the owner (CLAUDE.md).
+    """
+    return config.env("SADANA_MEMORY_ACCOUNT", "local")
+
+
 def default_rubric() -> str:
     """The deployer's default rubric — one env var, resolved the way every
     other block resolves its own behaviour config (`config.py`'s own

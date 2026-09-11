@@ -9,8 +9,9 @@ from pathlib import Path
 
 import pytest
 
+from conftest import conversation as build_conversation
 from conftest import open_conn, write_character
-from sadana import persona, persona_store
+from sadana import conversation_store, memory_store, persona, persona_store, stores
 from sadana.persona import CharacterError
 
 
@@ -18,7 +19,9 @@ from sadana.persona import CharacterError
 def conn() -> Iterator[sqlite3.Connection]:
     connection = open_conn()
     try:
-        persona_store.ensure_schema(connection)
+        # Every add-on table, not just PERSONA's: `known_accounts` reads all
+        # three, which is the gap `stores.ensure_schemas` exists to close.
+        stores.ensure_schemas(connection)
         yield connection
     finally:
         connection.close()
@@ -141,3 +144,57 @@ def test_resolve_voice_survives_a_selection_whose_name_is_no_longer_valid(
 ) -> None:
     persona_store.set_selection(conn, "someone", "../escape", now=1.0)
     assert persona_store.resolve_voice(conn, "someone", tmp_path) == persona.NEUTRAL_VOICE
+
+
+# ── PERSONA-02: who this assistant has spoken with ───────────────────────
+
+
+@pytest.mark.unit
+def test_known_accounts_sees_an_account_that_only_has_a_conversation(conn: sqlite3.Connection) -> None:
+    conversation_store.create(
+        conn,
+        build_conversation(key="webhook:chat-9"),
+        now=0.0,
+        account_key="webhook:chat-9",  # pragma: allowlist secret
+    )
+
+    assert persona_store.known_accounts(conn) == ("webhook:chat-9",)
+
+
+@pytest.mark.unit
+def test_known_accounts_sees_an_account_that_only_has_a_memory(conn: sqlite3.Connection) -> None:
+    memory_store.write_entry(conn, "adam", "tz", "UTC+2", now=1.0)
+
+    assert persona_store.known_accounts(conn) == ("adam",)
+
+
+@pytest.mark.unit
+def test_known_accounts_sees_an_account_that_only_has_a_selection(conn: sqlite3.Connection) -> None:
+    persona_store.set_selection(conn, "adam", "working", now=1.0)
+
+    conversation_store.create(
+        conn,
+        build_conversation(key="c1"),
+        now=0.0,
+        account_key="adam",  # pragma: allowlist secret
+    )
+
+
+@pytest.mark.unit
+def test_known_accounts_unions_the_three_sources_without_duplicating(conn: sqlite3.Connection) -> None:
+    conversation_store.create(
+        conn,
+        build_conversation(key="c1"),
+        now=0.0,
+        account_key="adam",  # pragma: allowlist secret
+    )
+    memory_store.write_entry(conn, "adam", "tz", "UTC+2", now=1.0)
+    persona_store.set_selection(conn, "adam", "working", now=1.0)
+    memory_store.write_entry(conn, "webhook:9", "their_name", "Sam", now=1.0)
+
+    assert persona_store.known_accounts(conn) == ("adam", "webhook:9")
+
+
+@pytest.mark.unit
+def test_account_exists_is_false_for_a_name_nothing_has_used(conn: sqlite3.Connection) -> None:
+    assert persona_store.account_exists(conn, "nobody") is False

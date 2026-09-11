@@ -137,7 +137,7 @@ def test_cmd_chat_immediate_eof_creates_conversation_with_no_turns(monkeypatch: 
 def test_cmd_chat_resume_continues_existing_conversation(monkeypatch: pytest.MonkeyPatch) -> None:
     conn = open_store(store_path_from_config())
     try:
-        create(conn, _build_conversation(key="resume-me"), now=0.0)
+        create(conn, _build_conversation(key="resume-me"), now=0.0, account_key="local")  # pragma: allowlist secret
     finally:
         conn.close()
 
@@ -234,7 +234,12 @@ def test_cmd_chat_sends_a_budget_exhausted_turns_own_summary_to_stdout_not_stder
     `client_surface.TurnOutcome`'s three fields exist to make impossible, and
     this is the only test that watches the streams themselves."""
     conn = open_store(store_path_from_config())
-    create(conn, _build_conversation(key="exhausted", iteration_budget=IterationBudget(max_total=1, used=1)), now=0.0)
+    create(
+        conn,
+        _build_conversation(key="exhausted", iteration_budget=IterationBudget(max_total=1, used=1)),
+        now=0.0,
+        account_key="local",  # pragma: allowlist secret
+    )
     monkeypatch.setattr(model_access, "send", lambda request: plain_response("here is what we did"))
     _feed(monkeypatch, "hello")
 

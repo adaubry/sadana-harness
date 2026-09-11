@@ -27,6 +27,7 @@ from sadana.conversation import (
 from sadana.conversation_store import (
     ConversationAlreadyExists,
     ConversationNotFound,
+    accounts_with_conversations,
     advance_scheduled_trigger,
     bind_persist,
     create,
@@ -121,7 +122,7 @@ def test_create_then_load_round_trips_every_field(tmp_path: Path) -> None:
     conn = open_store(tmp_path / "c.db")
     conv = _conversation(messages=_messages(), next_turn_seq=1)
 
-    create(conn, conv, now=100.0)
+    create(conn, conv, now=100.0, account_key="a1")  # pragma: allowlist secret
     loaded = load(conn, conv.key, now=100.0)
 
     assert loaded == conv
@@ -131,11 +132,11 @@ def test_create_then_load_round_trips_every_field(tmp_path: Path) -> None:
 def test_create_duplicate_key_raises_and_leaves_original_unchanged(tmp_path: Path) -> None:
     conn = open_store(tmp_path / "c.db")
     original = _conversation(messages=_messages())
-    create(conn, original, now=0.0)
+    create(conn, original, now=0.0, account_key="a1")  # pragma: allowlist secret
 
     colliding = _conversation(messages=(), next_turn_seq=99)
     with pytest.raises(ConversationAlreadyExists):
-        create(conn, colliding, now=0.0)
+        create(conn, colliding, now=0.0, account_key="a1")  # pragma: allowlist secret
 
     assert load(conn, "k1", now=0.0) == original
 
@@ -144,7 +145,7 @@ def test_create_duplicate_key_raises_and_leaves_original_unchanged(tmp_path: Pat
 def test_save_upserts_repeatedly_on_owned_key(tmp_path: Path) -> None:
     conn = open_store(tmp_path / "c.db")
     conv = _conversation(messages=_messages()[:1])
-    create(conn, conv, now=0.0)
+    create(conn, conv, now=0.0, account_key="a1")  # pragma: allowlist secret
 
     grown = _conversation(messages=_messages(), next_turn_seq=1)
     save(conn, grown, now=0.0)
@@ -164,7 +165,7 @@ def test_load_unknown_key_raises_conversation_not_found(tmp_path: Path) -> None:
 def test_resaving_same_messages_does_not_duplicate_rows(tmp_path: Path) -> None:
     conn = open_store(tmp_path / "c.db")
     conv = _conversation(messages=_messages())
-    create(conn, conv, now=0.0)
+    create(conn, conv, now=0.0, account_key="a1")  # pragma: allowlist secret
     save(conn, conv, now=0.0)
     save(conn, conv, now=0.0)
 
@@ -186,7 +187,7 @@ def test_load_reconstructs_context_state_and_stable_prompt_len_across_a_second_c
     )
 
     conn = open_store(path)
-    create(conn, conv, now=0.0)
+    create(conn, conv, now=0.0, account_key="a1")  # pragma: allowlist secret
     conn.close()  # the failure mode this fix targets only shows up across a real reconnect
 
     reopened = open_store(path)
@@ -246,7 +247,7 @@ def test_wall_clock_budget_persists_as_remaining_seconds(tmp_path: Path) -> None
     conn = open_store(tmp_path / "c.db")
     conv = _conversation(wall_clock_budget=WallClockBudget(deadline=130.0))
 
-    create(conn, conv, now=100.0)  # 30s remaining at save time
+    create(conn, conv, now=100.0, account_key="a1")  # 30s remaining at save time  # pragma: allowlist secret
     loaded = load(conn, conv.key, now=500.0)  # resumed 400s later, on a fresh clock
 
     assert loaded.wall_clock_budget == WallClockBudget(deadline=530.0)
@@ -256,7 +257,7 @@ def test_wall_clock_budget_persists_as_remaining_seconds(tmp_path: Path) -> None
 def test_no_wall_clock_budget_round_trips_as_none(tmp_path: Path) -> None:
     conn = open_store(tmp_path / "c.db")
     conv = _conversation(wall_clock_budget=None)
-    create(conn, conv, now=0.0)
+    create(conn, conv, now=0.0, account_key="a1")  # pragma: allowlist secret
     assert load(conn, conv.key, now=999.0).wall_clock_budget is None
 
 
@@ -273,7 +274,7 @@ def test_create_forced_failure_leaves_no_partial_row(tmp_path: Path, monkeypatch
 
     monkeypatch.setattr(conversation_store, "_insert_messages", boom)
     with pytest.raises(RuntimeError):
-        create(conn, conv, now=0.0)
+        create(conn, conv, now=0.0, account_key="a1")  # pragma: allowlist secret
 
     assert conn.execute("SELECT COUNT(*) FROM conversations").fetchone()[0] == 0
     assert conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0] == 0
@@ -283,7 +284,7 @@ def test_create_forced_failure_leaves_no_partial_row(tmp_path: Path, monkeypatch
 def test_save_forced_failure_leaves_previous_snapshot_intact(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     conn = open_store(tmp_path / "c.db")
     first = _conversation(messages=_messages()[:1])
-    create(conn, first, now=0.0)
+    create(conn, first, now=0.0, account_key="a1")  # pragma: allowlist secret
 
     grown = _conversation(messages=_messages(), next_turn_seq=1)
 
@@ -351,7 +352,7 @@ def test_bind_persist_real_failure_aborts_turn_before_dispatch(tmp_path: Path, m
 def test_bind_persist_success_saves_growing_messages(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     conn = open_store(tmp_path / "c.db")
     conv = _conversation()
-    create(conn, conv, now=0.0)
+    create(conn, conv, now=0.0, account_key="a1")  # pragma: allowlist secret
 
     surface = build_surface([_spec("noop", "noop")])
     responses = iter(
@@ -386,8 +387,8 @@ def test_search_empty_store_returns_empty_list(tmp_path: Path) -> None:
 @pytest.mark.unit
 def test_search_empty_query_returns_every_conversation(tmp_path: Path) -> None:
     conn = open_store(tmp_path / "c.db")
-    create(conn, _conversation(key="alpha"), now=0.0)
-    create(conn, _conversation(key="beta"), now=0.0)
+    create(conn, _conversation(key="alpha"), now=0.0, account_key="a1")  # pragma: allowlist secret
+    create(conn, _conversation(key="beta"), now=0.0, account_key="a1")  # pragma: allowlist secret
 
     found = search_conversations(conn, "", now=0.0)
 
@@ -399,8 +400,8 @@ def test_search_empty_query_returns_every_conversation(tmp_path: Path) -> None:
 @pytest.mark.unit
 def test_search_matches_key_substring_case_insensitively(tmp_path: Path) -> None:
     conn = open_store(tmp_path / "c.db")
-    create(conn, _conversation(key="debugging-session"), now=0.0)
-    create(conn, _conversation(key="unrelated"), now=0.0)
+    create(conn, _conversation(key="debugging-session"), now=0.0, account_key="a1")  # pragma: allowlist secret
+    create(conn, _conversation(key="unrelated"), now=0.0, account_key="a1")  # pragma: allowlist secret
 
     found = search_conversations(conn, "DEBUG", now=0.0)
 
@@ -410,8 +411,13 @@ def test_search_matches_key_substring_case_insensitively(tmp_path: Path) -> None
 @pytest.mark.unit
 def test_search_matches_template_name_substring_case_insensitively(tmp_path: Path) -> None:
     conn = open_store(tmp_path / "c.db")
-    create(conn, _conversation(key="k1", template_name="eval-harness"), now=0.0)
-    create(conn, _conversation(key="k2", template_name="other"), now=0.0)
+    create(
+        conn,
+        _conversation(key="k1", template_name="eval-harness"),
+        now=0.0,
+        account_key="a1",  # pragma: allowlist secret,  # pragma: allowlist secret
+    )
+    create(conn, _conversation(key="k2", template_name="other"), now=0.0, account_key="a1")  # pragma: allowlist secret
 
     found = search_conversations(conn, "EVAL", now=0.0)
 
@@ -421,8 +427,18 @@ def test_search_matches_template_name_substring_case_insensitively(tmp_path: Pat
 @pytest.mark.unit
 def test_search_matches_message_content_substring(tmp_path: Path) -> None:
     conn = open_store(tmp_path / "c.db")
-    create(conn, _conversation(key="k1", messages=(Message(role="user", content="find the needle here"),)), now=0.0)
-    create(conn, _conversation(key="k2", messages=(Message(role="user", content="nothing to see"),)), now=0.0)
+    create(
+        conn,
+        _conversation(key="k1", messages=(Message(role="user", content="find the needle here"),)),
+        now=0.0,
+        account_key="a1",  # pragma: allowlist secret
+    )
+    create(
+        conn,
+        _conversation(key="k2", messages=(Message(role="user", content="nothing to see"),)),
+        now=0.0,
+        account_key="a1",  # pragma: allowlist secret
+    )
 
     found = search_conversations(conn, "NEEDLE", now=0.0)
 
@@ -440,6 +456,7 @@ def test_search_deduplicates_conversation_matching_multiple_fields(tmp_path: Pat
             messages=(Message(role="user", content="about widgets"),),
         ),
         now=0.0,
+        account_key="a1",  # pragma: allowlist secret
     )
 
     found = search_conversations(conn, "widget", now=0.0)
@@ -450,7 +467,7 @@ def test_search_deduplicates_conversation_matching_multiple_fields(tmp_path: Pat
 @pytest.mark.unit
 def test_search_no_match_returns_empty_list(tmp_path: Path) -> None:
     conn = open_store(tmp_path / "c.db")
-    create(conn, _conversation(key="k1"), now=0.0)
+    create(conn, _conversation(key="k1"), now=0.0, account_key="a1")  # pragma: allowlist secret
 
     assert search_conversations(conn, "nothing-saved-matches-this", now=0.0) == []
 
@@ -458,8 +475,8 @@ def test_search_no_match_returns_empty_list(tmp_path: Path) -> None:
 @pytest.mark.unit
 def test_search_escapes_percent_and_underscore_as_literals(tmp_path: Path) -> None:
     conn = open_store(tmp_path / "c.db")
-    create(conn, _conversation(key="50%off"), now=0.0)
-    create(conn, _conversation(key="50Xoff"), now=0.0)
+    create(conn, _conversation(key="50%off"), now=0.0, account_key="a1")  # pragma: allowlist secret
+    create(conn, _conversation(key="50Xoff"), now=0.0, account_key="a1")  # pragma: allowlist secret
 
     assert [c.key for c in search_conversations(conn, "50%off", now=0.0)] == ["50%off"]
     assert search_conversations(conn, "50_off", now=0.0) == []
@@ -585,3 +602,38 @@ def test_delete_pause_removes_the_row(tmp_path: Path) -> None:
 def test_delete_pause_on_an_unknown_key_is_a_silent_no_op(tmp_path: Path) -> None:
     conn = open_store(tmp_path / "c.db")
     delete_pause(conn, conversation_key="never-existed")  # must not raise
+
+
+# ── PERSONA-02: whose conversation this is ───────────────────────────────
+
+
+@pytest.mark.unit
+def test_create_records_which_account_the_conversation_belongs_to(tmp_path: Path) -> None:
+    conn = open_store(tmp_path / "c.db")
+    create(conn, _conversation(key="k1"), now=0.0, account_key="adam")  # pragma: allowlist secret
+
+    assert accounts_with_conversations(conn) == frozenset({"adam"})
+
+
+@pytest.mark.unit
+def test_accounts_with_conversations_is_one_entry_per_account_not_per_conversation(tmp_path: Path) -> None:
+    conn = open_store(tmp_path / "c.db")
+    create(conn, _conversation(key="k1"), now=0.0, account_key="adam")  # pragma: allowlist secret
+    create(conn, _conversation(key="k2"), now=0.0, account_key="adam")  # pragma: allowlist secret
+    create(conn, _conversation(key="k3"), now=0.0, account_key="webhook:99")  # pragma: allowlist secret
+
+    assert accounts_with_conversations(conn) == frozenset({"adam", "webhook:99"})
+
+
+@pytest.mark.unit
+def test_a_conversation_recorded_before_this_item_still_loads_and_belongs_to_nobody(tmp_path: Path) -> None:
+    """The legacy shape: a `conversations` row with no `conversation_accounts`
+    row beside it. It must keep loading, and it must be absent from the
+    listing rather than crashing it."""
+    conn = open_store(tmp_path / "c.db")
+    create(conn, _conversation(key="legacy"), now=0.0, account_key="adam")  # pragma: allowlist secret
+    conn.execute("DELETE FROM conversation_accounts WHERE conversation_key = 'legacy'")
+    conn.commit()
+
+    assert load(conn, "legacy", now=0.0).key == "legacy"
+    assert accounts_with_conversations(conn) == frozenset()

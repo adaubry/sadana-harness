@@ -17,22 +17,11 @@ Parser and handlers in one file, the shape `subcommands/memory.py` uses.
 from __future__ import annotations
 
 import argparse
-import sqlite3
 import sys
 import time
-from collections.abc import Iterator
-from contextlib import closing, contextmanager
 
-from sadana import persona, persona_store
-from sadana.conversation_store import open_store, store_path_from_config
+from sadana import memory, persona, persona_store, stores
 from sadana.persona import CharacterError
-
-
-@contextmanager
-def _open_schema_ensured_store() -> Iterator[sqlite3.Connection]:
-    with closing(open_store(store_path_from_config())) as conn:
-        persona_store.ensure_schema(conn)
-        yield conn
 
 
 def build_persona_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
@@ -52,6 +41,11 @@ def build_persona_parser(subparsers: argparse._SubParsersAction[argparse.Argumen
     use_parser.add_argument("name", help=f"the character's name, or {persona.NEUTRAL_NAME!r} for the neutral voice")
     use_parser.set_defaults(func=cmd_persona_use)
 
+    accounts_parser = persona_subparsers.add_parser(
+        "accounts", help="show every account this assistant has spoken with"
+    )
+    accounts_parser.set_defaults(func=cmd_persona_accounts)
+
     new_parser = persona_subparsers.add_parser("new", help="write a template character file and print its path")
     new_parser.add_argument("name", help="the new character's name")
     new_parser.set_defaults(func=cmd_persona_new)
@@ -62,7 +56,7 @@ def cmd_persona_list(args: argparse.Namespace) -> int:
     characters = persona_store.list_characters(characters_dir)
     selected = None
     if args.account is not None:
-        with _open_schema_ensured_store() as conn:
+        with stores.open_cli_store() as conn:
             selected = persona_store.get_selection(conn, args.account)
     if not characters:
         print(f"No characters yet. They live in {characters_dir} — `sadana persona new <name>` writes one.")
@@ -86,7 +80,7 @@ def cmd_persona_show(args: argparse.Namespace) -> int:
 
 def cmd_persona_use(args: argparse.Namespace) -> int:
     if args.name == persona.NEUTRAL_NAME:
-        with _open_schema_ensured_store() as conn:
+        with stores.open_cli_store() as conn:
             persona_store.clear_selection(conn, args.account)
         print(f"{args.account!r} now speaks in the neutral voice")
         return 0
@@ -97,7 +91,18 @@ def cmd_persona_use(args: argparse.Namespace) -> int:
     except CharacterError as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
-    with _open_schema_ensured_store() as conn:
+    with stores.open_cli_store() as conn:
+        # A selection for an account nothing will ever read is worse than an
+        # error: it confirms, and then changes nothing anybody can hear. The
+        # owner's own account is exempt, because choosing a voice before you
+        # have said anything is an ordinary first move (PERSONA-02).
+        if args.account != memory.owner_account() and not persona_store.account_exists(conn, args.account):
+            print(
+                f"error: no account named {args.account!r} has used this assistant "
+                f"— `sadana persona accounts` lists the ones that have",
+                file=sys.stderr,
+            )
+            return 1
         persona_store.set_selection(conn, args.account, args.name, now=time.time())
     print(f"{args.account!r} now speaks as {args.name!r} — conversations already open keep the voice they started with")
     return 0
@@ -110,4 +115,23 @@ def cmd_persona_new(args: argparse.Namespace) -> int:
         print(f"error: {e}", file=sys.stderr)
         return 1
     print(path)
+    return 0
+
+
+def cmd_persona_accounts(_args: argparse.Namespace) -> int:
+    owner = memory.owner_account()
+    with stores.open_cli_store() as conn:
+        accounts = persona_store.known_accounts(conn)
+        selections = {account: persona_store.get_selection(conn, account) for account in accounts}
+    if owner not in accounts:
+        # The owner always counts, even before they have said anything —
+        # `persona use` accepts them, so a listing that omitted them would
+        # contradict the command it exists to serve.
+        accounts = tuple(sorted((*accounts, owner)))
+        selections.setdefault(owner, None)
+    for account in accounts:
+        mark = " (owner)" if account == owner else ""
+        chosen = selections.get(account)
+        voice = chosen if chosen is not None else "the neutral voice"
+        print(f"{account}{mark}: {voice}")
     return 0

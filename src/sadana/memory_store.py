@@ -129,6 +129,69 @@ def set_rubric_override(conn: sqlite3.Connection, account_key: memory.AccountKey
         )
 
 
+#: The account-key prefix a scheduled trigger used to run under, before
+#: PERSONA-02 made scheduled work the owner's own. Only ever read, by the
+#: adoption below.
+_SCHEDULE_PREFIX = "schedule:"
+
+
+def accounts_with_memories(conn: sqlite3.Connection) -> frozenset[memory.AccountKey]:
+    """Every account something has been remembered about."""
+    rows = conn.execute("SELECT DISTINCT account_key FROM memory_entries").fetchall()
+    return frozenset(row["account_key"] for row in rows)
+
+
+def adopt_scheduled_memories(conn: sqlite3.Connection, owner: memory.AccountKey) -> int:
+    """Move what scheduled runs remembered under their own names into
+    `owner`'s memory, and return how many entries moved.
+
+    PERSONA-02: a trigger the owner wrote is the owner's own machinery, so
+    what it learned is theirs. Before that item, every scheduled run
+    remembered under `schedule:<trigger name>`, where nothing would ever read
+    it again once scheduling started running as the owner.
+
+    Loses nothing, which is the intent's own constraint and the reason this
+    is not a bare `UPDATE`: where the owner already holds an entry under the
+    same key, the incoming one is kept under `<entry_key>--<source account>`
+    rather than overwriting a fact the owner already had. Both texts survive;
+    one of them gets an uglier name.
+
+    Idempotent: after one pass no `schedule:` row is left, so every later call
+    finds nothing and returns 0. That is what makes it safe to run on every
+    process start rather than from a command somebody has to remember.
+
+    Does nothing at all if the owner's own account starts with `schedule:` —
+    a configuration nobody should have, and one that would otherwise have
+    rows migrating onto themselves.
+    """
+    if owner.startswith(_SCHEDULE_PREFIX):
+        return 0
+    rows = conn.execute(
+        "SELECT account_key, entry_key, content, updated_at FROM memory_entries WHERE account_key LIKE ?",
+        (_SCHEDULE_PREFIX + "%",),
+    ).fetchall()
+    if not rows:
+        return 0
+    with write_txn(conn) as c:
+        for row in rows:
+            taken = c.execute(
+                "SELECT 1 FROM memory_entries WHERE account_key = ? AND entry_key = ?",
+                (owner, row["entry_key"]),
+            ).fetchone()
+            entry_key = f"{row['entry_key']}--{row['account_key']}" if taken else row["entry_key"]
+            c.execute(
+                "INSERT INTO memory_entries (account_key, entry_key, content, updated_at) VALUES (?, ?, ?, ?) "
+                "ON CONFLICT (account_key, entry_key) "
+                "DO UPDATE SET content = excluded.content, updated_at = excluded.updated_at",
+                (owner, entry_key, row["content"], row["updated_at"]),
+            )
+            c.execute(
+                "DELETE FROM memory_entries WHERE account_key = ? AND entry_key = ?",
+                (row["account_key"], row["entry_key"]),
+            )
+    return len(rows)
+
+
 def ensure_plugin_seeded(plugins_root: Path) -> None:
     """If `plugins_root / "memory"` doesn't exist yet, copies the shipped
     plugin source there — the "if missing, write the default" idiom, for a

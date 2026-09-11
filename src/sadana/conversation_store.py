@@ -82,6 +82,20 @@ CREATE TABLE IF NOT EXISTS plugin_pauses (
     trace_json        TEXT NOT NULL,
     artifacts_json    TEXT NOT NULL
 );
+
+-- PERSONA-02 (docs/tasks/PERSONA-02-who-the-agent-is-talking-to/spec.md
+-- requirement 6). Whose conversation this is — a name, never a live
+-- reference, and a table rather than a column on `conversations`: the value
+-- would otherwise have to become a `Conversation` field to survive `save()`'s
+-- upsert, and a child conversation has no answer to give for it. Nothing
+-- reads this during a turn; it exists so the accounts listing can answer.
+-- A row written before this item simply has no row here, and lists as owned
+-- by nobody.
+
+CREATE TABLE IF NOT EXISTS conversation_accounts (
+    conversation_key  TEXT PRIMARY KEY REFERENCES conversations(key),
+    account_key       TEXT NOT NULL
+);
 """
 
 _CONVERSATION_COLUMNS = (
@@ -251,15 +265,35 @@ def _insert_messages(conn: sqlite3.Connection, conversation: Conversation, *, st
     )
 
 
-def create(conn: sqlite3.Connection, conversation: Conversation, *, now: float) -> None:
-    """Inserts one ``conversations`` row. Raises ``ConversationAlreadyExists``
-    on a primary-key collision, leaving the prior row untouched."""
+def create(conn: sqlite3.Connection, conversation: Conversation, *, now: float, account_key: str) -> None:
+    """Inserts one ``conversations`` row, and one ``conversation_accounts``
+    row naming whose it is. Raises ``ConversationAlreadyExists`` on a
+    primary-key collision, leaving the prior row untouched.
+
+    ``account_key`` is required rather than defaulted: a conversation always
+    belongs to somebody, and the next client to be written should not be able
+    to leave that unanswered by omission (PERSONA-02 requirement 6). Both rows
+    go in the one transaction this function already opened, so a conversation
+    can never exist without an owner recorded beside it."""
     with write_txn(conn) as c:
         try:
             c.execute(_INSERT_CONVERSATION_SQL, _conversation_row(conversation, now))
         except sqlite3.IntegrityError as exc:
             raise ConversationAlreadyExists(conversation.key) from exc
+        c.execute(
+            "INSERT INTO conversation_accounts (conversation_key, account_key) VALUES (?, ?) "
+            "ON CONFLICT (conversation_key) DO UPDATE SET account_key = excluded.account_key",
+            (conversation.key, account_key),
+        )
         _insert_messages(c, conversation)
+
+
+def accounts_with_conversations(conn: sqlite3.Connection) -> frozenset[str]:
+    """Every account that has started at least one conversation. Empty for a
+    store written before PERSONA-02, whose rows have no account recorded —
+    that is the honest answer, not a failure."""
+    rows = conn.execute("SELECT DISTINCT account_key FROM conversation_accounts").fetchall()
+    return frozenset(row["account_key"] for row in rows)
 
 
 def save(conn: sqlite3.Connection, conversation: Conversation, *, now: float, start_seq: int = 0) -> None:
@@ -295,8 +329,7 @@ def load(conn: sqlite3.Connection, key: ConversationKey, *, now: float) -> Conve
         raise ConversationNotFound(key)
 
     msg_rows = conn.execute(
-        "SELECT role, content, tool_calls_json, tool_call_id FROM messages "
-        "WHERE conversation_key = ? ORDER BY msg_seq",
+        "SELECT role, content, tool_calls_json, tool_call_id FROM messages WHERE conversation_key = ? ORDER BY msg_seq",
         (key,),
     ).fetchall()
     messages = tuple(

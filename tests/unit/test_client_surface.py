@@ -182,7 +182,7 @@ def test_a_non_completed_turn_still_carries_its_own_text_in_answer(monkeypatch: 
         system_message="",
         iteration_budget=IterationBudget(max_total=1, used=1),
     )
-    create(conn, exhausted, now=0.0)
+    create(conn, exhausted, now=0.0, account_key="a1")  # pragma: allowlist secret
 
     outcome = asyncio.run(
         take_turn(make_runtime(conn), account="a", conversation="k-exhausted", text="hi", create_as=None)

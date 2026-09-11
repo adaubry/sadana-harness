@@ -7,10 +7,10 @@ import threading
 
 import pytest
 
-from conftest import make_runtime, open_conn
-from sadana import client_surface, gateway_dispatch
-from sadana.conversation_store import due_triggers, upsert_scheduled_trigger
-from sadana.gateway import MessageEvent
+from conftest import make_runtime, open_conn, plain_response, write_character
+from sadana import client_surface, gateway_dispatch, memory, model_access, persona, persona_store, stores
+from sadana.conversation_store import due_triggers, load, upsert_scheduled_trigger
+from sadana.gateway import MessageEvent, session_key_for
 from sadana.scheduling import _advance, _is_due, tick
 
 
@@ -31,9 +31,13 @@ def test_advance_is_always_now_plus_interval_never_next_run_at_plus_interval() -
     assert _advance(now=1_000_000.0, interval_seconds=10.0) == 1_000_010.0
 
 
-def _fake_handle_inbound(calls: list[MessageEvent], *, raise_for: str | None = None):
-    async def _handle_inbound(_runtime: object, event: MessageEvent) -> tuple[bool, str]:
+def _fake_handle_inbound(
+    calls: list[MessageEvent], *, raise_for: str | None = None, accounts: list[str | None] | None = None
+):
+    async def _handle_inbound(_runtime: object, event: MessageEvent, *, account: str | None = None) -> tuple[bool, str]:
         calls.append(event)
+        if accounts is not None:
+            accounts.append(account)
         if event.chat_id == raise_for:
             raise RuntimeError("boom")
         return True, "ok"
@@ -135,3 +139,47 @@ def test_tick_wraps_its_own_conn_access_in_the_shared_conn_lock(monkeypatch: pyt
     # never nests an acquisition inside its own (which would deadlock the
     # real, non-reentrant threading.Lock).
     assert recording_lock.acquisitions == 2
+
+
+# ── PERSONA-02: a trigger the owner wrote runs as the owner ──────────────
+
+
+@pytest.mark.unit
+def test_a_fired_trigger_runs_as_the_owner_not_as_itself(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Whose the work is, and which thread it continues, are different
+    questions: the account becomes the owner's while the conversation key
+    stays the trigger's own."""
+    monkeypatch.setenv("SADANA_MEMORY_ACCOUNT", "adam")
+    conn = open_conn()
+    upsert_scheduled_trigger(conn, name="daily", trigger_text="go", next_run_at=0.0, interval_seconds=None)
+    calls: list[MessageEvent] = []
+    accounts: list[str | None] = []
+    monkeypatch.setattr(gateway_dispatch, "handle_inbound", _fake_handle_inbound(calls, accounts=accounts))
+
+    asyncio.run(tick(make_runtime(conn)))
+
+    assert accounts == [memory.owner_account()]
+    assert session_key_for(calls[0]) == "schedule:daily"
+
+
+@pytest.mark.unit
+def test_a_scheduled_conversation_speaks_in_the_owners_chosen_voice(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Acceptance criterion 2, end to end through the real bridge: the owner
+    chooses a character, a trigger fires, and the conversation it started
+    was created in that voice. Composition is the whole point of this item —
+    the account being the owner's is what makes the voice theirs."""
+    monkeypatch.setenv("SADANA_MEMORY_ACCOUNT", "adam")
+    monkeypatch.setattr(model_access, "send", lambda request: plain_response("done"))
+    character = write_character("working", body="You read the code first.")
+    conn = open_conn()
+    stores.ensure_schemas(conn)
+    persona_store.set_selection(conn, "adam", "working", now=0.0)
+    upsert_scheduled_trigger(conn, name="daily", trigger_text="go", next_run_at=0.0, interval_seconds=None)
+
+    asyncio.run(tick(make_runtime(conn)))
+
+    convo = load(conn, "schedule:daily", now=0.0)
+    assert convo.stable_prompt == persona.render(
+        persona_store.load_character(persona_store.characters_dir_from_config(), "working")
+    )
+    assert character.exists()

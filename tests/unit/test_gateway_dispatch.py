@@ -3,17 +3,28 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
 
 import pytest
 
 from conftest import make_runtime, plain_response
 from conftest import wait_then_summarize_installed as _wait_then_summarize_installed
-from sadana import memory_store, model_access, plugin_dispatch, plugins
+from sadana import channel_webhook, memory_store, model_access, plugin_dispatch, plugins
 from sadana.conversation import ConversationTemplate, IterationBudget, TemplateRecipe, create_conversation
-from sadana.conversation_store import create, load, load_pause, open_store, save_pause, store_path_from_config
+from sadana.conversation_store import (
+    accounts_with_conversations,
+    create,
+    load,
+    load_pause,
+    open_store,
+    save_pause,
+    store_path_from_config,
+)
 from sadana.gateway import MessageEvent
 from sadana.gateway_dispatch import handle_inbound
+
+_SECRET = "s3cr3t"  # pragma: allowlist secret - a fixed test fixture value, not a real credential
 
 
 @pytest.mark.unit
@@ -133,7 +144,7 @@ def test_handle_inbound_with_a_pause_row_resumes_without_calling_the_model(
         system_message="",
         iteration_budget=IterationBudget(max_total=10),
     )
-    create(conn, conversation, now=0.0)
+    create(conn, conversation, now=0.0, account_key="webhook:c1")  # pragma: allowlist secret
     save_pause(conn, conversation_key=key, plugin="p", entry="do_it", node="future", trace=(), artifacts=())
 
     event = MessageEvent(platform="webhook", chat_id="chat-resume", thread_id=None, text="42")
@@ -187,3 +198,50 @@ def test_handle_inbound_persists_a_pause_row_when_a_turns_dispatch_call_pauses(
     assert pause is not None
     assert pause.plugin == "p"
     assert pause.node == "future"
+
+
+# ── PERSONA-02: who the door is told this is ─────────────────────────────
+
+
+@pytest.mark.unit
+def test_a_webhook_message_still_runs_under_its_own_chat_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SADANA_MEMORY_ACCOUNT", "adam")
+    monkeypatch.setattr(model_access, "send", lambda request: plain_response("reply"))
+    conn = open_store(store_path_from_config())
+    event = MessageEvent(platform="webhook", chat_id="chat-9", thread_id=None, text="hello")
+
+    asyncio.run(handle_inbound(make_runtime(conn), event))
+
+    assert accounts_with_conversations(conn) == frozenset({"webhook:chat-9"})
+
+
+@pytest.mark.unit
+def test_an_account_in_the_payload_is_not_an_account(monkeypatch: pytest.MonkeyPatch) -> None:
+    """CLAUDE.md: an inbound channel envelope never carries the account it
+    belongs to. A sender claiming to be the owner is parsed as an unknown
+    key and dropped on the floor, so the turn still runs as the sender."""
+    monkeypatch.setenv("SADANA_MEMORY_ACCOUNT", "adam")
+    monkeypatch.setattr(model_access, "send", lambda request: plain_response("reply"))
+    conn = open_store(store_path_from_config())
+    body = json.dumps({"chat_id": "chat-9", "text": "hello", "account": "adam"}).encode("utf-8")
+
+    outcome = channel_webhook.parse_webhook_request(
+        headers={"X-Sadana-Webhook-Secret": _SECRET}, body=body, secret=_SECRET
+    )
+    assert isinstance(outcome, MessageEvent)
+    asyncio.run(handle_inbound(make_runtime(conn), outcome))
+
+    assert accounts_with_conversations(conn) == frozenset({"webhook:chat-9"})
+
+
+@pytest.mark.unit
+def test_a_trusted_caller_may_state_the_account(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The other half of the same rule: `scheduling.tick()` decided who this
+    is before calling, and that override reaches the door."""
+    monkeypatch.setattr(model_access, "send", lambda request: plain_response("reply"))
+    conn = open_store(store_path_from_config())
+    event = MessageEvent(platform="schedule", chat_id="daily", thread_id=None, text="go")
+
+    asyncio.run(handle_inbound(make_runtime(conn), event, account="adam"))
+
+    assert accounts_with_conversations(conn) == frozenset({"adam"})

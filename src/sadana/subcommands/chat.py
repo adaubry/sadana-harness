@@ -25,7 +25,7 @@ import sys
 import time
 from contextlib import closing
 
-from sadana import client_surface, config, memory
+from sadana import client_surface, memory
 from sadana.conversation import ConversationKey
 
 
@@ -82,7 +82,7 @@ def cmd_chat(args: argparse.Namespace) -> int:
     # The door resolves the provider and the model; the account it will not,
     # by design (CLIENT-SURFACE-01 requirement 3) — whoever asks states who
     # the person is, so this client holds its own default and says it out loud.
-    account = args.account or config.env("SADANA_MEMORY_ACCOUNT", "local")
+    account = args.account or memory.owner_account()
     runtime = client_surface.open_runtime(provider=args.provider, model=args.model)
 
     with closing(runtime.conn):
