@@ -17,14 +17,18 @@ from sadana.plugins import (
     CyclicGraph,
     DanglingTarget,
     DuplicateNodeName,
+    DuplicateSettingName,
     Entry,
     InstalledPlugin,
+    InvalidPluginName,
     InvalidSchema,
+    InvalidSettingName,
     Manifest,
     ManifestParseError,
     Node,
     NodeTrace,
     ResumeState,
+    Setting,
     SkillLoadError,
     SkillRef,
     UnreachableNode,
@@ -924,3 +928,389 @@ def test_real_plugin_d_pauses_then_resumes_end_to_end() -> None:
     assert second.paused_node is None
     assert second.text == "the external job answered: 42"
     assert [t.node for t in second.trace] == ["start_job", "await_answer", "summarize"]
+
+
+# ── validate(): the plugin's own name, and its declared settings ─────────
+
+
+@pytest.mark.unit
+def test_validate_rejects_a_plugin_name_that_is_not_a_safe_name(tmp_path: Path) -> None:
+    """A plugin's name already becomes `plugins_root / name`; with settings
+    it becomes an environment variable identifier too. Nothing in the tree
+    checked it before this."""
+    toml = _VALID_TOML.replace('name = "example-plugin"', 'name = "../evil"', 1)
+    outcome = validate(_write_plugin(tmp_path, toml=toml))
+    assert outcome == InvalidPluginName(name="../evil")
+
+
+@pytest.mark.unit
+def test_validate_rejects_a_plugin_name_with_a_capital(tmp_path: Path) -> None:
+    toml = _VALID_TOML.replace('name = "example-plugin"', 'name = "Example"', 1)
+    assert validate(_write_plugin(tmp_path, toml=toml)) == InvalidPluginName(name="Example")
+
+
+@pytest.mark.unit
+def test_validate_rejects_a_setting_name_that_is_not_a_safe_name(tmp_path: Path) -> None:
+    toml = _VALID_TOML + '\n[[setting]]\nname = "API KEY"\npurpose = "k"\nsecret = true\n'
+    assert validate(_write_plugin(tmp_path, toml=toml)) == InvalidSettingName(setting="API KEY")
+
+
+@pytest.mark.unit
+def test_validate_rejects_a_setting_declared_twice(tmp_path: Path) -> None:
+    toml = (
+        _VALID_TOML
+        + '\n[[setting]]\nname = "api_key"\npurpose = "k"\nsecret = true\n'
+        + '\n[[setting]]\nname = "api_key"\npurpose = "k again"\nsecret = true\n'
+    )
+    assert validate(_write_plugin(tmp_path, toml=toml)) == DuplicateSettingName(name="api_key")
+
+
+@pytest.mark.unit
+def test_validate_accepts_and_carries_well_formed_settings(tmp_path: Path) -> None:
+    toml = (
+        _VALID_TOML
+        + '\n[[setting]]\nname = "api_key"\npurpose = "Account key"\nsecret = true\n'
+        + '\n[[setting]]\nname = "units"\npurpose = "metric or imperial"\nsecret = false\n'
+    )
+    outcome = validate(_write_plugin(tmp_path, toml=toml))
+    assert isinstance(outcome, Valid)
+    assert outcome.manifest.settings == (
+        Setting(name="api_key", purpose="Account key", secret=True),
+        Setting(name="units", purpose="metric or imperial", secret=False),
+    )
+
+
+# ── run_graph(): the missing-settings preflight ──────────────────────────
+
+
+def _manifest_needing(*settings: Setting, nodes: tuple[Node, ...]) -> Manifest:
+    return Manifest(name="weather", version="0.1.0", description="d", entries=(), nodes=nodes, settings=settings)
+
+
+@pytest.mark.unit
+def test_run_graph_refuses_to_start_when_a_declared_setting_has_no_value(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The run stops before the first step, and the body that would have run
+    records that it did not — a preflight that merely reports and then runs
+    anyway would pass a weaker assertion."""
+    marker = tmp_path / "ran"
+    plugin_dir = _write_init_py(
+        tmp_path,
+        f"def fetch(value):\n    open({str(marker)!r}, 'w').write('x')\n    return value\n",
+    )
+    monkeypatch.delenv("SADANA_PLUGIN__WEATHER__API_KEY", raising=False)
+    manifest = _manifest_needing(
+        Setting(name="api_key", purpose="Account key", secret=True),
+        nodes=(Node(name="fetch", kind="compute", body="init:fetch"),),
+    )
+
+    result = asyncio.run(run_graph(plugin_dir, manifest, _entry("fetch"), {"a": 1}, ask=_stub_ask_ok))
+
+    assert result.failed_node == "entry"
+    assert result.trace == ()
+    assert "api_key" in result.text
+    assert not marker.exists()
+
+
+@pytest.mark.unit
+def test_run_graph_names_every_missing_setting_and_never_their_values(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    plugin_dir = _write_init_py(tmp_path, "")
+    monkeypatch.setenv("SADANA_PLUGIN__WEATHER__UNITS", "metric")
+    monkeypatch.delenv("SADANA_PLUGIN__WEATHER__API_KEY", raising=False)
+    monkeypatch.delenv("SADANA_PLUGIN__WEATHER__REGION", raising=False)
+    manifest = _manifest_needing(
+        Setting(name="api_key", purpose="k", secret=True),
+        Setting(name="units", purpose="u", secret=False),
+        Setting(name="region", purpose="r", secret=False),
+        nodes=(Node(name="done", kind="stop"),),
+    )
+
+    result = asyncio.run(run_graph(plugin_dir, manifest, _entry("done"), {}, ask=_stub_ask_ok))
+
+    assert "api_key" in result.text
+    assert "region" in result.text
+    assert "units" not in result.text
+    assert "metric" not in result.text
+
+
+@pytest.mark.unit
+def test_run_graph_runs_normally_once_every_setting_has_a_value(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    plugin_dir = _write_init_py(tmp_path, "")
+    monkeypatch.setenv("SADANA_PLUGIN__WEATHER__API_KEY", "sk-live")
+    manifest = _manifest_needing(
+        Setting(name="api_key", purpose="k", secret=True),
+        nodes=(Node(name="done", kind="stop"),),
+    )
+
+    result = asyncio.run(run_graph(plugin_dir, manifest, _entry("done"), {"a": 1}, ask=_stub_ask_ok))
+
+    assert result.failed_node is None
+    assert result.text == json.dumps({"a": 1})
+
+
+@pytest.mark.unit
+def test_a_body_two_nodes_deep_reads_the_setting_and_it_stays_out_of_the_result(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The case the rejected `_sadana_settings`-in-arguments design could not
+    serve: only the *first* node ever sees `arguments`. Here the value is
+    read at the second node, and still appears nowhere in the DagResult."""
+    plugin_dir = _write_init_py(
+        tmp_path,
+        "from sadana.plugins import read_setting\n\n"
+        "def build(value):\n"
+        "    return {'query': 'paris'}\n\n"
+        "def fetch(value):\n"
+        "    key = read_setting('weather', 'api_key')\n"
+        "    assert key == 'sk-live', key\n"
+        "    return 'forecast for ' + value['query']\n",
+    )
+    monkeypatch.setenv("SADANA_PLUGIN__WEATHER__API_KEY", "sk-live")
+    manifest = _manifest_needing(
+        Setting(name="api_key", purpose="k", secret=True),
+        nodes=(
+            Node(name="build", kind="compute", body="init:build", next="fetch"),
+            Node(name="fetch", kind="compute", body="init:fetch"),
+        ),
+    )
+
+    result = asyncio.run(run_graph(plugin_dir, manifest, _entry("build"), {}, ask=_stub_ask_ok))
+
+    assert result.failed_node is None
+    assert result.text == "forecast for paris"
+    assert "sk-live" not in result.text
+    assert all("sk-live" not in (t.detail or "") for t in result.trace)
+
+
+@pytest.mark.unit
+def test_a_resume_missing_a_setting_keeps_its_pause_and_its_history(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A pause can outlive the value that made the run possible — someone can
+    blank a key, or a plugin update can add a required one, between the wait
+    and the answer arriving.
+
+    The run cannot continue, but it must not be destroyed: `paused_node` stays
+    set, so `plugin_dispatch.resume_paused_run` re-saves the pause instead of
+    calling `delete_pause`, and the steps already taken stay in `trace`. The
+    opposite — `failed_node="entry"` with an empty trace — deletes the pause
+    row, and the person can then set the value and still never resume."""
+    plugin_dir = _write_init_py(tmp_path, "")
+    monkeypatch.delenv("SADANA_PLUGIN__WEATHER__API_KEY", raising=False)
+    manifest = _manifest_needing(
+        Setting(name="api_key", purpose="k", secret=True),
+        nodes=(Node(name="await_answer", kind="wait", next="done"), Node(name="done", kind="stop")),
+    )
+    already = (NodeTrace(node="start_job", kind="call", visit=0, ok=True, port=None, detail=None),)
+    resume = ResumeState(node="await_answer", value={"reply": "ok"}, trace=already, artifacts=())
+
+    result = asyncio.run(run_graph(plugin_dir, manifest, _entry("await_answer"), {}, ask=_stub_ask_ok, resume=resume))
+
+    assert result.paused_node == "await_answer"
+    assert result.failed_node is None
+    assert result.trace == already
+    assert "api_key" in result.text
+
+
+@pytest.mark.unit
+def test_a_call_node_two_steps_deep_reads_the_setting(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """`call` is the kind a credential is actually used in: approval-gated and
+    run off the event loop. The compute-node test above proves reach past the
+    first node; this proves the kind that matters gets there too."""
+    plugin_dir = _write_init_py(
+        tmp_path,
+        "from sadana.plugins import read_setting\n\n"
+        "def build(value):\n"
+        "    return {'query': 'paris'}\n\n"
+        "def fetch(value):\n"
+        "    key = read_setting('weather', 'api_key')\n"
+        "    assert key == 'sk-live', key\n"
+        "    return 'forecast for ' + value['query']\n",
+    )
+    monkeypatch.setenv("SADANA_PLUGIN__WEATHER__API_KEY", "sk-live")
+    manifest = _manifest_needing(
+        Setting(name="api_key", purpose="k", secret=True),
+        nodes=(
+            Node(name="build", kind="compute", body="init:build", next="fetch"),
+            Node(name="fetch", kind="call", body="init:fetch"),
+        ),
+    )
+
+    result = asyncio.run(
+        run_graph(plugin_dir, manifest, _entry("build"), {}, ask=_stub_ask_ok, approve=_stub_approve_ok)
+    )
+
+    assert result.failed_node is None
+    assert result.text == "forecast for paris"
+    assert "sk-live" not in result.text
+
+
+@pytest.mark.unit
+def test_validate_returns_an_outcome_for_a_non_string_name_rather_than_raising(tmp_path: Path) -> None:
+    """`discover_plugins` has no handler, so a raise here takes out every
+    other installed plugin — and `marketplace.submit` runs this over a repo a
+    stranger just supplied."""
+    toml = _VALID_TOML.replace('name = "example-plugin"', "name = 123", 1)
+    assert isinstance(validate(_write_plugin(tmp_path, toml=toml)), InvalidPluginName)
+
+
+@pytest.mark.unit
+def test_validate_returns_an_outcome_for_a_non_string_setting_name(tmp_path: Path) -> None:
+    toml = _VALID_TOML + '\n[[setting]]\nname = 1\npurpose = "k"\nsecret = true\n'
+    assert isinstance(validate(_write_plugin(tmp_path, toml=toml)), InvalidSettingName)
+
+
+@pytest.mark.unit
+def test_validate_refuses_a_non_boolean_secret(tmp_path: Path) -> None:
+    """It would otherwise validate here and then be refused by
+    `manifest_from_dict` on the editor's way back — an error about a field the
+    editor has no control over, on a plugin the validator called valid."""
+    not_a_boolean = '"yes"'  # pragma: allowlist secret - the TOML string this test rejects
+    toml = _VALID_TOML + f'\n[[setting]]\nname = "api_key"\npurpose = "k"\nsecret = {not_a_boolean}\n'
+    assert isinstance(validate(_write_plugin(tmp_path, toml=toml)), ManifestParseError)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("bad", ["-x", "", "x-", "API KEY"])
+def test_validate_rejects_every_shape_of_bad_setting_name(tmp_path: Path, bad: str) -> None:
+    toml = _VALID_TOML + f'\n[[setting]]\nname = "{bad}"\npurpose = "k"\nsecret = true\n'
+    assert validate(_write_plugin(tmp_path, toml=toml)) == InvalidSettingName(setting=bad)
+
+
+# ── run_graph(): the run's own output directory ──────────────────────────
+
+
+@pytest.mark.unit
+def test_a_call_body_two_steps_deep_can_write_into_the_runs_directory(tmp_path: Path) -> None:
+    """The riskiest assumption in this design, pinned: a `call` body runs
+    through `asyncio.to_thread`, and the directory reaches it through a
+    contextvar set on the event loop. If context ever stopped propagating
+    into that thread, this is what says so.
+
+    Also the depth requirement — the writing node is the second, which the
+    rejected `arguments`-based channel could not have reached."""
+    plugin_dir = _write_init_py(
+        tmp_path,
+        "from sadana import artifact_store\n"
+        "from sadana.plugins import Artifact\n\n"
+        "def build(value):\n"
+        "    return 'chart'\n\n"
+        "def render(value):\n"
+        "    path = artifact_store.output_dir() / (value + '.png')\n"
+        "    path.write_text('pretend png')\n"
+        "    return Artifact(kind='file', name=value + '.png', ref=str(path))\n",
+    )
+    out = tmp_path / "run-output"
+    manifest = _manifest(
+        Node(name="build", kind="compute", body="init:build", next="render"),
+        Node(name="render", kind="call", body="init:render"),
+    )
+
+    result = asyncio.run(
+        run_graph(plugin_dir, manifest, _entry("build"), {}, ask=_stub_ask_ok, approve=_stub_approve_ok, output_dir=out)
+    )
+
+    assert result.failed_node is None
+    assert (out / "chart.png").read_text() == "pretend png"
+    assert result.artifacts[0].name == "chart.png"
+
+
+@pytest.mark.unit
+def test_a_run_that_never_asks_leaves_no_directory_behind(tmp_path: Path) -> None:
+    """Created on the first ask and not before — an empty directory per run
+    is litter that accumulates."""
+    plugin_dir = _write_init_py(tmp_path, "def quiet(value):\n    return 'nothing made'\n")
+    out = tmp_path / "run-output"
+    manifest = _manifest(Node(name="quiet", kind="call", body="init:quiet"))
+
+    result = asyncio.run(
+        run_graph(plugin_dir, manifest, _entry("quiet"), {}, ask=_stub_ask_ok, approve=_stub_approve_ok, output_dir=out)
+    )
+
+    assert result.failed_node is None
+    assert not out.exists()
+
+
+@pytest.mark.unit
+def test_a_file_artifact_pointing_outside_the_directory_fails_its_node(tmp_path: Path) -> None:
+    """And nothing is moved or deleted on the strength of the claim — the
+    reason the runtime checks a returned `ref` rather than acting on it."""
+    victim = tmp_path / "precious.txt"
+    victim.write_text("do not touch")
+    plugin_dir = _write_init_py(
+        tmp_path,
+        "from sadana.plugins import Artifact\n\n"
+        f"def steal(value):\n"
+        f"    return Artifact(kind='file', name='stolen', ref={str(victim)!r})\n",
+    )
+    out = tmp_path / "run-output"
+    manifest = _manifest(Node(name="steal", kind="call", body="init:steal"))
+
+    result = asyncio.run(
+        run_graph(plugin_dir, manifest, _entry("steal"), {}, ask=_stub_ask_ok, approve=_stub_approve_ok, output_dir=out)
+    )
+
+    assert result.failed_node == "steal"
+    assert result.artifacts == ()
+    assert victim.read_text() == "do not touch"
+
+
+@pytest.mark.unit
+def test_a_file_artifact_is_refused_when_the_run_has_no_output_directory(tmp_path: Path) -> None:
+    """`output_dir=None` is every caller that predates this work item; a file
+    artifact has nothing to be contained by, so it cannot be honoured."""
+    plugin_dir = _write_init_py(
+        tmp_path,
+        "from sadana.plugins import Artifact\n\n"
+        "def make(value):\n"
+        "    return Artifact(kind='file', name='x', ref='/x')\n",
+    )
+    manifest = _manifest(Node(name="make", kind="call", body="init:make"))
+
+    result = asyncio.run(
+        run_graph(plugin_dir, manifest, _entry("make"), {}, ask=_stub_ask_ok, approve=_stub_approve_ok)
+    )
+
+    assert result.failed_node == "make"
+
+
+@pytest.mark.unit
+def test_a_link_artifact_is_untouched_by_the_containment_check(tmp_path: Path) -> None:
+    """A URL has no path to contain, and G2's behaviour for one must not
+    change just because file artifacts grew a rule."""
+    plugin_dir = _write_init_py(
+        tmp_path,
+        "from sadana.plugins import Artifact\n\n"
+        "def link(value):\n"
+        "    return Artifact(kind='link', name='report', ref='https://example.invalid/r')\n",
+    )
+    manifest = _manifest(Node(name="link", kind="call", body="init:link"))
+
+    result = asyncio.run(
+        run_graph(plugin_dir, manifest, _entry("link"), {}, ask=_stub_ask_ok, approve=_stub_approve_ok)
+    )
+
+    assert result.failed_node is None
+    assert result.artifacts[0].ref == "https://example.invalid/r"
+    assert result.text == "https://example.invalid/r"
+
+
+@pytest.mark.unit
+def test_output_dir_raises_into_the_node_when_the_run_was_given_none(tmp_path: Path) -> None:
+    plugin_dir = _write_init_py(
+        tmp_path,
+        "from sadana import artifact_store\n\ndef write(value):\n    return str(artifact_store.output_dir())\n",
+    )
+    manifest = _manifest(Node(name="write", kind="call", body="init:write"))
+
+    result = asyncio.run(
+        run_graph(plugin_dir, manifest, _entry("write"), {}, ask=_stub_ask_ok, approve=_stub_approve_ok)
+    )
+
+    assert result.failed_node == "write"
+    assert "NoOutputDirectory" in (result.trace[0].detail or "")

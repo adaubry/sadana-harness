@@ -210,24 +210,6 @@ def test_cmd_setup_creates_dotenv_0600_at_creation(monkeypatch: pytest.MonkeyPat
 
 
 @pytest.mark.unit
-def test_quote_env_value_strips_newlines(monkeypatch: pytest.MonkeyPatch) -> None:
-    # A newline in a value must not split one .env assignment across two
-    # physical lines — that would inject a second assignment the reader
-    # imports on the next load.
-    import sadana.subcommands.setup as setup_mod
-
-    value = 'abc"\nexport OPENROUTER_API_KEY="PWNED'
-    quoted = setup_mod._quote_env_value(value)
-    assert "\n" not in quoted
-    assert "\r" not in quoted
-    # and the written line round-trips to exactly the sanitized value
-    path = _env_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(f"OPENROUTER_API_KEY={quoted}\n", encoding="utf-8")
-    assert _read_env(path)["OPENROUTER_API_KEY"] == 'abc"export OPENROUTER_API_KEY="PWNED'
-
-
-@pytest.mark.unit
 def test_upsert_replaces_spaced_key_line(monkeypatch: pytest.MonkeyPatch) -> None:
     # A hand-edited "KEY = value" line is the same assignment to load_dotenv
     # (it strips the key's whitespace); the writer must replace it, not

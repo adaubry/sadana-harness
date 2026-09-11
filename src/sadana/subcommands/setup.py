@@ -3,8 +3,8 @@
 CLI-SHELL-06 of the CLI-SHELL block — the one command that turns a fresh
 instance into a working one. Owns its parser and its handler in one file,
 matching `chat.py`/`conversations.py`/`gateway.py`'s existing convention,
-and is the I/O half of the `.env` format whose read side is
-`config.load_dotenv()`.
+and prompts for and resolves its two values; the `.env` write half it used to
+own now lives in `env_file.py`, shared with `sadana plugin set`.
 
 What it fills, and in what order (per spec.md): for each value in
 `_VALUE_KINDS`, a flag on the command line wins, then a value already in the
@@ -20,9 +20,8 @@ import argparse
 import getpass
 import os
 import sys
-from pathlib import Path
 
-from sadana import config
+from sadana.env_file import drop_key, env_path, upsert_key
 
 # (env var, flag name, human prompt). Every value here is a secret — none
 # may be echoed. The single wired provider (openrouter) plus the daemon
@@ -62,75 +61,6 @@ def build_setup_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentP
 
 def _is_interactive() -> bool:
     return sys.stdin.isatty() and sys.stdout.isatty()
-
-
-def _env_path() -> Path:
-    return config.get_paths().state_dir / ".env"
-
-
-def _path_put(path: Path, text: str) -> None:
-    """Write ``text`` opening the file with mode 0600 — the file holds
-    secrets, so it must never be world-readable even for the instant
-    between creation and any later chmod (spec.md:430: "0600 via os.open +
-    mode in the write path")."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    try:
-        os.write(fd, text.encode("utf-8"))
-    finally:
-        os.close(fd)
-
-
-def _drop_key(path: Path, key: str) -> None:
-    """Remove every line assigning ``key``. Shares the writer's key
-    normalization, so a spaced ``KEY =`` line is removed too."""
-    if not path.exists():
-        return
-    lines = path.read_text(encoding="utf-8").splitlines()
-    out = [line for line in lines if _env_line_key(line) != key]
-    if len(out) == len(lines):
-        return
-    _path_put(path, "\n".join(out) + "\n")
-
-
-def _env_line_key(line: str) -> str:
-    """Return the var name a line assigns, or ``""`` if it assigns none.
-    Matches the reader's normalization: ``load_dotenv`` strips the key's
-    whitespace (``src/sadana/config.py``), so ``KEY=`` and ``KEY =`` are the
-    same assignment — both are replaced/reused here, never duplicated."""
-    key, sep, _ = line.strip().partition("=")
-    return key.strip() if sep else ""
-
-
-def _upsert_key(path: Path, key: str, value: str) -> None:
-    """Replace the line assigning ``key`` or append one, leaving other
-    lines' content unchanged. Only keys this command owns are touched."""
-    reinsert = f"{key}={_quote_env_value(value)}"
-    if not path.exists():
-        _path_put(path, f"{reinsert}\n")
-        return
-    lines = path.read_text(encoding="utf-8").splitlines()
-    out: list[str] = []
-    found = False
-    for line in lines:
-        if _env_line_key(line) == key:
-            out.append(reinsert)
-            found = True
-        else:
-            out.append(line)
-    if not found:
-        out.append(reinsert)
-    _path_put(path, "\n".join(out) + "\n")
-
-
-def _quote_env_value(value: str) -> str:
-    """Always double-quote (single quotes are ambiguous to systemd-style
-    parsers), and strip newlines so a value can never span physical lines —
-    a multi-line value would otherwise inject a second assignment into the
-    .env, which the reader splits on physical lines (hermes's
-    save_env_value strips \\n/\\r for the same reason)."""
-    value = value.replace("\n", "").replace("\r", "")
-    return f'"{value}"'
 
 
 def _resolve_values(args: argparse.Namespace) -> tuple[list[tuple[str, str]], list[str]]:
@@ -185,11 +115,11 @@ def cmd_setup(args: argparse.Namespace) -> int:
             print(f"  --{_FLAG_FOR_VAR[var]} <{var}>", file=sys.stderr)
         return 1
 
-    path = _env_path()
+    path = env_path()
     for var, value in resolved:
         if value:
-            _upsert_key(path, var, value)
+            upsert_key(path, var, value)
         else:
-            _drop_key(path, var)
+            drop_key(path, var)
     print("sadana setup complete. The instance is configured to run.")
     return 0

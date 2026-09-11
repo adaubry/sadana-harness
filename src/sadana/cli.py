@@ -13,7 +13,7 @@ from __future__ import annotations
 import argparse
 import sys
 
-from sadana import __version__, config
+from sadana import __version__, builtin_seed, config, plugins
 from sadana.subcommands.chat import build_chat_parser
 from sadana.subcommands.conversations import build_conversations_parser
 from sadana.subcommands.editor import build_editor_parser
@@ -48,6 +48,20 @@ def main(argv: list[str] | None = None) -> int:
     # subcommand reads config, never overriding a live env var.
     config.load_dotenv()
     args = build_parser().parse_args(sys.argv[1:] if argv is None else argv)
+    # The plugins shipped inside this package, placed where
+    # `discover_plugins()` looks — once, here, rather than at whichever
+    # subcommands remembered to. Doing it per-subcommand left a first-run trap
+    # with no way out: `plugin set` refuses a plugin that is not installed, a
+    # builtin only appeared once `chat` had seeded it, and `chat`'s first run
+    # is exactly what fails for want of a key. `editor` had the same hole from
+    # the other side, opening onto an empty plugin list on a fresh machine.
+    #
+    # *After* `parse_args`, deliberately: `--version`, `--help` and a parse
+    # error all exit inside it, and none of them should create directories or
+    # be able to fail on an unwritable state dir. The first placement was
+    # above this line with a comment claiming exactly this property, which it
+    # did not have.
+    builtin_seed.seed_all(plugins._plugins_root())
     return args.func(args)
 
 

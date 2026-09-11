@@ -61,6 +61,7 @@ WSL only. Python lives in `.venv`; `make` puts it on PATH for you, so there is n
 - A browser surface holds no logic that can be held in Python — layout, validation and assembly are computed server-side and sent as data, because nothing in this repo can test JavaScript.
 - A caller-supplied name that becomes a filesystem path is checked against an allowlist pattern before it touches a path, and the resolved path is re-checked to be inside its intended root — both, never either.
 - A client reaches a turn only through `client_surface.take_turn()` — `build_dispatch` and `take_turn_and_reconcile` have exactly one call site each in `src/`, inside `client_surface.py`, and a new client is a new file that states its own account and conversation key rather than an edit to that module; `eval_harness.py` is the one sanctioned non-client caller of `conversation.create_conversation`/`take_turn`, because an eval task is a hermetic single turn with no store, no account and a stubbed dispatch.
+- Text a plugin fetched from outside reaches the model only as a tool result, never as system-prompt or skill text: `ask` resolves its skill from `plugin.toml` alone, and no node kind may build prompt text out of a threaded value.
 
 ## Glossary
 

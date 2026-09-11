@@ -42,6 +42,7 @@ import time
 from dataclasses import dataclass, replace
 
 from sadana import (
+    builtin_seed,
     config,
     conversation_store,
     memory,
@@ -61,6 +62,7 @@ from sadana.conversation import (
     ExitReason,
     Message,
     TemplateRecipe,
+    TurnKey,
     append,
     create_conversation,
     iteration_budget_from_config,
@@ -161,7 +163,7 @@ def open_runtime(*, provider: str | None = None, model: str | None = None) -> Ru
     (`cmd_gateway_run`) does not, exactly as before this module existed.
     """
     config.load_dotenv()
-    memory_store.ensure_plugin_seeded(plugins._plugins_root())
+    builtin_seed.seed_all(plugins._plugins_root())
     plugin_set = plugin_dispatch.build_plugin_set(plugin_manifest.discover_plugins())
     conn = conversation_store.open_store(conversation_store.store_path_from_config())
     stores.ensure_schemas(conn)
@@ -389,8 +391,19 @@ async def take_turn(
                 raise
             convo = _create(runtime, account=account, conversation=conversation, template_name=create_as, now=now)
 
-        async def persist_pause(result: plugins.DagResult) -> None:
-            conversation_store.save_pause_from_result(conn, conversation_key=conversation, result=result)
+        async def persist_pause(turn_key: TurnKey, seq_in_turn: int, result: plugins.DagResult) -> None:
+            # The pause records the run it belonged to, so the resumed half
+            # writes into the same output directory the paused half used
+            # (`docs/tasks/ARTIFACT-STORE-01-somewhere-to-put-what-a-plugin
+            # -makes/spec.md`). `build_dispatch` hands over the same pair it
+            # just gave `record_plugin_run`.
+            conversation_store.save_pause_from_result(
+                conn,
+                conversation_key=conversation,
+                result=result,
+                turn_seq=turn_key.turn_seq,
+                seq_in_turn=seq_in_turn,
+            )
 
         dispatch, tracker = plugin_dispatch.build_dispatch(
             convo,

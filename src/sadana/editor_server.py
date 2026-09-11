@@ -37,17 +37,6 @@ from sadana import editor_layout, gateway, plugin_manifest, plugins
 _ASSETS = Path(__file__).parent / "editor_assets"
 _ASSET_TYPES = {".html": "text/html; charset=utf-8", ".js": "text/javascript", ".css": "text/css"}
 
-# A plugin name becomes a directory. Lowercase letters, digits and dashes
-# only, and it may not lead with a dash — which leaves no way to spell `..`,
-# a separator, or an absolute path (CLAUDE.md: a caller-supplied name that
-# becomes a filesystem path is checked against an allowlist *and* re-checked
-# after resolution).
-# The length cap is not cosmetic: without it a 400-character name passes
-# every check here and then raises `OSError: File name too long` from the
-# first `is_file()`, which used to escape `handle()` as a 500 carrying the
-# absolute path of the plugins directory.
-_SAFE_NAME = re.compile(r"[a-z0-9][a-z0-9-]{0,63}")
-
 
 @dataclass(frozen=True)
 class Response:
@@ -62,18 +51,6 @@ def _json(status: int, payload: dict) -> Response:
 
 def _error(status: int, message: str) -> Response:
     return _json(status, {"error": message})
-
-
-def _plugin_dir(plugins_root: Path, name: str) -> Path | None:
-    """The directory `name` refers to, or `None` if the name is not one this
-    server will touch. Both halves of the rule, never either: the pattern is
-    the intent, the containment check after resolution is the proof."""
-    if not _SAFE_NAME.fullmatch(name):
-        return None
-    candidate = plugins_root / name
-    if candidate.resolve().parent != plugins_root.resolve():
-        return None
-    return candidate
 
 
 def _defined_functions(source: str) -> set[str]:
@@ -295,7 +272,7 @@ def _create(plugins_root: Path, body: bytes) -> Response:
     if not isinstance(payload, dict) or not isinstance(payload.get("name"), str):
         return _error(400, "'name' is required and must be a string")
     name = payload["name"]
-    directory = _plugin_dir(plugins_root, name)
+    directory = plugins.plugin_dir(plugins_root, name)
     if directory is None:
         return _error(400, "a plugin name may hold only lowercase letters, digits and dashes")
     if directory.exists():
@@ -452,7 +429,7 @@ def handle(
 
     if path.startswith("/api/plugins/"):
         name, _, tail = path[len("/api/plugins/") :].partition("/")
-        directory = _plugin_dir(plugins_root, name)
+        directory = plugins.plugin_dir(plugins_root, name)
         if directory is None:
             return _error(400, "a plugin name may hold only lowercase letters, digits and dashes")
         if not (directory / "plugin.toml").is_file():

@@ -1,0 +1,11 @@
+{
+  "type": "object",
+  "properties": {
+    "prompt": {
+      "type": "string",
+      "description": "What to draw, described in plain language. Be specific about subject, style and composition."
+    }
+  },
+  "required": ["prompt"],
+  "additionalProperties": false
+}

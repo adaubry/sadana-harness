@@ -14,11 +14,8 @@ synthetic id.
 
 from __future__ import annotations
 
-import shutil
 import sqlite3
-import tempfile
 from dataclasses import dataclass
-from pathlib import Path
 
 from sadana import memory
 from sadana.conversation_store import write_txn
@@ -38,13 +35,6 @@ CREATE TABLE IF NOT EXISTS memory_rubric_overrides (
     updated_at  REAL NOT NULL
 );
 """
-
-# The on-disk source of truth for the first-party `memory` plugin, shipped
-# inside this package so `ensure_plugin_seeded` can materialize it into a
-# fresh `_plugins_root()` without a network fetch — plugin distribution
-# (PLUGIN-INSTALL-01) is unaffected: this is not installed *through* that
-# pipeline, only placed where `discover_plugins()` already looks.
-_BUILTIN_PLUGIN_SOURCE = Path(__file__).resolve().parent / "builtin_plugins" / "memory"
 
 
 @dataclass(frozen=True)
@@ -190,27 +180,3 @@ def adopt_scheduled_memories(conn: sqlite3.Connection, owner: memory.AccountKey)
                 (row["account_key"], row["entry_key"]),
             )
     return len(rows)
-
-
-def ensure_plugin_seeded(plugins_root: Path) -> None:
-    """If `plugins_root / "memory"` doesn't exist yet, copies the shipped
-    plugin source there — the "if missing, write the default" idiom, for a
-    directory tree rather than one file. A no-op on every call after the first.
-
-    Copies into a sibling temp directory first and renames it into place,
-    so a process killed mid-copy never leaves a half-written `memory/`
-    directory for `discover_plugins()` to trip over — the rename is one
-    atomic filesystem op, same as `open()`+`os.replace()`-style writes
-    elsewhere in this project. Not guarding against a second *process*
-    racing this one: this project's own posture is single-writer until a
-    real concurrent-caller incident shows up (CLAUDE.md), not before."""
-    destination = plugins_root / "memory"
-    if destination.exists():
-        return
-    plugins_root.mkdir(parents=True, exist_ok=True)
-    staging = Path(tempfile.mkdtemp(dir=plugins_root))
-    shutil.copytree(_BUILTIN_PLUGIN_SOURCE, staging, dirs_exist_ok=True)
-    try:
-        staging.rename(destination)
-    except OSError:
-        shutil.rmtree(staging, ignore_errors=True)

@@ -1,0 +1,20 @@
+[plugin]
+name = "image-gen"
+version = "0.1.0"
+description = "Draws a picture from a description and saves it as a file."
+
+[[entry]]
+tool = "image.draw"
+purpose = "Draw a picture. Use this when someone asks for an image, a diagram, an illustration or a mock-up rather than a description of one. Costs money each time, and returns the path of a file rather than the picture itself."
+parameters = "schema/draw.json"
+start = "draw"
+
+[[node]]
+name = "draw"
+kind = "call"
+body = "draw:draw"
+
+[[setting]]
+name = "api_key"
+purpose = "OpenRouter API key — https://openrouter.ai/keys (the same key `sadana setup` asks for; this plugin keeps its own copy on purpose)"
+secret = true  # pragma: allowlist secret - declares that a value is a secret, is not one

@@ -1,0 +1,20 @@
+[plugin]
+name = "browse"
+version = "0.1.0"
+description = "Drives a real web browser to carry out a task and reports what it found. Needs `uvx` and a browser; fetches the browser-automation software from the network on first use."
+
+[[entry]]
+tool = "web.browse"
+purpose = "Give this a goal in plain English and it drives a real browser to achieve it, then reports back. Use it when the answer needs the page itself — a form, a table, what happened after clicking — rather than what search results say about it. Slow, costs model calls, and the pages it reads are sent to a model to decide each step."
+parameters = "schema/browse.json"
+start = "browse"
+
+[[node]]
+name = "browse"
+kind = "call"
+body = "browse:browse"
+
+[[setting]]
+name = "api_key"
+purpose = "OpenRouter API key — https://openrouter.ai/keys (the browser drives its own model to decide each step, so every browse costs several model calls, and the pages it reads are sent to that model)"
+secret = true  # pragma: allowlist secret - declares that a value is a secret, is not one

@@ -1,0 +1,20 @@
+[plugin]
+name = "web-search"
+version = "0.1.0"
+description = "Looks something up on the web and reports what the search results say."
+
+[[entry]]
+tool = "web.search"
+purpose = "Search the web. Use this whenever the answer depends on something recent, local, or that you might be out of date about, rather than answering from memory."
+parameters = "schema/search.json"
+start = "search"
+
+[[node]]
+name = "search"
+kind = "call"
+body = "search:search"
+
+[[setting]]
+name = "api_key"
+purpose = "Brave Search API key — free tier, sign up at https://brave.com/search/api/"
+secret = true  # pragma: allowlist secret - declares that a value is a secret, is not one

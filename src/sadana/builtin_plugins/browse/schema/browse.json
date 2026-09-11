@@ -1,0 +1,11 @@
+{
+  "type": "object",
+  "properties": {
+    "task": {
+      "type": "string",
+      "description": "What to achieve, in plain English, including any starting point. For example: 'On example.com, find the current price of the standard plan and report it.'"
+    }
+  },
+  "required": ["task"],
+  "additionalProperties": false
+}

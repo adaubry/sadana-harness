@@ -637,3 +637,74 @@ def test_a_conversation_recorded_before_this_item_still_loads_and_belongs_to_nob
 
     assert load(conn, "legacy", now=0.0).key == "legacy"
     assert accounts_with_conversations(conn) == frozenset()
+
+
+# ── a pause remembers which run it belonged to ───────────────────────────
+
+
+@pytest.mark.unit
+def test_a_pause_round_trips_the_run_it_belonged_to(tmp_path: Path) -> None:
+    """So the resumed half writes into the same directory the paused half
+    did — a run's output directory is keyed by turn and sequence, and a
+    resume happens in a later process with nothing else to go on."""
+    conn = open_store(tmp_path / "c.db")
+    save_pause(
+        conn,
+        conversation_key="k1",
+        plugin="plugin-d",
+        entry="plugin_d_entry",
+        node="await_answer",
+        trace=(),
+        artifacts=(),
+        turn_seq=4,
+        seq_in_turn=2,
+    )
+
+    pause = load_pause(conn, conversation_key="k1")
+
+    assert pause is not None
+    assert (pause.turn_seq, pause.seq_in_turn) == (4, 2)
+
+
+@pytest.mark.unit
+def test_a_store_whose_plugin_pauses_predates_these_columns_migrates_and_still_loads(tmp_path: Path) -> None:
+    """The migration's actual safety claim, driven through the ALTER branch.
+
+    Every store already on disk has a `plugin_pauses` without these two
+    columns, and `load_pause`'s SELECT names them — so if the new DDL were
+    wrong, the first `open_store` or the first resume against a real store
+    would fail. Writing the pre-migration table by hand is the only way to
+    execute that path: `open_store` on a fresh file creates the table from
+    `_SCHEMA`, which already has both columns, so a row that merely omits
+    them proves the NULL read and nothing about the migration.
+    """
+    path = tmp_path / "c.db"
+    raw = sqlite3.connect(path)
+    raw.execute(
+        """CREATE TABLE plugin_pauses (
+            conversation_key  TEXT PRIMARY KEY,
+            plugin            TEXT NOT NULL,
+            entry             TEXT NOT NULL,
+            node              TEXT NOT NULL,
+            trace_json        TEXT NOT NULL,
+            artifacts_json    TEXT NOT NULL
+        )"""
+    )
+    raw.execute(
+        "INSERT INTO plugin_pauses (conversation_key, plugin, entry, node, trace_json, artifacts_json) "
+        "VALUES ('k1', 'plugin-d', 'plugin_d_entry', 'await_answer', '[]', '[]')"
+    )
+    raw.commit()
+    raw.close()
+
+    conn = open_store(path)
+    pause = load_pause(conn, conversation_key="k1")
+
+    assert pause is not None
+    assert pause.node == "await_answer"
+    assert pause.turn_seq is None
+    assert pause.seq_in_turn is None
+
+    # Idempotent: a second open of the same file must not re-run the ALTER.
+    reopened = open_store(path)
+    assert load_pause(reopened, conversation_key="k1") is not None

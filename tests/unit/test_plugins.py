@@ -17,22 +17,32 @@ from sadana.plugins import (
     DagResult,
     DanglingTarget,
     DuplicateNodeName,
+    DuplicateSettingName,
     Entry,
     InstalledPlugin,
+    InvalidPluginName,
     InvalidSchema,
+    InvalidSettingName,
     Manifest,
     ManifestParseError,
     Node,
     NodeTrace,
+    Setting,
     UnreachableNode,
     UnresolvedBody,
     UnresolvedSkill,
     Valid,
     _parse_manifest,
+    add_node,
     describe_manifest_outcome,
     manifest_from_dict,
     manifest_to_dict,
     manifest_to_toml,
+    missing_settings,
+    read_setting,
+    remove_node,
+    rename_node,
+    setting_env_var,
 )
 
 # ── Artifact ─────────────────────────────────────────────────────────────
@@ -228,6 +238,7 @@ def test_manifest_to_dict_round_trips_every_field_as_json_safe_primitives() -> N
                 "ports": ["urgent", "normal"],
             },
         ],
+        "settings": [],
     }
 
 
@@ -240,6 +251,7 @@ def test_manifest_to_dict_handles_no_entries_and_no_nodes() -> None:
         "description": "d",
         "entries": [],
         "nodes": [],
+        "settings": [],
     }
 
 
@@ -447,3 +459,199 @@ def test_manifest_from_dict_raises_value_error_for_non_list_ports() -> None:
     }
     with pytest.raises(ValueError, match="'ports'"):
         manifest_from_dict(data)
+
+
+# ── Setting ──────────────────────────────────────────────────────────────
+
+
+@pytest.mark.unit
+def test_setting_constructs_with_its_documented_fields() -> None:
+    setting = Setting(name="api_key", purpose="Account key for the weather service", secret=True)
+    assert setting.name == "api_key"
+    assert setting.purpose == "Account key for the weather service"
+    assert setting.secret is True
+
+
+@pytest.mark.unit
+def test_setting_is_frozen() -> None:
+    setting = Setting(name="units", purpose="metric or imperial", secret=False)
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        setting.secret = True  # type: ignore[misc]
+
+
+@pytest.mark.unit
+def test_manifest_declares_no_settings_by_default() -> None:
+    """The field is trailing and defaulted so every construction that
+    predates it keeps meaning what it meant."""
+    manifest = Manifest(name="p", version="0.1.0", description="d", entries=(), nodes=())
+    assert manifest.settings == ()
+
+
+# ── setting_env_var / read_setting / missing_settings ────────────────────
+
+
+@pytest.mark.unit
+def test_setting_env_var_namespaces_by_plugin_and_setting() -> None:
+    assert setting_env_var("my-plugin", "api_key") == "SADANA_PLUGIN__MY_PLUGIN__API_KEY"
+
+
+@pytest.mark.unit
+def test_setting_env_var_separator_keeps_two_plugins_apart() -> None:
+    """The whole reason the separator is doubled: with a single underscore,
+    plugin "a-b" setting "c" and plugin "a" setting "b_c" would name the
+    same variable, and one plugin would read the other's value."""
+    assert setting_env_var("a-b", "c") != setting_env_var("a", "b_c")
+
+
+@pytest.mark.unit
+def test_setting_env_var_refuses_a_name_that_never_passed_validation() -> None:
+    with pytest.raises(AssertionError):
+        setting_env_var("../evil", "api_key")
+
+
+@pytest.mark.unit
+def test_read_setting_returns_the_value_when_set(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SADANA_PLUGIN__WEATHER__API_KEY", "sk-live")
+    assert read_setting("weather", "api_key") == "sk-live"
+
+
+@pytest.mark.unit
+def test_read_setting_is_none_when_unset(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("SADANA_PLUGIN__WEATHER__API_KEY", raising=False)
+    assert read_setting("weather", "api_key") is None
+
+
+@pytest.mark.unit
+def test_read_setting_treats_an_empty_value_as_unset(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A blank line in .env is a value nobody supplied; conflating the two
+    is what stops the preflight being defeated by one."""
+    monkeypatch.setenv("SADANA_PLUGIN__WEATHER__API_KEY", "")
+    assert read_setting("weather", "api_key") is None
+
+
+@pytest.mark.unit
+def test_missing_settings_reports_only_the_unset_ones_in_declaration_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manifest = Manifest(
+        name="weather",
+        version="0.1.0",
+        description="d",
+        entries=(),
+        nodes=(),
+        settings=(
+            Setting(name="api_key", purpose="key", secret=True),
+            Setting(name="units", purpose="metric or imperial", secret=False),
+            Setting(name="region", purpose="which region", secret=False),
+        ),
+    )
+    monkeypatch.setenv("SADANA_PLUGIN__WEATHER__UNITS", "metric")
+    monkeypatch.delenv("SADANA_PLUGIN__WEATHER__API_KEY", raising=False)
+    monkeypatch.delenv("SADANA_PLUGIN__WEATHER__REGION", raising=False)
+
+    assert missing_settings(manifest) == ("api_key", "region")
+
+
+@pytest.mark.unit
+def test_missing_settings_is_empty_for_a_manifest_that_declares_none() -> None:
+    manifest = Manifest(name="p", version="0.1.0", description="d", entries=(), nodes=())
+    assert missing_settings(manifest) == ()
+
+
+# ── settings through every round trip ────────────────────────────────────
+
+
+def _manifest_with_settings() -> Manifest:
+    return Manifest(
+        name="weather",
+        version="0.1.0",
+        description="One sentence.",
+        entries=(Entry(tool="forecast", purpose="p", parameters="s.json", start="fetch"),),
+        nodes=(Node(name="fetch", kind="call", body="init:fetch"),),
+        settings=(
+            Setting(name="api_key", purpose="Account key — sign up at example.com", secret=True),
+            Setting(name="units", purpose="metric or imperial", secret=False),
+        ),
+    )
+
+
+@pytest.mark.unit
+def test_settings_survive_the_dict_round_trip() -> None:
+    manifest = _manifest_with_settings()
+    assert manifest_from_dict(manifest_to_dict(manifest)) == manifest
+
+
+@pytest.mark.unit
+def test_settings_survive_the_toml_round_trip() -> None:
+    """The editor writes plugin.toml from a Manifest and the loader reads it
+    back; a settings arm present in one direction only would delete a
+    plugin's settings on its next save."""
+    manifest = _manifest_with_settings()
+    assert _parse_manifest(manifest_to_toml(manifest)) == manifest
+
+
+@pytest.mark.unit
+def test_manifest_from_dict_rejects_a_non_boolean_secret() -> None:
+    data = {
+        "name": "p",
+        "version": "0.1.0",
+        "description": "d",
+        # "yes" is the non-boolean this test exists to reject, not a value.
+        "settings": [{"name": "api_key", "purpose": "k", "secret": "yes"}],  # pragma: allowlist secret
+    }
+    with pytest.raises(ValueError, match="'secret'"):
+        manifest_from_dict(data)
+
+
+@pytest.mark.unit
+def test_manifest_from_dict_accepts_a_manifest_with_no_settings_key() -> None:
+    """What every manifest posted back before this field existed looks like."""
+    data = {"name": "p", "version": "0.1.0", "description": "d"}
+    assert manifest_from_dict(data).settings == ()
+
+
+# ── the three new manifest outcomes ──────────────────────────────────────
+
+
+@pytest.mark.unit
+def test_invalid_plugin_name_carries_the_name() -> None:
+    assert InvalidPluginName(name="Foo").name == "Foo"
+
+
+@pytest.mark.unit
+def test_invalid_setting_name_carries_the_setting() -> None:
+    assert InvalidSettingName(setting="API KEY").setting == "API KEY"
+
+
+@pytest.mark.unit
+def test_duplicate_setting_name_carries_the_name() -> None:
+    assert DuplicateSettingName(name="api_key").name == "api_key"
+
+
+@pytest.mark.unit
+def test_each_new_outcome_describes_itself_distinctly() -> None:
+    descriptions = {
+        describe_manifest_outcome(InvalidPluginName(name="Foo")),
+        describe_manifest_outcome(InvalidSettingName(setting="API KEY")),
+        describe_manifest_outcome(DuplicateSettingName(name="api_key")),
+    }
+    assert len(descriptions) == 3
+    for text in descriptions:
+        assert text
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "edit",
+    [
+        pytest.param(lambda m: rename_node(m, "fetch", "collect"), id="rename"),
+        pytest.param(lambda m: remove_node(m, "fetch"), id="remove"),
+        pytest.param(lambda m: add_node(m, "stop")[0], id="add"),
+    ],
+)
+def test_editing_the_graph_never_drops_the_plugins_settings(edit) -> None:  # type: ignore[no-untyped-def]
+    """Every editor edit goes through one of these. Two of them rebuilt the
+    Manifest field by field, which silently deleted the settings a person had
+    already filled in — and nothing failed until the next run."""
+    manifest = _manifest_with_settings()
+    assert edit(manifest).settings == manifest.settings

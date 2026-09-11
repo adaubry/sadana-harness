@@ -42,6 +42,21 @@ files = ["src"]
 # provider grows enough real logic to want static checking, give it a
 # hyphen-free package under sadana/ proper and re-include it here.
 exclude = ["^src/sadana/model_providers/"]
+
+# builtin_plugins/ is deliberately NOT excluded, and keeping it that way
+# constrains how a plugin body is named. A body is loaded by
+# `plugin_manifest._load_body_module` via spec_from_file_location and never
+# imported, so its filename is free — but a plugin directory carrying a hyphen
+# (`web-search`, `image-gen`) is not a valid package name, and mypy falls back
+# to treating the body as a *top-level* module named after the file. Two such
+# plugins both shipping `init.py` collide on the module name `init`, and mypy
+# refuses to check either of them.
+#
+# So each hyphenated plugin names its body for what it does — `search.py`,
+# `draw.py` — and `plugin.toml` points `body` at it. `memory/` has no hyphen,
+# resolves as a real package, and keeps `init.py` safely. Excluding the whole
+# directory was tried first and was worse: it silently dropped the checking
+# those bodies already had, to solve a collision between exactly two files.
 warn_unused_configs = true
 warn_redundant_casts = true
 warn_unused_ignores = true

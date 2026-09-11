@@ -13,7 +13,6 @@ from sadana.memory_store import (
     accounts_with_memories,
     adopt_scheduled_memories,
     delete_entry,
-    ensure_plugin_seeded,
     ensure_schema,
     get_rubric_override,
     list_entries,
@@ -96,26 +95,6 @@ def test_rubric_override_same_account_updates_not_duplicates(conn) -> None:  # t
 def test_rubric_override_never_leaks_across_accounts(conn) -> None:  # type: ignore[no-untyped-def]
     set_rubric_override(conn, "a1", "a1's own rubric", now=1.0)
     assert get_rubric_override(conn, "a2") == ""
-
-
-@pytest.mark.unit
-def test_ensure_plugin_seeded_materializes_plugin_toml(tmp_path) -> None:  # type: ignore[no-untyped-def]
-    plugins_root = tmp_path / "plugins"
-    ensure_plugin_seeded(plugins_root)
-    assert (plugins_root / "memory" / "plugin.toml").is_file()
-    assert (plugins_root / "memory" / "init.py").is_file()
-    assert (plugins_root / "memory" / "schema" / "remember.json").is_file()
-
-
-@pytest.mark.unit
-def test_ensure_plugin_seeded_is_idempotent(tmp_path) -> None:  # type: ignore[no-untyped-def]
-    plugins_root = tmp_path / "plugins"
-    ensure_plugin_seeded(plugins_root)
-    marker = plugins_root / "memory" / "plugin.toml"
-    original = marker.read_text(encoding="utf-8")
-    marker.write_text(original + "\n# local edit\n", encoding="utf-8")
-    ensure_plugin_seeded(plugins_root)  # must not overwrite an existing directory
-    assert marker.read_text(encoding="utf-8") == original + "\n# local edit\n"
 
 
 # ── PERSONA-02: what the schedules remembered becomes the owner's ────────
