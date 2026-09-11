@@ -1,9 +1,38 @@
 # Capability import blueprint
 
-Status: in progress. Written 2026-09-10 against `c299819`; §4.2 corrected
-2026-09-11 against `4b3d108` — see the correction in that section.
-Cited by: `PLUGIN-CONFIG-01`, `ARTIFACT-STORE-01`, `WEB-SEARCH-01`,
-`IMAGE-GEN-01`, `SUBPROCESS-01`, `BROWSE-01` (items 1-6 of §8).
+Status: **closed 2026-09-11.** All six §8 work items are built, reviewed and
+merged. Written 2026-09-10 against `c299819`; §4.2 corrected 2026-09-11 against
+`4b3d108` — see the correction in that section.
+
+Cited by, in the order they landed: `PLUGIN-CONFIG-01` (`dfd4552`),
+`ARTIFACT-STORE-01` (`a171233`), `WEB-SEARCH-01` (`0e4f537`), `IMAGE-GEN-01`
+(`508829b`), `SUBPROCESS-01` (`4b3d108`), `BROWSE-01` (`6f44f34`).
+
+**What this document got right, and what it got wrong**, recorded here because
+the next blueprint will be written by someone reading this one:
+
+- The **ordering was right**, including the part that looked backwards. Item 1
+  (per-plugin config) really did block everything, and putting it before the
+  capability everyone wanted was correct.
+- **§6 Rule 1 held six times.** Not one import needed a backend seam, and the
+  registry reflex §9 Risk 1 predicts never once looked justified in the moment.
+- **The shape held.** Items 2, 4 and 6 each needed *no change* to `run_graph`,
+  the node vocabulary, the approval gate or the settings mechanism. That was
+  the claim §8 item 2 existed to test, and it is the plan's main result.
+- **§4.2's evidence was false**, and nothing caught it for five work items
+  because the document was cited by section number rather than checked against
+  the code it described. Corrected in place. The shape rule itself survived.
+- **§5.6's four gaps were the right four.** Three are closed (1, 2, 3);
+  **gap 4, `each` not runnable, is still open and still has no work item** —
+  the same sentence this document shipped with.
+
+What this plan generated and did not finish: five maintain-stage `intent.md`s
+(retention of what plugins make; a `.env` nothing reads; a CLI error that blames
+the wrong thing; `plugin_install._git` inheriting the whole environment and
+pinning no git protocol policy; and a shipped plugin being materialised once and
+never updated). Three are written and uncommitted — the chain gate declines a
+work item that has only an intent, which is itself an unresolved question about
+what the maintain stage is allowed to produce.
 
 **Moving target:** `GATEWAY-DAEMON-02-scheduled-and-resumable-triggers` was in
 build while this was being written, and lands the `wait` node plus a scheduler.
