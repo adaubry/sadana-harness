@@ -78,8 +78,9 @@ def test_cmd_gateway_run_starts_the_scheduling_tick_thread_before_the_daemon(
     assert result == 0
     assert called.wait(timeout=5), "scheduling.run_tick_loop was never started"
     assert seen["interval_seconds"] == 30
-    assert "conn" in seen
-    assert "plugin_set" in seen
+    # the connection, the plugin scan, the persona, the provider, the model
+    # and the recorder all travel inside the one runtime now
+    assert "runtime" in seen
 
 
 @pytest.mark.unit

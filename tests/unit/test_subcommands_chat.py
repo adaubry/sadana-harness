@@ -9,9 +9,10 @@ from pathlib import Path
 import pytest
 
 from conftest import conversation as _build_conversation
-from conftest import plain_response, tool_call_response
+from conftest import plain_response, tool_call_response, tool_then_text
+from conftest import wait_then_summarize_installed as _wait_then_summarize_installed
 from sadana import memory_store, model_access
-from sadana.conversation import Conversation
+from sadana.conversation import Conversation, IterationBudget
 from sadana.conversation_store import ConversationNotFound, create, load, open_store, store_path_from_config
 from sadana.persona import persona_path_from_config
 from sadana.subcommands.chat import build_chat_parser, cmd_chat
@@ -195,6 +196,83 @@ def test_cmd_chat_declined_approval_stops_the_call_node_safely(monkeypatch: pyte
 
     loaded = _load("approval-test")
     assert loaded.next_turn_seq == 1  # the turn still completed; the call node just didn't run
+
+
+# ── cmd_chat: what lands on stdout, what lands on stderr, what the exit says ─
+
+
+@pytest.mark.unit
+def test_cmd_chat_prints_a_completed_turns_answer_to_stdout_and_nothing_to_stderr(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(model_access, "send", lambda request: plain_response("the answer"))
+    _feed(monkeypatch, "hello")
+
+    assert cmd_chat(_args(key="stdout-test")) == 0
+
+    captured = capsys.readouterr()
+    assert "the answer" in captured.out
+    assert captured.err == ""
+
+
+@pytest.mark.unit
+def test_cmd_chat_sends_a_budget_exhausted_turns_own_summary_to_stdout_not_stderr(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A turn that did not complete can still carry real words —
+    `conversation.py`'s EPILOGUE — and those words are the answer, so they
+    belong on stdout with only the exit code reporting that something went
+    wrong. Routing them to stderr instead is the regression
+    `client_surface.TurnOutcome`'s three fields exist to make impossible, and
+    this is the only test that watches the streams themselves."""
+    conn = open_store(store_path_from_config())
+    create(conn, _build_conversation(key="exhausted", iteration_budget=IterationBudget(max_total=1, used=1)), now=0.0)
+    monkeypatch.setattr(model_access, "send", lambda request: plain_response("here is what we did"))
+    _feed(monkeypatch, "hello")
+
+    assert cmd_chat(_args(resume="exhausted")) == 1
+
+    captured = capsys.readouterr()
+    assert "here is what we did" in captured.out
+    assert "here is what we did" not in captured.err
+
+
+# ── cmd_chat: a paused plugin run survives, and the next line resumes it ──
+
+
+@pytest.mark.unit
+def test_cmd_chat_resumes_a_paused_plugin_run_on_the_next_line(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """The defect `intent.md` exists to fix, stated as code. A `wait` node
+    reached from the terminal used to be discarded in silence: this file held
+    its own copy of the turn body and the copy never passed `persist_pause`,
+    so `build_dispatch` fell back to a no-op and no `plugin_pauses` row was
+    ever written — while the identical plugin over the identical store was
+    resumable from a webhook. Two lines of input now: the first reaches the
+    `wait` node, the second carries the answer through it.
+
+    `len(calls) == 2` is the half that matters most. A resume must not reach
+    the model at all, so a third request would mean the pause was not found
+    and an ordinary turn ran in its place."""
+    plugins_root = tmp_path / "plugins"
+    plugins_root.mkdir()
+    _wait_then_summarize_installed(plugins_root)
+    monkeypatch.setenv("SADANA_PLUGINS_DIR", str(plugins_root))
+
+    calls: list[object] = []
+    send = tool_then_text()
+
+    def _counting_send(request: object) -> model_access.Response:
+        calls.append(request)
+        return send(request)
+
+    monkeypatch.setattr(model_access, "send", _counting_send)
+    _feed(monkeypatch, "start it", "42")
+
+    assert cmd_chat(_args(key="terminal-pause")) == 0
+
+    assert len(calls) == 2
+    last = _load("terminal-pause").messages[-1]
+    assert (last.role, last.content) == ("assistant", "answered: 42")
 
 
 # ── cmd_chat: MEMORY-01 recall folded into a new conversation's prompt ──

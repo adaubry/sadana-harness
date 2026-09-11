@@ -56,8 +56,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from sadana import config, gateway_dispatch, model_access, plugin_dispatch  # noqa: E402
-from sadana.conversation_store import open_store, store_path_from_config  # noqa: E402
+from sadana import client_surface, config, gateway_dispatch, model_access  # noqa: E402
 from sadana.gateway import MessageEvent  # noqa: E402
 from sadana.subcommands.gateway import cmd_gateway_run  # noqa: E402
 
@@ -290,18 +289,13 @@ def scenario_gateway_with_stored_secret(state: Path) -> None:
         try:
             old_send = model_access.send
             model_access.send = _canned_send  # type: ignore[assignment]
-            conn = open_store(store_path_from_config())
-            plugin_set = plugin_dispatch.PluginSet(catalog=(), tool_specs=(), by_tool={})
+            runtime = client_surface.open_runtime(provider="openrouter", model=model_access.DEFAULT_MODEL)
 
             def on_message(event: MessageEvent) -> tuple[bool, str]:
                 return asyncio.run(
                     gateway_dispatch.handle_inbound(
-                        conn,
+                        runtime,
                         event,
-                        plugin_set=plugin_set,
-                        persona="p",
-                        provider="openrouter",
-                        model=model_access.DEFAULT_MODEL,
                     )
                 )
 

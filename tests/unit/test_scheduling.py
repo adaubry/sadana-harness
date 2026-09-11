@@ -7,13 +7,11 @@ import threading
 
 import pytest
 
-from conftest import open_conn
-from sadana import gateway_dispatch, plugin_dispatch
+from conftest import make_runtime, open_conn
+from sadana import client_surface, gateway_dispatch
 from sadana.conversation_store import due_triggers, upsert_scheduled_trigger
 from sadana.gateway import MessageEvent
 from sadana.scheduling import _advance, _is_due, tick
-
-_EMPTY_PLUGIN_SET = plugin_dispatch.PluginSet(catalog=(), tool_specs=(), by_tool={})
 
 
 @pytest.mark.unit
@@ -34,7 +32,7 @@ def test_advance_is_always_now_plus_interval_never_next_run_at_plus_interval() -
 
 
 def _fake_handle_inbound(calls: list[MessageEvent], *, raise_for: str | None = None):
-    async def _handle_inbound(_conn, event: MessageEvent, **_kwargs) -> tuple[bool, str]:
+    async def _handle_inbound(_runtime: object, event: MessageEvent) -> tuple[bool, str]:
         calls.append(event)
         if event.chat_id == raise_for:
             raise RuntimeError("boom")
@@ -53,7 +51,7 @@ def test_tick_fires_only_due_triggers(monkeypatch: pytest.MonkeyPatch) -> None:
     calls: list[MessageEvent] = []
     monkeypatch.setattr(gateway_dispatch, "handle_inbound", _fake_handle_inbound(calls))
 
-    fired = asyncio.run(tick(conn, plugin_set=_EMPTY_PLUGIN_SET, persona="p", provider="p", model="m"))
+    fired = asyncio.run(tick(make_runtime(conn)))
 
     assert fired == 1
     assert [c.chat_id for c in calls] == ["due"]
@@ -67,7 +65,7 @@ def test_tick_deletes_a_one_shot_trigger_after_firing(monkeypatch: pytest.Monkey
     upsert_scheduled_trigger(conn, name="once", trigger_text="go", next_run_at=0.0, interval_seconds=None)
     monkeypatch.setattr(gateway_dispatch, "handle_inbound", _fake_handle_inbound([]))
 
-    asyncio.run(tick(conn, plugin_set=_EMPTY_PLUGIN_SET, persona="p", provider="p", model="m"))
+    asyncio.run(tick(make_runtime(conn)))
 
     assert due_triggers(conn, now=9_999_999_999.0) == ()
 
@@ -78,7 +76,7 @@ def test_tick_advances_a_recurring_trigger_to_now_plus_interval(monkeypatch: pyt
     upsert_scheduled_trigger(conn, name="weekly", trigger_text="go", next_run_at=0.0, interval_seconds=604800.0)
     monkeypatch.setattr(gateway_dispatch, "handle_inbound", _fake_handle_inbound([]))
 
-    asyncio.run(tick(conn, plugin_set=_EMPTY_PLUGIN_SET, persona="p", provider="p", model="m"))
+    asyncio.run(tick(make_runtime(conn)))
 
     (row,) = due_triggers(conn, now=9_999_999_999.0)
     assert row.next_run_at > 604800.0 - 1  # advanced from *now*, not from the old next_run_at
@@ -94,7 +92,7 @@ def test_tick_one_failing_trigger_does_not_stop_the_others_and_stays_due(
     calls: list[MessageEvent] = []
     monkeypatch.setattr(gateway_dispatch, "handle_inbound", _fake_handle_inbound(calls, raise_for="broken"))
 
-    fired = asyncio.run(tick(conn, plugin_set=_EMPTY_PLUGIN_SET, persona="p", provider="p", model="m"))
+    fired = asyncio.run(tick(make_runtime(conn)))
 
     assert fired == 1
     assert {c.chat_id for c in calls} == {"broken", "fine"}
@@ -106,9 +104,9 @@ class _RecordingLock:
     """A real `threading.Lock`, wrapped to record every `with` acquisition
     — deploy-stage cold review: `tick()`'s own direct `conn` touches raced
     every webhook request's own thread with no lock at all. This proves
-    the wiring, not real concurrency (that's `gateway_dispatch.conn_lock`'s
+    the wiring, not real concurrency (that's `client_surface.conn_lock`'s
     own single, project-wide lock object, already relied on for real by
-    `handle_inbound`)."""
+    `take_turn`)."""
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
@@ -128,9 +126,9 @@ def test_tick_wraps_its_own_conn_access_in_the_shared_conn_lock(monkeypatch: pyt
     upsert_scheduled_trigger(conn, name="due", trigger_text="go", next_run_at=0.0, interval_seconds=None)
     monkeypatch.setattr(gateway_dispatch, "handle_inbound", _fake_handle_inbound([]))
     recording_lock = _RecordingLock()
-    monkeypatch.setattr(gateway_dispatch, "conn_lock", recording_lock)
+    monkeypatch.setattr(client_surface, "conn_lock", recording_lock)
 
-    asyncio.run(tick(conn, plugin_set=_EMPTY_PLUGIN_SET, persona="p", provider="p", model="m"))
+    asyncio.run(tick(make_runtime(conn)))
 
     # once for the due_triggers() read, once for the post-fire delete —
     # handle_inbound() is called *outside* both, so this also proves tick()

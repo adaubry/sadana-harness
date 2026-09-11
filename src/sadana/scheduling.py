@@ -10,18 +10,19 @@ sets this precedent).
 
 Firing a trigger is nothing but delivering a synthetic inbound message
 through the exact bridge `channel_webhook.py` already uses —
-`gateway_dispatch.handle_inbound()`, completely unchanged. No second
-bridge, no new turn-loop entry point.
+`gateway_dispatch.handle_inbound()`. No second bridge, no new turn-loop
+entry point; since CLIENT-SURFACE-01 that bridge is itself only a
+translation onto `client_surface.take_turn()`, so a scheduled trigger and a
+webhook message and a terminal line all reach the same one door.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
-import sqlite3
 import time
 
-from sadana import conversation_store, gateway_dispatch, observability, plugin_dispatch
+from sadana import client_surface, conversation_store, gateway_dispatch
 from sadana.gateway import MessageEvent
 
 logger = logging.getLogger(__name__)
@@ -40,16 +41,7 @@ def _advance(now: float, interval_seconds: float) -> float:
     return now + interval_seconds
 
 
-async def tick(
-    conn: sqlite3.Connection,
-    *,
-    plugin_set: plugin_dispatch.PluginSet,
-    persona: str,
-    provider: str,
-    model: str,
-    record_turn: observability.RecordTurnFn = observability.noop_record,
-    record_plugin_run: observability.RecordPluginRunFn = observability.noop_record,
-) -> int:
+async def tick(runtime: client_surface.Runtime) -> int:
     """Fires every trigger whose `next_run_at` has arrived, returning how
     many fired. A trigger's own failure is caught, logged, and skipped —
     never raised out of this function, so one bad trigger can't stop the
@@ -61,37 +53,29 @@ async def tick(
     failure deserves — "no catch-up" (requirement 5) is about the daemon
     having been down, not about one attempt failing while it was up.
 
-    Every direct touch of `conn` this function makes (the due-triggers
-    query, the post-fire advance/delete) is wrapped in
-    `gateway_dispatch.conn_lock` — the same lock `handle_inbound()` already
-    holds for its own whole body. `run_tick_loop` runs on its own
+    Every direct touch of `runtime.conn` this function makes (the
+    due-triggers query, the post-fire advance/delete) is wrapped in
+    `client_surface.conn_lock` — the same lock `take_turn()` already holds
+    for its own whole body. `run_tick_loop` runs on its own
     background thread, and without this a deploy-stage cold review found it
     racing `conn` against every webhook request's own thread, violating
     `conversation_store.open_store()`'s documented single-writer-at-a-time
     contract. `handle_inbound()` itself is called *outside* any lock this
     function holds — it acquires the same, non-reentrant lock internally,
     so nesting would deadlock."""
+    conn = runtime.conn
     now = time.time()
-    with gateway_dispatch.conn_lock:
+    with client_surface.conn_lock:
         due = conversation_store.due_triggers(conn, now=now)
     fired = 0
     for trigger in due:
         event = MessageEvent(platform="schedule", chat_id=trigger.name, thread_id=None, text=trigger.trigger_text)
         try:
-            await gateway_dispatch.handle_inbound(
-                conn,
-                event,
-                plugin_set=plugin_set,
-                persona=persona,
-                provider=provider,
-                model=model,
-                record_turn=record_turn,
-                record_plugin_run=record_plugin_run,
-            )
+            await gateway_dispatch.handle_inbound(runtime, event)
         except Exception:
             logger.warning("scheduled trigger %r failed to fire", trigger.name, exc_info=True)
             continue
-        with gateway_dispatch.conn_lock:
+        with client_surface.conn_lock:
             if trigger.interval_seconds is None:
                 conversation_store.delete_scheduled_trigger(conn, name=trigger.name)
             else:
@@ -102,17 +86,7 @@ async def tick(
     return fired
 
 
-def run_tick_loop(
-    conn: sqlite3.Connection,
-    *,
-    interval_seconds: float,
-    plugin_set: plugin_dispatch.PluginSet,
-    persona: str,
-    provider: str,
-    model: str,
-    record_turn: observability.RecordTurnFn = observability.noop_record,
-    record_plugin_run: observability.RecordPluginRunFn = observability.noop_record,
-) -> None:
+def run_tick_loop(runtime: client_surface.Runtime, *, interval_seconds: float) -> None:
     """Blocks forever, ticking every `interval_seconds`. Meant to run in a
     `daemon=True` thread — needs no coordination with `gateway_daemon.run()`'s
     own SIGTERM/lock/shutdown sequence, since a daemon thread dies with the
@@ -120,22 +94,13 @@ def run_tick_loop(
     already makes an abrupt mid-tick kill an accepted, harmless outcome
     rather than a new failure mode to guard against.
 
-    Mirrors `tick()`'s own keyword parameters explicitly rather than
-    forwarding `**kwargs` — a self-check pass tried the `**kwargs` shrink
-    and a second, more careful pass reversed it: forwarding loses mypy's
-    ability to check this call against `tick()`'s real signature (a
-    `# type: ignore` would be needed), which this project's own emphasis on
-    `make typecheck` makes the wrong trade for five duplicated names."""
+    Takes the `Runtime` rather than mirroring `tick()`'s parameters:
+    CLIENT-SURFACE-01 moved the seven values this used to forward — the
+    connection, the plugin set, the persona, the provider, the model and the
+    two recording callables — into one value assembled once by
+    `client_surface.open_runtime()`. The earlier note here, about why the
+    five duplicated keyword names beat a `**kwargs` shrink, is obsolete along
+    with the names themselves."""
     while True:
-        asyncio.run(
-            tick(
-                conn,
-                plugin_set=plugin_set,
-                persona=persona,
-                provider=provider,
-                model=model,
-                record_turn=record_turn,
-                record_plugin_run=record_plugin_run,
-            )
-        )
+        asyncio.run(tick(runtime))
         time.sleep(interval_seconds)

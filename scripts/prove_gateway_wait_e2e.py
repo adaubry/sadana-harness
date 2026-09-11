@@ -25,6 +25,7 @@ import builtins
 import http.server
 import json
 import os
+import shutil
 import signal
 import socket
 import sys
@@ -39,15 +40,21 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 _STATE_DIR = tempfile.mkdtemp(prefix="sadana-wait-e2e-")
 os.environ["SADANA_STATE_DIR"] = _STATE_DIR  # noqa: E402
-os.environ["SADANA_PLUGINS_DIR"] = str(Path(__file__).resolve().parent.parent / "tests" / "fixtures" / "plugins")  # noqa: E402
+# A copy, never the repo's own `tests/fixtures/plugins` in place:
+# `client_surface.open_runtime()` seeds a `memory` plugin directory under
+# whatever `SADANA_PLUGINS_DIR` resolves to, so pointing this at a tracked
+# path would have the proof write into the repository it is proving.
+# `tests/unit/test_subcommands_chat.py` fixes the same hazard the same way.
+_PLUGINS_DIR = Path(_STATE_DIR) / "plugins"
+shutil.copytree(Path(__file__).resolve().parent.parent / "tests" / "fixtures" / "plugins", _PLUGINS_DIR)
+os.environ["SADANA_PLUGINS_DIR"] = str(_PLUGINS_DIR)  # noqa: E402
 
 from sadana import (  # noqa: E402
     channel_webhook,
+    client_surface,
     gateway_daemon,
     gateway_dispatch,
-    memory_store,
     model_access,
-    plugin_dispatch,
     plugin_manifest,
 )
 from sadana.conversation_store import load_pause, open_store, store_path_from_config  # noqa: E402
@@ -152,17 +159,14 @@ def main() -> None:
 
     installed = plugin_manifest.discover_plugins()
     assert any(p.name == "plugin-d" for p in installed), f"plugin-d not found among {[p.name for p in installed]!r}"
-    plugin_set = plugin_dispatch.build_plugin_set(installed)
 
-    conn = open_store(store_path_from_config())
-    memory_store.ensure_schema(conn)
+    # One door, opened once — the plugin scan, the store and the memory schema
+    # this script used to assemble itself (CLIENT-SURFACE-01). The scan above
+    # stays: it is this script's own precondition check, not the assembly.
+    runtime = client_surface.open_runtime(provider="p", model="m")
 
     def on_message(event: MessageEvent) -> tuple[bool, str]:
-        return asyncio.run(
-            gateway_dispatch.handle_inbound(
-                conn, event, plugin_set=plugin_set, persona="You are a test persona.\n", provider="p", model="m"
-            )
-        )
+        return asyncio.run(gateway_dispatch.handle_inbound(runtime, event))
 
     def make_server() -> http.server.ThreadingHTTPServer:
         return channel_webhook.make_server(HOST, PORT, secret=SECRET, on_message=on_message)

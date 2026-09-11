@@ -41,8 +41,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 os.environ["SADANA_STATE_DIR"] = tempfile.mkdtemp(prefix="sadana-gateway-e2e-")  # noqa: E402
 
-from sadana import gateway_daemon, gateway_dispatch, model_access, plugin_dispatch  # noqa: E402
-from sadana.conversation_store import open_store, store_path_from_config  # noqa: E402
+from sadana import client_surface, gateway_daemon, gateway_dispatch, model_access  # noqa: E402
 from sadana.gateway import MessageEvent  # noqa: E402
 
 HOST = "127.0.0.1"
@@ -154,17 +153,15 @@ def _drive_http_checks() -> None:
 def main() -> None:
     model_access.send = _canned_send  # type: ignore[assignment]
 
-    conn = open_store(store_path_from_config())
-    plugin_set = plugin_dispatch.PluginSet(catalog=(), tool_specs=(), by_tool={})
+    # One door, opened once — the assembly this script used to keep its own
+    # copy of (CLIENT-SURFACE-01). `provider`/`model` are inert here:
+    # `model_access.send` is canned above, so nothing reaches a provider.
+    runtime = client_surface.open_runtime(provider="p", model="m")
 
-    # gateway_dispatch.handle_inbound() serializes its own conn access
-    # (its module-level _conn_lock) — no lock needed here.
+    # client_surface.take_turn() serializes its own conn access
+    # (client_surface.conn_lock) — no lock needed here.
     def on_message(event: MessageEvent) -> tuple[bool, str]:
-        return asyncio.run(
-            gateway_dispatch.handle_inbound(
-                conn, event, plugin_set=plugin_set, persona="You are a test persona.\n", provider="p", model="m"
-            )
-        )
+        return asyncio.run(gateway_dispatch.handle_inbound(runtime, event))
 
     driver_thread = threading.Thread(target=_drive_http_checks)
     driver_thread.start()

@@ -10,11 +10,12 @@ from __future__ import annotations
 
 import sqlite3
 import subprocess
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
 
-from sadana import model_access, plugins
+from sadana import client_surface, memory_store, model_access, observability, plugin_dispatch, plugins
 from sadana.context import ContextState
 from sadana.conversation import (
     Conversation,
@@ -219,6 +220,62 @@ def make_upstream_repo(tmp_path: Path, *, plugin_name: str = "greeter", tag: str
     run_git(["commit", "-q", "-m", "initial"], cwd=repo)
     run_git(["tag", tag], cwd=repo)
     return repo
+
+
+EMPTY_PLUGIN_SET = plugin_dispatch.PluginSet(catalog=(), tool_specs=(), by_tool={})
+
+
+def make_runtime(
+    conn: sqlite3.Connection, *, plugin_set: plugin_dispatch.PluginSet = EMPTY_PLUGIN_SET
+) -> client_surface.Runtime:
+    """A ``client_surface.Runtime`` over a caller-owned connection — shared by
+    ``test_client_surface.py``, ``test_gateway_dispatch.py`` and
+    ``test_scheduling.py``, all of which drive a turn without going through
+    ``open_runtime()``'s own disk assembly.
+
+    No ``persona`` parameter: no test asserts anything about
+    ``Runtime.persona``, so a keyword for it would read as significant at
+    every call site while changing nothing. A test that ever does care can
+    build the frozen ``Runtime`` itself, or use ``dataclasses.replace``.
+
+    Ensures the ``memory_store`` schema itself: ``take_turn``'s docstring names
+    that as the obligation of whoever builds a ``Runtime`` by hand, the same
+    way ``test_gateway_dispatch.py`` already called ``ensure_schema`` for a
+    direct bridge call."""
+    memory_store.ensure_schema(conn)
+    return client_surface.Runtime(
+        conn=conn,
+        plugin_set=plugin_set,
+        persona="You are a test persona.\n",
+        provider="p",
+        model="m",
+        recorder=observability.make_recorder(conn),
+    )
+
+
+def tool_then_text(
+    tool: str = "do_it", text: str = "okay, I'll wait for it."
+) -> Callable[[object], model_access.Response]:
+    """A ``model_access.send`` stub for the two-step shape every plugin turn
+    has: call ``tool`` first, then answer with ``text`` once a tool result is
+    in history. Shared by ``test_client_surface.py`` and
+    ``test_subcommands_chat.py``; ``test_gateway_dispatch.py`` still hand-rolls
+    its own copy, which is a tidy-up for whoever next edits that file."""
+
+    def _send(request: object) -> model_access.Response:
+        messages = request.messages  # type: ignore[attr-defined]
+        if any(m.get("role") == "tool" for m in messages):
+            return plain_response(text)
+        return tool_call_response(tool)
+
+    return _send
+
+
+def never_send(_request: object) -> model_access.Response:
+    """A ``model_access.send`` stub that fails the test if it is ever called —
+    for a path whose whole point is that no model call happens (a resume, an
+    unknown conversation)."""
+    raise AssertionError("the model must not be called on this path")
 
 
 def open_conn() -> sqlite3.Connection:

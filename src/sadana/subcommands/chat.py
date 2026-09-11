@@ -2,42 +2,31 @@
 
 CLI-SHELL-04 of the CLI-SHELL block (`docs/reference/cli_shell_blueprint.md`
 §6, work item 4); its full contract is
-`docs/tasks/CLI-SHELL-04-chat-command/spec.md`.
+`docs/tasks/CLI-SHELL-04-chat-command/spec.md`, rebuilt on
+`docs/tasks/CLIENT-SURFACE-01-one-door-in/spec.md`.
 
-Owns both its parser and its handler in one file, from the first
-line — see spec.md's Design section for why.
+Owns both its parser and its handler in one file, from the first line — see
+spec.md's Design section for why.
+
+Everything about *taking a turn* now lives in `client_surface.py`. What is
+left here is what makes this client this client: which conversation the flags
+name, who the person is when nobody said, and how an answer is shown — words
+to stdout, a diagnostic to stderr, a non-zero exit code when the turn did not
+complete. That split is why the terminal stopped losing a paused plugin run:
+this file used to hold its own copy of the turn body and the copy never
+passed `persist_pause`.
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
-import sqlite3
 import sys
 import time
 from contextlib import closing
 
-from sadana import (
-    config,
-    conversation_store,
-    memory,
-    memory_store,
-    model_access,
-    observability,
-    plugin_dispatch,
-    plugin_manifest,
-    plugins,
-)
-from sadana.conversation import (
-    Conversation,
-    ConversationTemplate,
-    ExitReason,
-    TemplateRecipe,
-    create_conversation,
-    iteration_budget_from_config,
-    wall_clock_budget_from_config,
-)
-from sadana.persona import load_or_seed_persona, persona_path_from_config
+from sadana import client_surface, config, memory
+from sadana.conversation import ConversationKey
 
 
 def build_chat_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
@@ -52,16 +41,19 @@ def build_chat_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentPa
 
 
 async def _chat_loop(
-    conn: sqlite3.Connection,
-    conversation: Conversation,
+    runtime: client_surface.Runtime,
+    conversation: ConversationKey,
     *,
-    plugin_set: plugin_dispatch.PluginSet,
-    persona: str,
-    provider: str,
-    model: str,
-    account_key: memory.AccountKey,
+    account: memory.AccountKey,
 ) -> int:
-    recorder = observability.make_recorder(conn)
+    """Read a line, take a turn, show what came back. Nothing else.
+
+    `answer` to stdout and `diagnostic` to stderr, never both: a turn that
+    ended badly can still carry real words — an exhausted iteration budget
+    produces a summary (`conversation.py`'s EPILOGUE) — and those words are
+    the answer, so they go to stdout and the exit code alone reports that
+    something went wrong.
+    """
     while True:
         try:
             user_input = await asyncio.to_thread(input, "> ")
@@ -69,89 +61,49 @@ async def _chat_loop(
             print()
             return 0
 
-        now = time.monotonic()
-        dispatch, tracker = plugin_dispatch.build_dispatch(
-            conversation,
-            plugin_set,
-            stable_prompt=persona,
-            provider=provider,
-            model=model,
-            now=now,
-            record_turn=recorder.record_turn,
-            record_plugin_run=recorder.record_plugin_run,
-            memory_context=memory_store.DispatchContext(account_key=account_key, conn=conn),
+        outcome = await client_surface.take_turn(
+            runtime,
+            account=account,
+            conversation=conversation,
+            text=user_input,
+            create_as=None,  # started before the first prompt, below
         )
-        persist = conversation_store.bind_persist(conn, conversation, now=now)
-        result, conversation = await plugin_dispatch.take_turn_and_reconcile(
-            conversation,
-            dispatch,
-            tracker,
-            user_input=user_input,
-            provider=provider,
-            model=model,
-            now=now,
-            persist=persist,
-            record_turn=recorder.record_turn,
-        )
-        await asyncio.to_thread(conversation_store.save, conn, conversation, now=now)
 
-        if result.final_text:
-            # BUDGET_EXHAUSTED still carries a best-effort summary
-            # (conversation.py's EPILOGUE) — never drop it just because
-            # the exit reason isn't COMPLETED.
-            print(result.final_text)
+        if outcome.answer:
+            print(outcome.answer)
         else:
-            print(f"[{result.exit_reason.value}] {result.detail or ''}", file=sys.stderr)
+            print(outcome.diagnostic, file=sys.stderr)
 
-        if result.exit_reason != ExitReason.COMPLETED:
+        if not outcome.ok:
             return 1
 
 
 def cmd_chat(args: argparse.Namespace) -> int:
-    provider = args.provider or config.env("SADANA_MODEL_ACCESS_PROVIDER", model_access.DEFAULT_PROVIDER)
-    model = args.model or config.env("SADANA_MODEL_ACCESS_MODEL", model_access.DEFAULT_MODEL)
-    account_key = args.account or config.env("SADANA_MEMORY_ACCOUNT", "local")
+    # The door resolves the provider and the model; the account it will not,
+    # by design (CLIENT-SURFACE-01 requirement 3) — whoever asks states who
+    # the person is, so this client holds its own default and says it out loud.
+    account = args.account or config.env("SADANA_MEMORY_ACCOUNT", "local")
+    runtime = client_surface.open_runtime(provider=args.provider, model=args.model)
 
-    persona = load_or_seed_persona(persona_path_from_config())
-    memory_store.ensure_plugin_seeded(plugins._plugins_root())
-    plugin_set = plugin_dispatch.build_plugin_set(plugin_manifest.discover_plugins())
-    with closing(conversation_store.open_store(conversation_store.store_path_from_config())) as conn:
-        memory_store.ensure_schema(conn)
-        now = time.monotonic()
-        if args.resume:
-            conversation = conversation_store.load(conn, args.resume, now=now)
-        else:
-            key = args.key or time.strftime("chat-%Y%m%d-%H%M%S")
-            template = ConversationTemplate(
-                name="chat",
-                recipe=TemplateRecipe(
-                    stable_prompt=persona, catalog=plugin_set.catalog, tool_specs=plugin_set.tool_specs
-                ),
-            )
-            entries = memory_store.list_entries(conn, account_key)
-            override = memory_store.get_rubric_override(conn, account_key)
-            system_message = memory.system_message_for(entries, memory.default_rubric(), override)
-            conversation, _template = create_conversation(
-                template,
-                key,
-                system_message=system_message,
-                iteration_budget=iteration_budget_from_config(),
-                wall_clock_budget=wall_clock_budget_from_config(now),
-            )
-            conversation_store.create(conn, conversation, now=now)
+    with closing(runtime.conn):
+        # `--resume KEY` means it already exists; `--key NAME` (or a generated
+        # name) means it does not and is created now, before the first prompt
+        # appears. Both are claims about the flag the person typed, and the
+        # door settles both in one call — this file used to probe the store
+        # itself, which is a client reaching around the door, outside its
+        # lock, for the next client to copy. The exceptions are unchanged:
+        # `ConversationNotFound` for an unknown resume,
+        # `ConversationAlreadyExists` for a name already taken.
+        conversation = args.resume or args.key or time.strftime("chat-%Y%m%d-%H%M%S")
+        client_surface.open_conversation(
+            runtime,
+            account=account,
+            conversation=conversation,
+            template_name=None if args.resume else "chat",
+        )
 
         try:
-            return asyncio.run(
-                _chat_loop(
-                    conn,
-                    conversation,
-                    plugin_set=plugin_set,
-                    persona=persona,
-                    provider=provider,
-                    model=model,
-                    account_key=account_key,
-                )
-            )
+            return asyncio.run(_chat_loop(runtime, conversation, account=account))
         except KeyboardInterrupt:
             print()
             return 130

@@ -28,7 +28,6 @@ import asyncio
 import http.server
 import os
 import signal
-import sqlite3
 import sys
 import tempfile
 import threading
@@ -41,16 +40,13 @@ os.environ["SADANA_STATE_DIR"] = tempfile.mkdtemp(prefix="sadana-scheduling-e2e-
 
 from sadana import (  # noqa: E402
     channel_webhook,
+    client_surface,
     gateway_daemon,
-    memory_store,
     model_access,
-    plugin_dispatch,
     scheduling,
 )
 from sadana.conversation_store import (  # noqa: E402
     due_triggers,
-    open_store,
-    store_path_from_config,
     upsert_scheduled_trigger,
 )
 from sadana.gateway import MessageEvent  # noqa: E402
@@ -58,7 +54,6 @@ from sadana.gateway import MessageEvent  # noqa: E402
 HOST = "127.0.0.1"
 PORT = 18766
 SECRET = "prove-scheduling-e2e-secret"  # pragma: allowlist secret - fixed local test value, no real deployment
-_EMPTY_PLUGIN_SET = plugin_dispatch.PluginSet(catalog=(), tool_specs=(), by_tool={})
 
 
 def _canned_send(request: model_access.Request) -> model_access.Response:
@@ -67,15 +62,12 @@ def _canned_send(request: model_access.Request) -> model_access.Response:
     )
 
 
-def _tick(conn: sqlite3.Connection) -> int:
-    return asyncio.run(
-        scheduling.tick(
-            conn, plugin_set=_EMPTY_PLUGIN_SET, persona="You are a test persona.\n", provider="p", model="m"
-        )
-    )
+def _tick(runtime: client_surface.Runtime) -> int:
+    return asyncio.run(scheduling.tick(runtime))
 
 
-def _drive_checks(conn: sqlite3.Connection) -> None:
+def _drive_checks(runtime: client_surface.Runtime) -> None:
+    conn = runtime.conn
     print("=== registering one due-now trigger and one due-later trigger ===")
     now = time.time()
     upsert_scheduled_trigger(
@@ -87,7 +79,7 @@ def _drive_checks(conn: sqlite3.Connection) -> None:
     print(f"[ok] registered; due_triggers(now) = {[t.name for t in due_triggers(conn, now=now)]!r}")
 
     print("\n=== tick #1: only the due-now trigger fires, with no webhook call ===")
-    fired_count = _tick(conn)
+    fired_count = _tick(runtime)
     print(f"[ok] tick fired {fired_count} trigger(s)")
     assert fired_count == 1, f"expected exactly 1 firing, got {fired_count}"
 
@@ -101,7 +93,7 @@ def _drive_checks(conn: sqlite3.Connection) -> None:
         conn, name="weekly", trigger_text="weekly digest", next_run_at=0.0, interval_seconds=604800.0
     )
     before = time.time()
-    fired_count2 = _tick(conn)
+    fired_count2 = _tick(runtime)
     assert fired_count2 == 1
     (row,) = [t for t in due_triggers(conn, now=before + 604800.0 + 60.0) if t.name == "weekly"]
     print(f"weekly trigger's new next_run_at = {row.next_run_at!r}, tick started at {before!r}")
@@ -114,8 +106,10 @@ def _drive_checks(conn: sqlite3.Connection) -> None:
 
 def main() -> None:
     model_access.send = _canned_send  # type: ignore[assignment]
-    conn = open_store(store_path_from_config())
-    memory_store.ensure_schema(conn)  # handle_inbound assumes this already ran, same as cmd_gateway_run's own setup
+    # One door, opened once — the store and the memory schema this script used
+    # to assemble itself (CLIENT-SURFACE-01). `provider`/`model` are inert:
+    # `model_access.send` is canned above, so nothing reaches a provider.
+    runtime = client_surface.open_runtime(provider="p", model="m")
 
     def on_message(_event: MessageEvent) -> tuple[bool, str]:  # pragma: no cover - never invoked in this proof
         raise AssertionError("no webhook call should ever be made in this proof")
@@ -124,7 +118,7 @@ def main() -> None:
         return channel_webhook.make_server(HOST, PORT, secret=SECRET, on_message=on_message)
 
     def driver() -> None:
-        _drive_checks(conn)
+        _drive_checks(runtime)
         print(f"\nsending SIGTERM to pid {os.getpid()} to stop the daemon cleanly...")
         os.kill(os.getpid(), signal.SIGTERM)
 

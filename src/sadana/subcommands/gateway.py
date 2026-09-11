@@ -19,21 +19,14 @@ import threading
 
 from sadana import (
     channel_webhook,
+    client_surface,
     config,
-    conversation_store,
     gateway_daemon,
     gateway_dispatch,
     gateway_service,
-    memory_store,
-    model_access,
-    observability,
-    plugin_dispatch,
-    plugin_manifest,
-    plugins,
     scheduling,
 )
 from sadana.gateway import MessageEvent
-from sadana.persona import load_or_seed_persona, persona_path_from_config
 
 
 def build_gateway_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
@@ -72,30 +65,17 @@ def cmd_gateway_run(args: argparse.Namespace) -> int:
         print("SADANA_GATEWAY_WEBHOOK_SECRET is not set; refusing to start", file=sys.stderr)
         return 1
 
-    provider = config.env("SADANA_MODEL_ACCESS_PROVIDER", model_access.DEFAULT_PROVIDER)
-    model = config.env("SADANA_MODEL_ACCESS_MODEL", model_access.DEFAULT_MODEL)
-    persona = load_or_seed_persona(persona_path_from_config())
-    memory_store.ensure_plugin_seeded(plugins._plugins_root())
-    plugin_set = plugin_dispatch.build_plugin_set(plugin_manifest.discover_plugins())
-    conn = conversation_store.open_store(conversation_store.store_path_from_config())
-    memory_store.ensure_schema(conn)  # once, not per message — handle_inbound assumes this already ran
-    recorder = observability.make_recorder(conn)  # built once; handle_inbound reuses it every inbound message
+    # One door, opened once: the provider, the model, the persona, the plugin
+    # scan, the store, the memory schema and the recorder — the eight lines
+    # this function used to own a copy of, and `cmd_chat` the other
+    # (CLIENT-SURFACE-01). The daemon runs until killed, so the connection is
+    # deliberately not closed here, exactly as before.
+    runtime = client_surface.open_runtime()
 
-    # gateway_dispatch.handle_inbound() serializes its own conn access
-    # (gateway_dispatch.conn_lock) — no lock needed here.
+    # client_surface.take_turn() serializes its own conn access
+    # (client_surface.conn_lock) — no lock needed here.
     def on_message(event: MessageEvent) -> tuple[bool, str]:
-        return asyncio.run(
-            gateway_dispatch.handle_inbound(
-                conn,
-                event,
-                plugin_set=plugin_set,
-                persona=persona,
-                provider=provider,
-                model=model,
-                record_turn=recorder.record_turn,
-                record_plugin_run=recorder.record_plugin_run,
-            )
-        )
+        return asyncio.run(gateway_dispatch.handle_inbound(runtime, event))
 
     def make_server() -> http.server.ThreadingHTTPServer:
         return channel_webhook.make_server(host, port, secret=secret, on_message=on_message)
@@ -107,16 +87,7 @@ def cmd_gateway_run(args: argparse.Namespace) -> int:
     tick_interval = config.env_int("SADANA_SCHEDULING_TICK_SECONDS", 30)
     threading.Thread(
         target=scheduling.run_tick_loop,
-        kwargs={
-            "conn": conn,
-            "interval_seconds": tick_interval,
-            "plugin_set": plugin_set,
-            "persona": persona,
-            "provider": provider,
-            "model": model,
-            "record_turn": recorder.record_turn,
-            "record_plugin_run": recorder.record_plugin_run,
-        },
+        kwargs={"runtime": runtime, "interval_seconds": tick_interval},
         daemon=True,
         name="sadana-scheduling-tick",
     ).start()

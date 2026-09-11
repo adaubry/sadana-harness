@@ -276,6 +276,16 @@ def save(conn: sqlite3.Connection, conversation: Conversation, *, now: float, st
         _insert_messages(c, conversation, start_seq=start_seq)
 
 
+def exists(conn: sqlite3.Connection, key: ConversationKey) -> bool:
+    """Whether ``key`` names a saved conversation, without reading it.
+
+    ``load()`` answers the same question but pays for the whole history —
+    every message row, a ``json.loads`` per message, the tool surface and the
+    budgets — which is waste for a caller that only wants to know whether a
+    name is taken (``client_surface.open_conversation()``)."""
+    return conn.execute("SELECT 1 FROM conversations WHERE key = ?", (key,)).fetchone() is not None
+
+
 def load(conn: sqlite3.Connection, key: ConversationKey, *, now: float) -> Conversation:
     """Raises ``ConversationNotFound`` if ``key`` has no row. ``now`` turns
     the stored remaining-seconds figure back into a fresh

@@ -7,15 +7,13 @@ from pathlib import Path
 
 import pytest
 
-from conftest import plain_response
+from conftest import make_runtime, plain_response
 from conftest import wait_then_summarize_installed as _wait_then_summarize_installed
-from sadana import memory_store, model_access, observability, plugin_dispatch, plugins
+from sadana import memory_store, model_access, plugin_dispatch, plugins
 from sadana.conversation import ConversationTemplate, IterationBudget, TemplateRecipe, create_conversation
 from sadana.conversation_store import create, load, load_pause, open_store, save_pause, store_path_from_config
 from sadana.gateway import MessageEvent
 from sadana.gateway_dispatch import handle_inbound
-
-_PLUGIN_SET = plugin_dispatch.PluginSet(catalog=(), tool_specs=(), by_tool={})
 
 
 @pytest.mark.unit
@@ -24,22 +22,13 @@ def test_handle_inbound_continues_the_same_conversation_across_calls(monkeypatch
     monkeypatch.setattr(model_access, "send", lambda request: next(responses))
 
     conn = open_store(store_path_from_config())
-    memory_store.ensure_schema(conn)  # cmd_gateway_run's own one-time setup, done here for a direct call
     event = MessageEvent(platform="webhook", chat_id="chat-1", thread_id=None, text="hello")
 
-    ok1, text1 = asyncio.run(
-        handle_inbound(
-            conn, event, plugin_set=_PLUGIN_SET, persona="You are a test persona.\n", provider="p", model="m"
-        )
-    )
+    ok1, text1 = asyncio.run(handle_inbound(make_runtime(conn), event))
     assert ok1 is True
     assert text1 == "first reply"
 
-    ok2, text2 = asyncio.run(
-        handle_inbound(
-            conn, event, plugin_set=_PLUGIN_SET, persona="You are a test persona.\n", provider="p", model="m"
-        )
-    )
+    ok2, text2 = asyncio.run(handle_inbound(make_runtime(conn), event))
     assert ok2 is True
     assert text2 == "second reply"
 
@@ -48,31 +37,21 @@ def test_handle_inbound_continues_the_same_conversation_across_calls(monkeypatch
 
 
 @pytest.mark.unit
-def test_handle_inbound_records_the_turn_when_given_a_recorder(monkeypatch: pytest.MonkeyPatch) -> None:
-    """OBSERVABILITY-01: `cmd_gateway_run` builds one `Recorder` per
-    process and passes its two callables into every `handle_inbound` call
-    (see `subcommands/gateway.py`) — this proves that injection actually
-    reaches the turn, the same contract `build_dispatch`'s own recording
-    tests check at the `plugin_dispatch` layer."""
+def test_handle_inbound_records_the_turn(monkeypatch: pytest.MonkeyPatch) -> None:
+    """OBSERVABILITY-01: one `Recorder` per process reaches every turn. It
+    used to be two callables `cmd_gateway_run` threaded into each
+    `handle_inbound` call; since CLIENT-SURFACE-01 the recorder is a field on
+    the `Runtime` that `client_surface.open_runtime()` assembles once, so
+    recording is no longer something a caller can forget to pass. What this
+    proves is unchanged — that the injection actually reaches the turn, the
+    same contract `build_dispatch`'s own recording tests check at the
+    `plugin_dispatch` layer."""
     monkeypatch.setattr(model_access, "send", lambda request: plain_response("reply"))
 
     conn = open_store(store_path_from_config())
-    memory_store.ensure_schema(conn)
-    recorder = observability.make_recorder(conn)
     event = MessageEvent(platform="webhook", chat_id="chat-2", thread_id=None, text="hello")
 
-    asyncio.run(
-        handle_inbound(
-            conn,
-            event,
-            plugin_set=_PLUGIN_SET,
-            persona="You are a test persona.\n",
-            provider="p",
-            model="m",
-            record_turn=recorder.record_turn,
-            record_plugin_run=recorder.record_plugin_run,
-        )
-    )
+    asyncio.run(handle_inbound(make_runtime(conn), event))
 
     row = conn.execute(
         "SELECT * FROM turn_runs WHERE conversation_key = ? AND turn_seq = 0", ("webhook:chat-2",)
@@ -97,11 +76,7 @@ def test_handle_inbound_shares_recall_across_threads_of_the_same_account(monkeyp
 
     for thread_id in ("thread-a", "thread-b"):
         event = MessageEvent(platform="webhook", chat_id="chat-3", thread_id=thread_id, text="hi")
-        asyncio.run(
-            handle_inbound(
-                conn, event, plugin_set=_PLUGIN_SET, persona="You are a test persona.\n", provider="p", model="m"
-            )
-        )
+        asyncio.run(handle_inbound(make_runtime(conn), event))
         loaded = load(conn, f"webhook:chat-3:{thread_id}", now=0.0)
         assert "Their dog is named Buddy." in loaded.system_prompt
 
@@ -114,11 +89,7 @@ def test_handle_inbound_never_recalls_a_different_chat_ids_memories(monkeypatch:
     memory_store.write_entry(conn, "webhook:chat-4", "dog_name", "Their dog is named Buddy.", now=0.0)
 
     event = MessageEvent(platform="webhook", chat_id="chat-5", thread_id=None, text="hi")
-    asyncio.run(
-        handle_inbound(
-            conn, event, plugin_set=_PLUGIN_SET, persona="You are a test persona.\n", provider="p", model="m"
-        )
-    )
+    asyncio.run(handle_inbound(make_runtime(conn), event))
 
     loaded = load(conn, "webhook:chat-5", now=0.0)
     assert "Their dog is named Buddy." not in loaded.system_prompt
@@ -134,14 +105,9 @@ def test_handle_inbound_with_no_pause_row_is_unaffected_by_the_check(monkeypatch
     takes today's exact existing path, unchanged."""
     monkeypatch.setattr(model_access, "send", lambda request: plain_response("reply"))
     conn = open_store(store_path_from_config())
-    memory_store.ensure_schema(conn)
     event = MessageEvent(platform="webhook", chat_id="chat-nopause", thread_id=None, text="hello")
 
-    ok, text = asyncio.run(
-        handle_inbound(
-            conn, event, plugin_set=_PLUGIN_SET, persona="You are a test persona.\n", provider="p", model="m"
-        )
-    )
+    ok, text = asyncio.run(handle_inbound(make_runtime(conn), event))
 
     assert ok is True
     assert text == "reply"
@@ -160,7 +126,6 @@ def test_handle_inbound_with_a_pause_row_resumes_without_calling_the_model(
     monkeypatch.setattr(plugins, "_plugins_root", lambda: tmp_path)
 
     conn = open_store(store_path_from_config())
-    memory_store.ensure_schema(conn)
     key = "webhook:chat-resume"
     conversation, _t = create_conversation(
         ConversationTemplate(name="t", recipe=TemplateRecipe(stable_prompt="p", catalog=(), tool_specs=())),
@@ -172,7 +137,7 @@ def test_handle_inbound_with_a_pause_row_resumes_without_calling_the_model(
     save_pause(conn, conversation_key=key, plugin="p", entry="do_it", node="future", trace=(), artifacts=())
 
     event = MessageEvent(platform="webhook", chat_id="chat-resume", thread_id=None, text="42")
-    ok, text = asyncio.run(handle_inbound(conn, event, plugin_set=_PLUGIN_SET, persona="p", provider="p", model="m"))
+    ok, text = asyncio.run(handle_inbound(make_runtime(conn), event))
 
     assert ok is True
     assert text == "answered: 42"
@@ -211,11 +176,10 @@ def test_handle_inbound_persists_a_pause_row_when_a_turns_dispatch_call_pauses(
     monkeypatch.setattr(model_access, "send", _stateful_send)
 
     conn = open_store(store_path_from_config())
-    memory_store.ensure_schema(conn)
     key = "webhook:chat-first-pause"
     event = MessageEvent(platform="webhook", chat_id="chat-first-pause", thread_id=None, text="start it")
 
-    ok, text = asyncio.run(handle_inbound(conn, event, plugin_set=plugin_set, persona="p", provider="p", model="m"))
+    ok, text = asyncio.run(handle_inbound(make_runtime(conn, plugin_set=plugin_set), event))
 
     assert ok is True
     assert text == "okay, I'll wait for it."
