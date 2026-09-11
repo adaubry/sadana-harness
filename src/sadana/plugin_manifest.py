@@ -163,6 +163,27 @@ def validate(plugin_dir: Path, *, check_bodies: bool = True) -> plugins.Manifest
     except (tomllib.TOMLDecodeError, KeyError, TypeError, UnicodeDecodeError) as e:
         return plugins.ManifestParseError(detail=str(e))
 
+    # Names first, and the plugin's own name before anything else: it is the
+    # one field here that becomes a filesystem path and an environment
+    # variable identifier rather than staying a label, so nothing downstream
+    # should get to use it before it has been checked
+    # (`docs/tasks/PLUGIN-CONFIG-01-settings-and-secrets-a-plugin-owns/spec.md`).
+    # ``isinstance`` before the regex, not belt-and-braces: these checks run
+    # after the ``try`` above, so ``PLUGIN_NAME_RE.fullmatch(123)`` would leave
+    # here as an uncaught ``TypeError`` rather than an outcome — and
+    # ``discover_plugins`` has no handler, so one malformed plugin would take
+    # out every other one instead of being silently excluded.
+    if not isinstance(manifest.name, str) or not plugins.PLUGIN_NAME_RE.fullmatch(manifest.name):
+        return plugins.InvalidPluginName(name=str(manifest.name))
+
+    seen_settings: set[str] = set()
+    for setting in manifest.settings:
+        if not isinstance(setting.name, str) or not plugins.SETTING_NAME_RE.fullmatch(setting.name):
+            return plugins.InvalidSettingName(setting=str(setting.name))
+        if setting.name in seen_settings:
+            return plugins.DuplicateSettingName(name=setting.name)
+        seen_settings.add(setting.name)
+
     for entry in manifest.entries:
         outcome = _check_schema(plugin_dir, entry)
         if outcome is not None:
@@ -342,6 +363,8 @@ async def run_graph(
     history")."""
     by_name = plugins._node_index(manifest)
     modules: dict[str, ModuleType | None] = {}
+    trace: list[plugins.NodeTrace] = []
+    artifacts: list[plugins.Artifact] = []
 
     def result(text: str, failed_node: str | None) -> plugins.DagResult:
         return plugins.DagResult(
@@ -357,13 +380,46 @@ async def run_graph(
         trace.append(plugins.NodeTrace(node=node.name, kind=node.kind, visit=0, ok=False, port=None, detail=detail))
         return result(f"{manifest.name}'s {node.name!r} step did not complete.", node.name)
 
-    trace: list[plugins.NodeTrace]
-    artifacts: list[plugins.Artifact]
+    # Before anything, including a resume: a plugin whose declared settings
+    # have no value cannot work, and saying so here is the difference between
+    # a message naming the value and a failure inside somebody's HTTP call
+    # (`docs/tasks/PLUGIN-CONFIG-01-settings-and-secrets-a-plugin-owns/spec.md`).
+    # Placed in ``run_graph`` rather than in ``dispatch`` because this is the
+    # one door every execution path already goes through — dispatch, the eval
+    # harness, and the gateway's resume. A manifest declaring no settings
+    # reaches the walk exactly as it did before. ``failed_node`` is `"entry"`
+    # because no node ran; `trace` and `artifacts` are still empty here, so
+    # `result()` reports exactly that.
+    absent = plugins.missing_settings(manifest)
+    if absent:
+        named = ", ".join(repr(name) for name in absent)
+        text = (
+            f"{manifest.name} needs a value for {named}. "
+            f"Set each one with: sadana plugin set {manifest.name} <setting>"
+        )
+        if resume is not None:
+            # A paused run must survive this. `paused_node=None` would make
+            # `plugin_dispatch.resume_paused_run` call `delete_pause`, so a
+            # setting blanked (or a plugin update adding a required one)
+            # while a run waits would destroy the run the moment its answer
+            # arrived — the person could then set the value and still never
+            # resume. Returned exactly as the pause already was, so
+            # `save_pause_from_result` rewrites it unchanged and this is
+            # idempotent however many answers arrive before the value is set.
+            return plugins.DagResult(
+                plugin=manifest.name,
+                entry=entry.tool,
+                text=text,
+                artifacts=resume.artifacts,
+                trace=resume.trace,
+                failed_node=None,
+                paused_node=resume.node,
+            )
+        return result(text, "entry")
+
     value: object
     current: str
     if resume is None:
-        trace = []
-        artifacts = []
         value = arguments
         current = entry.start
     else:

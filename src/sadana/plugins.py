@@ -15,6 +15,8 @@ caller of it ever risks an import cycle."""
 from __future__ import annotations
 
 import json
+import os
+import re
 import tomllib
 from collections import deque
 from collections.abc import Awaitable, Callable
@@ -54,6 +56,29 @@ KIND_USES: dict[str, tuple[str, ...]] = {
 # out what they mean before the runtime can carry it out.
 KINDS_NOT_RUNNABLE: frozenset[str] = frozenset({"each"})
 
+# What a plugin's own name, and a setting's name, are allowed to be. Both are
+# allowlists rather than denylists, and both exist because these names stop
+# being labels: a plugin's name becomes a directory
+# (``_plugins_root() / name``, ``_skill_path``, ``plugin_install.install``),
+# and with ``[[setting]]`` it becomes an environment variable identifier too
+# (CLAUDE.md: "A caller-supplied name that becomes a filesystem path is
+# checked against an allowlist pattern before it touches a path").
+#
+# Lowercase only, so no two names differ by case alone on a filesystem that
+# does not care — the same class of collision pre-commit's
+# ``check-case-conflict`` guards in this repo. No leading, trailing or
+# doubled dash, which leaves no way to spell ``..``, a separator, or an
+# absolute path. The 64-character ceiling is not cosmetic: without it a
+# 400-character name passes every check and then raises ``OSError: File name
+# too long`` from the first ``is_file()``, which used to escape the editor's
+# ``handle()`` as a 500 carrying the absolute path of the plugins directory.
+#
+# One pattern for the whole project. The editor grew its own copy of this
+# rule first (``editor_server._SAFE_NAME``); a second source of truth means a
+# name can pass one door and fail another depending which validated it.
+PLUGIN_NAME_RE = re.compile(r"^[a-z0-9](-?[a-z0-9]){0,63}$")
+SETTING_NAME_RE = re.compile(r"^[a-z0-9]+(_[a-z0-9]+)*$")
+
 
 @dataclass(frozen=True)
 class SkillRef:
@@ -79,6 +104,27 @@ def _plugins_root() -> Path:
     under the existing state directory. Resolved fresh on every call,
     never cached — same posture as ``config.get_paths()``."""
     return config.env_path("SADANA_PLUGINS_DIR", default=config.get_paths().state_dir / "plugins")
+
+
+def plugin_dir(plugins_root: Path, name: str) -> Path | None:
+    """The directory ``name`` refers to under ``plugins_root``, or ``None``
+    if ``name`` is not one this project will touch.
+
+    Both halves of CLAUDE.md's rule, never either: the pattern is the
+    intent, and the containment check after resolution is the proof. The
+    second half catches what the first cannot — a symlink inside
+    ``plugins_root`` pointing out of it resolves elsewhere while its name
+    stays perfectly well-formed.
+
+    Every place an outside name becomes a plugin directory goes through
+    here: the editor's HTTP surface, and ``plugin_install`` before it moves
+    a fetched tree into place."""
+    if not PLUGIN_NAME_RE.fullmatch(name):
+        return None
+    candidate = plugins_root / name
+    if candidate.resolve().parent != plugins_root.resolve():
+        return None
+    return candidate
 
 
 def _skill_path(ref: SkillRef) -> Path:
@@ -233,6 +279,29 @@ class Node:
 
 
 @dataclass(frozen=True)
+class Setting:
+    """One value a plugin needs from the person running it, declared in
+    ``plugin.toml`` as a ``[[setting]]`` table
+    (`docs/tasks/PLUGIN-CONFIG-01-settings-and-secrets-a-plugin-owns/spec.md`).
+
+    ``secret`` is the only behavioural field: it decides whether a prompt
+    echoes and whether the value may ever be shown back. It does *not*
+    decide where the value is stored — both kinds resolve from the same
+    namespaced environment variable, and spec.md's Concerns records why,
+    and that every ``secret=False`` setting is the set to move once a real
+    config file exists.
+
+    Deliberately carries no default value. A default would have to be
+    *injected* at run time, which means either mutating the process
+    environment or putting the value back into the run's data channel —
+    the one thing this design exists to avoid."""
+
+    name: str
+    purpose: str
+    secret: bool
+
+
+@dataclass(frozen=True)
 class Manifest:
     """A plugin's own description of itself, parsed from ``plugin.toml``."""
 
@@ -241,6 +310,52 @@ class Manifest:
     description: str
     entries: tuple[Entry, ...]
     nodes: tuple[Node, ...]
+    # Trailing and defaulted on purpose: every existing construction of a
+    # ``Manifest`` — in ``src/``, in the editor's ``replace()`` calls, and in
+    # the suite — is positional-or-keyword over the five fields above, and a
+    # field inserted anywhere but the end would silently re-bind them.
+    settings: tuple[Setting, ...] = ()
+
+
+def setting_env_var(plugin: str, name: str) -> str:
+    """The one place the naming rule for a plugin setting is written down.
+
+    The separator between the plugin's name and the setting's is *doubled*,
+    and neither name may contain a doubled underscore: a plugin name's
+    hyphens become single underscores and a setting name may carry single
+    underscores, so a single separator would let plugin "a-b" setting "c"
+    and plugin "a" setting "b_c" resolve to the same variable — one plugin
+    reading another's value.
+
+    Both names must already have passed their pattern — ``validate()``
+    refuses a manifest whose names do not, so a caller reaching here with a
+    bad one has skipped validation, which is a bug in the caller and not a
+    lookup that should quietly return nothing."""
+    assert PLUGIN_NAME_RE.fullmatch(plugin), f"{plugin!r} is not a valid plugin name"
+    assert SETTING_NAME_RE.fullmatch(name), f"{name!r} is not a valid setting name"
+    return f"SADANA_PLUGIN__{plugin.replace('-', '_').upper()}__{name.upper()}"
+
+
+def read_setting(plugin: str, name: str) -> str | None:
+    """What a node body calls to read one of its own plugin's settings.
+
+    ``None`` when unset *and* when set to the empty string: a blank line in
+    ``.env`` is a value nobody supplied, and treating the two alike is what
+    stops ``missing_settings`` below being defeated by one.
+
+    This is the only channel by which a value reaches a running plugin. It
+    is deliberately not ``arguments`` and not the walk's threaded value —
+    nothing the model writes can reach it, and nothing it returns can end up
+    in a ``DagResult``, a ``NodeTrace`` or a recorded run by accident."""
+    return os.environ.get(setting_env_var(plugin, name)) or None
+
+
+def missing_settings(manifest: Manifest) -> tuple[str, ...]:
+    """The declared settings with no value, in declaration order.
+
+    Derived on every call, never stored: reading it fresh is what makes
+    "set it, then run again" work without restarting anything."""
+    return tuple(s.name for s in manifest.settings if read_setting(manifest.name, s.name) is None)
 
 
 def manifest_to_dict(manifest: Manifest) -> dict[str, object]:
@@ -269,6 +384,7 @@ def manifest_to_dict(manifest: Manifest) -> dict[str, object]:
             }
             for n in manifest.nodes
         ],
+        "settings": [{"name": s.name, "purpose": s.purpose, "secret": s.secret} for s in manifest.settings],
     }
 
 
@@ -338,6 +454,14 @@ def manifest_to_toml(manifest: Manifest) -> str:
                 lines.append(f"{field} = {_toml_string(value)}")
         if node.ports:
             lines.append("ports = [" + ", ".join(_toml_string(p) for p in node.ports) + "]")
+    for setting in manifest.settings:
+        lines += [
+            "",
+            "[[setting]]",
+            f"name = {_toml_string(setting.name)}",
+            f"purpose = {_toml_string(setting.purpose)}",
+            f"secret = {'true' if setting.secret else 'false'}",
+        ]
     return "\n".join(lines) + "\n"
 
 
@@ -411,12 +535,27 @@ def manifest_from_dict(data: dict) -> Manifest:
             )
         )
 
+    settings_raw = data.get("settings", [])
+    if not isinstance(settings_raw, list):
+        raise ValueError("'settings' must be a list")
+    settings = []
+    for index, raw in enumerate(settings_raw):
+        where = f"setting {index}"
+        if not isinstance(raw, dict):
+            raise ValueError(f"{where}: must be an object, got {type(raw).__name__}")
+        name = _require_str(raw, "name", where)
+        secret = raw.get("secret")
+        if not isinstance(secret, bool):
+            raise ValueError(f"setting {name!r}: 'secret' must be true or false")
+        settings.append(Setting(name=name, purpose=_require_str(raw, "purpose", f"setting {name!r}"), secret=secret))
+
     return Manifest(
         name=_require_str(data, "name", "plugin"),
         version=_require_str(data, "version", "plugin"),
         description=_require_str(data, "description", "plugin"),
         entries=tuple(entries),
         nodes=tuple(nodes),
+        settings=tuple(settings),
     )
 
 
@@ -502,6 +641,34 @@ class CyclicGraph:
     node: str
 
 
+@dataclass(frozen=True)
+class InvalidPluginName:
+    """The plugin's own name is not one ``PLUGIN_NAME_RE`` allows.
+
+    Wider than the work item that added it: a plugin's name already became
+    a filesystem path long before it became an environment variable
+    identifier, and nothing in this tree checked it. Caught here because
+    install, the marketplace's vetting, the editor's save and
+    ``discover_plugins`` all already route through ``validate()``."""
+
+    name: str
+
+
+@dataclass(frozen=True)
+class InvalidSettingName:
+    """A ``[[setting]]``'s name is not one ``SETTING_NAME_RE`` allows."""
+
+    setting: str
+
+
+@dataclass(frozen=True)
+class DuplicateSettingName:
+    """Two ``[[setting]]`` tables declare the same name — one of them would
+    silently win, and which one is an accident of file order."""
+
+    name: str
+
+
 ManifestOutcome = (
     Valid
     | ManifestParseError
@@ -512,6 +679,9 @@ ManifestOutcome = (
     | UnresolvedBody
     | UnreachableNode
     | CyclicGraph
+    | InvalidPluginName
+    | InvalidSettingName
+    | DuplicateSettingName
 )
 
 
@@ -538,8 +708,27 @@ def describe_manifest_outcome(outcome: ManifestOutcome) -> str:
             return f"node {node!r} is never reached from any entry"
         case CyclicGraph(node=node):
             return f"the graph cycles back through node {node!r}"
+        case InvalidPluginName(name=name):
+            return f"plugin name {name!r} is not lowercase letters, digits and single hyphens"
+        case InvalidSettingName(setting=setting):
+            return f"setting name {setting!r} is not lowercase letters, digits and single underscores"
+        case DuplicateSettingName(name=name):
+            return f"duplicate setting name {name!r}"
         case _:  # pragma: no cover - Valid has no rejection reason; ManifestOutcome is exhausted above
             return "plugin.toml does not validate"
+
+
+def _require_bool(data: dict, field: str) -> bool:
+    """``TypeError`` for anything but a real boolean, which
+    ``plugin_manifest.validate``'s existing ``except`` turns into a
+    ``ManifestParseError``. Without it a string in that field validates, and the
+    plugin then cannot be saved in the editor — ``manifest_from_dict``
+    refuses the same value on the way back, an error about a field the
+    editor has no control over."""
+    value = data[field]
+    if not isinstance(value, bool):
+        raise TypeError(f"{field!r} must be true or false, got {type(value).__name__}")
+    return value
 
 
 def _parse_manifest(text: str) -> Manifest:
@@ -564,12 +753,17 @@ def _parse_manifest(text: str) -> Manifest:
         )
         for n in data.get("node", [])
     )
+    settings = tuple(
+        Setting(name=s["name"], purpose=s["purpose"], secret=_require_bool(s, "secret"))
+        for s in data.get("setting", [])
+    )
     return Manifest(
         name=plugin_meta["name"],
         version=plugin_meta["version"],
         description=plugin_meta["description"],
         entries=entries,
         nodes=nodes,
+        settings=settings,
     )
 
 
@@ -608,10 +802,14 @@ def rename_node(manifest: Manifest, old: str, new: str) -> Manifest:
     if new != old and new in index:
         raise ValueError(f"a step named {new!r} already exists")
     swap = lambda name: new if name == old else name  # noqa: E731 - one expression, three call sites below
-    return Manifest(
-        name=manifest.name,
-        version=manifest.version,
-        description=manifest.description,
+    # ``replace`` on the manifest, never a field-by-field rebuild: this
+    # function and ``remove_node`` below each used to name all five fields,
+    # which silently dropped ``settings`` the moment a sixth was added and
+    # nothing failed until the person's next run. ``add_node`` already had
+    # the right shape; these two now match it, so the next field added to
+    # ``Manifest`` is carried through here without anyone remembering to.
+    return replace(
+        manifest,
         entries=tuple(replace(entry, start=swap(entry.start)) for entry in manifest.entries),
         nodes=tuple(
             replace(
@@ -643,10 +841,8 @@ def remove_node(manifest: Manifest, name: str) -> Manifest:
         if node.name != name
     )
     fallback = kept[0].name if kept else ""
-    return Manifest(
-        name=manifest.name,
-        version=manifest.version,
-        description=manifest.description,
+    return replace(
+        manifest,
         entries=tuple(replace(e, start=fallback if e.start == name else e.start) for e in manifest.entries),
         nodes=kept,
     )

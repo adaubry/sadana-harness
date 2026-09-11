@@ -4,6 +4,7 @@ fetch_verified_tag()."""
 from __future__ import annotations
 
 import time
+from contextlib import closing
 from pathlib import Path
 
 import pytest
@@ -247,3 +248,41 @@ def test_discover_plugins_finds_a_freshly_installed_plugin_with_no_code_change(t
 
     installed = plugin_manifest.discover_plugins(plugins_root)
     assert any(p.name == "greeter" for p in installed)
+
+
+@pytest.mark.unit
+def test_register_refuses_a_name_that_is_not_a_safe_name() -> None:
+    """A registered name is a long-lived key that later becomes a directory
+    under the plugins root. Checked at the door it enters by, so no unsafe
+    name is ever in the registry to be resolved later."""
+    with closing(_conn()) as conn:
+        outcome = plugin_install.register(conn, "../evil", "https://example.invalid/x.git", now=1.0)
+    assert isinstance(outcome, plugin_install.InvalidName)
+
+
+@pytest.mark.unit
+def test_install_never_writes_outside_the_plugins_root(tmp_path: Path) -> None:
+    """`plugins_root / name` with an unchecked name escapes the root, and
+    the write is an `os.replace` over whatever is there. Both halves of
+    CLAUDE.md's rule are needed: the pattern at the door, and the resolved
+    path re-checked before anything is moved."""
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "precious.txt").write_text("do not clobber")
+    plugins_root = tmp_path / "plugins"
+    plugins_root.mkdir()
+    escaping = "../outside"
+
+    with closing(_conn()) as conn:
+        plugin_install._ensure_schema(conn)
+        # Straight into the table, past register(): proves install() defends
+        # itself rather than trusting that the registry was policed.
+        conn.execute(
+            "INSERT INTO plugin_registry (name, repo_url, registered_at) VALUES (?, ?, ?)",
+            (escaping, "https://example.invalid/x.git", 1.0),
+        )
+        conn.commit()
+        outcome = plugin_install.install(conn, escaping, "v1.0.0", plugins_root=plugins_root)
+
+    assert isinstance(outcome, plugin_install.InvalidName)
+    assert (outside / "precious.txt").read_text() == "do not clobber"

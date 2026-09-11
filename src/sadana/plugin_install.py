@@ -60,7 +60,20 @@ class NameTaken:
     name: str
 
 
-RegisterOutcome = Registered | NameTaken
+@dataclass(frozen=True)
+class InvalidName:
+    """`name` is not one `plugins.PLUGIN_NAME_RE` allows, or it resolves
+    outside the plugins root.
+
+    Checked at both doors an outside name enters by. `register()` mints a
+    long-lived key, so an unsafe name must never reach the table; `install()`
+    re-checks anyway rather than trusting that the table was policed, because
+    the row it reads is the thing that decides where `os.replace` writes."""
+
+    name: str
+
+
+RegisterOutcome = Registered | NameTaken | InvalidName
 
 
 @dataclass(frozen=True)
@@ -116,7 +129,9 @@ class FetchFailed:
     detail: str
 
 
-InstallOutcome = Installed | UnknownPluginName | AlreadyInstalled | NameMismatch | TagMismatch | FetchFailed
+InstallOutcome = (
+    Installed | UnknownPluginName | AlreadyInstalled | NameMismatch | TagMismatch | FetchFailed | InvalidName
+)
 
 
 def describe_fetch_failure(outcome: TagMismatch | FetchFailed) -> str:
@@ -145,6 +160,8 @@ def register(conn: sqlite3.Connection, name: str, repo_url: str, *, now: float) 
     """Record that `name` means `repo_url`. `name` is a real `PRIMARY KEY`
     — CLAUDE.md's rule that a long-lived name a user returns to needs a
     database constraint behind it, applied literally."""
+    if not plugins.PLUGIN_NAME_RE.fullmatch(name):
+        return InvalidName(name=name)
     _ensure_schema(conn)
     try:
         with write_txn(conn) as c:
@@ -287,11 +304,17 @@ def install(
     if not _is_valid_tag_syntax(tag):
         return FetchFailed(detail=f"{tag!r} is not a valid tag name")
 
+    # Before the name is allowed to become a path at all. `plugins_root / name`
+    # with an unchecked name escapes the root, and what happens at the end of
+    # this function is an `os.replace` over whatever is at `target`.
+    target = plugins.plugin_dir(plugins_root, name)
+    if target is None:
+        return InvalidName(name=name)
+
     repo_url = resolve(conn, name)
     if repo_url is None:
         return UnknownPluginName(name=name)
 
-    target = plugins_root / name
     if target.exists() and not replace:
         return AlreadyInstalled(name=name)
 

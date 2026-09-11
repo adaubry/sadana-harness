@@ -549,3 +549,67 @@ def test_the_ordinary_body_skill_and_schema_shapes_still_save(tmp_path: Path) ->
         _parse_manifest((tmp_path / "my-plugin" / "plugin.toml").read_text(encoding="utf-8")).nodes[0].body
         == "init:fetch"
     )
+
+
+# ── settings survive the editor's own round trip ─────────────────────────
+
+
+@pytest.mark.unit
+def test_saving_a_plugin_through_the_editor_keeps_its_settings(tmp_path: Path) -> None:
+    """The whole Python half of "saving in the editor preserves settings":
+    GET hands the browser a manifest, the browser posts back what it was
+    given, and PUT writes it. The JavaScript half cannot be tested here — it
+    is covered by reading `editor.js`, which posts `open.manifest` rather than
+    rebuilding it.
+
+    The danger is silent: a settings-losing save still succeeds, and
+    `_write_manifest`'s own emit-and-reparse guard cannot catch it, because
+    that compares the emitted file against the manifest it was *handed*, not
+    against what was on disk before."""
+    _create(tmp_path)
+    manifest_path = tmp_path / "my-plugin" / "plugin.toml"
+    manifest_path.write_text(
+        manifest_path.read_text(encoding="utf-8")
+        + '\n[[setting]]\nname = "api_key"\npurpose = "Account key"\nsecret = true\n',
+        encoding="utf-8",
+    )
+
+    handed_out = _body(handle("GET", "/api/plugins/my-plugin", b"", plugins_root=tmp_path))["manifest"]
+    assert handed_out["settings"] == [{"name": "api_key", "purpose": "Account key", "secret": True}]
+
+    saved = handle("PUT", "/api/plugins/my-plugin", json.dumps(handed_out).encode(), plugins_root=tmp_path)
+
+    assert saved.status == 200  # type: ignore[attr-defined]
+    assert _parse_manifest(manifest_path.read_text(encoding="utf-8")).settings[0].name == "api_key"
+
+
+@pytest.mark.unit
+def test_renaming_a_step_through_the_editor_keeps_the_plugins_settings(tmp_path: Path) -> None:
+    """The edit that actually lost them: `rename_node` rebuilt the manifest
+    field by field, so a person renaming a box deleted the key they had
+    already filled in, and nothing failed until the next run."""
+    _create(tmp_path)
+    manifest_path = tmp_path / "my-plugin" / "plugin.toml"
+    manifest_path.write_text(
+        manifest_path.read_text(encoding="utf-8")
+        + '\n[[setting]]\nname = "api_key"\npurpose = "Account key"\nsecret = true\n',
+        encoding="utf-8",
+    )
+    before = _body(handle("GET", "/api/plugins/my-plugin", b"", plugins_root=tmp_path))
+    step = before["manifest"]["nodes"][0]["name"]
+
+    renamed = handle(
+        "POST",
+        "/api/plugins/my-plugin/steps",
+        json.dumps({"op": "rename", "step": step, "to": "renamed"}).encode(),
+        plugins_root=tmp_path,
+    )
+
+    # Asserted before the settings check, and not for its own sake: with the
+    # wrong key this endpoint answers 400 and writes nothing, and the
+    # settings assertion below then passes against an untouched file. A test
+    # that cannot fail is worse than no test.
+    assert renamed.status == 200  # type: ignore[attr-defined]
+    written = _parse_manifest(manifest_path.read_text(encoding="utf-8"))
+    assert [n.name for n in written.nodes] == ["renamed"]
+    assert written.settings[0].name == "api_key"
