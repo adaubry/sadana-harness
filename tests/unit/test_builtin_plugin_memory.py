@@ -23,9 +23,9 @@ async def _approve_ok(_plugin: str, _node: str, _value: object) -> bool:
 
 
 def _builtin_dir():  # type: ignore[no-untyped-def]
-    from sadana.memory_store import _BUILTIN_PLUGIN_SOURCE
+    from sadana.builtin_seed import SOURCE_ROOT
 
-    return _BUILTIN_PLUGIN_SOURCE
+    return SOURCE_ROOT / "memory"
 
 
 @pytest.mark.unit

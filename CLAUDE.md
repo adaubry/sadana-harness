@@ -58,6 +58,7 @@ WSL only. Python lives in `.venv`; `make` puts it on PATH for you, so there is n
 - A plugin's own execution identity (a memory account, a session key, or anything like it) crosses into `arguments` only via a `_sadana_`-prefixed reserved key, merged in last so it always wins over anything the model supplied under that name — never a hidden parameter threaded through a node body's own call signature.
 - A browser surface holds no logic that can be held in Python — layout, validation and assembly are computed server-side and sent as data, because nothing in this repo can test JavaScript.
 - A caller-supplied name that becomes a filesystem path is checked against an allowlist pattern before it touches a path, and the resolved path is re-checked to be inside its intended root — both, never either.
+- Text a plugin fetched from outside reaches the model only as a tool result, never as system-prompt or skill text: `ask` resolves its skill from `plugin.toml` alone, and no node kind may build prompt text out of a threaded value.
 
 ## Glossary
 
