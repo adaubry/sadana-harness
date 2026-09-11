@@ -1,7 +1,9 @@
 # Capability import blueprint
 
-Status: proposed. Written 2026-09-10, against `c299819`.
-Cited by: (none yet — this document precedes its work items.)
+Status: in progress. Written 2026-09-10 against `c299819`; §4.2 corrected
+2026-09-11 against `4b3d108` — see the correction in that section.
+Cited by: `PLUGIN-CONFIG-01`, `ARTIFACT-STORE-01`, `WEB-SEARCH-01`,
+`IMAGE-GEN-01`, `SUBPROCESS-01`, `BROWSE-01` (items 1-6 of §8).
 
 **Moving target:** `GATEWAY-DAEMON-02-scheduled-and-resumable-triggers` was in
 build while this was being written, and lands the `wait` node plus a scheduler.
@@ -125,14 +127,50 @@ capability arrives for the least architecture.
 A loop that would be many tool calls, driven internally by the plugin's own
 body, entered once with a goal and exited once with a result.
 
-**Becomes a plugin.** hermes already made this decision and it should be read as
-evidence, not invented here: `toolsets.py:57` marks `browser_exec` as
-*"replaces other tools when browser.backend is browser-use"*. One tool takes a
-natural-language task and runs browser-use's own agent loop; the twelve
-`browser_*` tools beside it are Shape C. The same codebase ships both shapes of
-the same capability, and says which replaces which.
+**Becomes a plugin.**
 
-**Browsing is a Shape B import.** Take `browser_exec`; leave
+> **Corrected 2026-09-11, during `BROWSE-01`.** This paragraph originally read:
+> *"hermes already made this decision and it should be read as evidence, not
+> invented here: `toolsets.py:57` marks `browser_exec` as 'replaces other tools
+> when browser.backend is browser-use'. One tool takes a natural-language task
+> and runs browser-use's own agent loop; the twelve `browser_*` tools beside it
+> are Shape C. The same codebase ships both shapes of the same capability, and
+> says which replaces which."*
+>
+> **The claim about `browser_exec` is false.** It takes `code`, not a task:
+> `tools/browser_use_cli.py:1057-1061` registers it with
+> `code=args.get("code", "")`, and pipes that to the CLI on stdin
+> (`:829-836`). The model writes Python that drives the browser and issues it
+> across calls. So `browser_exec` collapses thirteen *tools* into one — which
+> is what that comment actually claims (it is at `toolsets.py:54-55`; the
+> original's `:57` was itself off by three) — but not thirteen *calls* into
+> one. **By this document's own §4.3 it is Shape C**, and the reference
+> therefore contains no Shape B browsing tool to read as evidence.
+>
+> The browser-use CLI as of this correction has no goal-shaped entry either:
+> its commands are code-on-stdin plus `doctor`, `auth`, `skill`, `recordings`,
+> `video`, `telemetry`, `--update` and `--reload`. Nothing takes "find me X".
+>
+> A Shape B form does exist, and `BROWSE-01` uses it: the browser-use
+> *library* still ships `Agent(task=..., llm=...)`, reachable by running
+> `uvx --from browser-use python -c "<a fixed script>" "<task>"` — a program,
+> not an import, so §6 Rule 5's no-new-dependency constraint holds and
+> `SUBPROCESS-01`'s primitive is what runs it. The script is first-party and
+> fixed; the model supplies only the task string.
+>
+> **What this changes for anything citing §4.2.** The shape rule is unaffected
+> and still right — enter by goal, exit once. What was wrong was the evidence
+> offered for it. A future import must not assume the reference has already
+> found the Shape B form of a capability; check, because here it had not.
+
+hermes ships `browser_exec` as the one browser tool when its browser backend is
+browser-use (`toolsets.py:54-55`, *"replaces other tools when browser.backend
+is browser-use"*), and the twelve `browser_*` tools beside it are Shape C. So is
+`browser_exec` itself — see the correction above.
+
+**Browsing is a Shape B import, but not by taking `browser_exec`** — see
+the correction above; `browser_exec` is itself Shape C, and the Shape B
+form is browser-use's `Agent` run as a program (`BROWSE-01`). Leave
 `browser_navigate`, `browser_snapshot`, `browser_click`, `browser_type`,
 `browser_scroll`, `browser_back`, `browser_press`, `browser_get_images`,
 `browser_vision`, `browser_console`, `browser_cdp`, `browser_dialog`.
@@ -280,7 +318,7 @@ Shape A unless noted. Ordered by ratio of capability to new architecture.
 | 5 | video generation | `video_generate` (MEDIA) | Same gap. Import after image gen or not at all. |
 | 6 | speech synthesis | `text_to_speech` (MEDIA) | Same gap. Note MEDIA's wider voice stack (§2) is *not* in scope: no wake word, no voice mode, no streaming. |
 | 7 | transcription | `transcription_tools.py` (MEDIA) | No hermes tool exists — it is a provider subsystem behind the voice loop. Importing it means **authoring an entry hermes never had**, which is allowed and worth flagging as such. |
-| 8 | web browsing | `browser_exec` (BROWSER) | **Shape B.** Blocked on §5.6 gap 1 (subprocess). The payoff is the largest on the list: thirteen hermes tools become one entry. |
+| 8 | web browsing | browser-use's `Agent` (not `browser_exec`) | **Shape B** — but *not* by importing `browser_exec`, which is Shape C (§4.2's correction). Run the library as a program with a fixed first-party script. §5.6 gap 1 closed by `SUBPROCESS-01`. |
 | 9 | X/Twitter search | `x_search` (BROWSER) | Narrow; import only if actually used. |
 | 10 | Spotify | `spotify` plugin (`kind: backend`) | HTTP API, self-contained, zero architectural weight. A pleasant demo, low priority. |
 | 11 | Feishu docs/drive | `feishu_doc_read`, `feishu_drive_*` (CHANNELS) | Shape A in principle. Five tools of someone else's workflow — import only on real use. |
@@ -437,7 +475,7 @@ start = "run"
 [[node]]
 name = "run"          # subprocess to browser-use; approval-gated, off the event loop
 kind = "call"
-body = "init:run_browser_use"
+body = "browse:run_browser_use"
 next = "judge"
 
 [[node]]

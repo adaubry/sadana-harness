@@ -22,15 +22,7 @@ PLUGIN = "image-gen"
 
 
 def draw(value: dict) -> Artifact | str:
-    # No no-key branch here on purpose. `PLUGIN-CONFIG-01`'s preflight in
-    # `run_graph` refuses the run before any node starts when a declared
-    # setting is unset, so a check written again here is unreachable — and
-    # unreachable code a reader trusts as the live behaviour, with wording
-    # that differs from what the preflight actually prints, is worse than
-    # none. `assert` rather than a branch: if this ever fires, the preflight
-    # stopped working and that is the bug worth hearing about.
-    api_key = plugins.read_setting(PLUGIN, "api_key")
-    assert api_key is not None, "run_graph's missing-settings preflight should have refused this run"
+    api_key = plugins.required_setting(PLUGIN, "api_key")
 
     prompt = str(value.get("prompt", "")).strip()
     if not prompt:

@@ -354,6 +354,25 @@ def read_setting(plugin: str, name: str) -> str | None:
     return os.environ.get(setting_env_var(plugin, name)) or None
 
 
+def required_setting(plugin: str, name: str) -> str:
+    """A declared setting that must be there, for a body that has already been
+    let past the preflight.
+
+    A plugin body writes no "key is missing" branch of its own.
+    ``plugin_manifest.run_graph`` refuses the whole run before any node starts
+    when a declared setting is unset, so such a branch is unreachable — and
+    unreachable code that a reader trusts as the live behaviour, returning
+    wording that differs from what the preflight actually prints, is worse than
+    none. The assertion here fires only if that preflight has stopped working,
+    which is the bug worth hearing about.
+
+    Written once because three plugins were each carrying it, two of them with
+    the same eight-line comment character for character."""
+    value = read_setting(plugin, name)
+    assert value is not None, f"run_graph's missing-settings preflight should have refused this run ({plugin}.{name})"
+    return value
+
+
 def missing_settings(manifest: Manifest) -> tuple[str, ...]:
     """The declared settings with no value, in declaration order.
 

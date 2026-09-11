@@ -5,7 +5,7 @@
 I/O in it, so the only thing this file contributes that a unit test cannot
 reach is the request itself.
 
-The key comes from `plugins.read_setting` — the plugin's own declared
+The key comes from `plugins.required_setting` — the plugin's own declared
 `[[setting]]`, supplied by the person through `sadana plugin set`. It is never
 a model-supplied argument, never in this repository, and never in the URL.
 """
@@ -16,15 +16,7 @@ PLUGIN = "web-search"
 
 
 def search(value: dict) -> str:
-    # No no-key branch here on purpose. `PLUGIN-CONFIG-01`'s preflight in
-    # `run_graph` refuses the run before any node starts when a declared
-    # setting is unset, so a check written again here is unreachable — and
-    # unreachable code a reader trusts as the live behaviour, with wording
-    # that differs from what the preflight actually prints, is worse than
-    # none. `assert` rather than a branch: if this ever fires, the preflight
-    # stopped working and that is the bug worth hearing about.
-    api_key = plugins.read_setting(PLUGIN, "api_key")
-    assert api_key is not None, "run_graph's missing-settings preflight should have refused this run"
+    api_key = plugins.required_setting(PLUGIN, "api_key")
 
     query = str(value.get("query", "")).strip()
     if not query:
