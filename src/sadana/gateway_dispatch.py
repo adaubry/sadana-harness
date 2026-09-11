@@ -43,6 +43,7 @@ from sadana.conversation import (
     ExitReason,
     Message,
     TemplateRecipe,
+    TurnKey,
     append,
     create_conversation,
     iteration_budget_from_config,
@@ -147,8 +148,14 @@ async def handle_inbound(
             )
             conversation_store.create(conn, conversation, now=now)
 
-        async def persist_pause(result: plugins.DagResult) -> None:
-            conversation_store.save_pause_from_result(conn, conversation_key=key, result=result)
+        async def persist_pause(turn_key: TurnKey, seq_in_turn: int, result: plugins.DagResult) -> None:
+            conversation_store.save_pause_from_result(
+                conn,
+                conversation_key=key,
+                result=result,
+                turn_seq=turn_key.turn_seq,
+                seq_in_turn=seq_in_turn,
+            )
 
         dispatch, tracker = plugin_dispatch.build_dispatch(
             conversation,

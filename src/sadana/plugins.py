@@ -188,7 +188,11 @@ class Artifact:
 
     kind: Literal["link", "file"]
     name: str
-    ref: str  # a URL, or a path under the run's own output directory
+    # A URL, or a path inside the run's own output directory — which
+    # `artifact_store` creates and `run_graph` checks a `file` ref against.
+    # This sentence described a directory nothing made until
+    # `ARTIFACT-STORE-01`; G2 named creating one as its own non-goal.
+    ref: str
 
 
 @dataclass(frozen=True)

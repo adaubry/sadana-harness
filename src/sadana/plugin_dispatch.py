@@ -14,7 +14,7 @@ import sqlite3
 from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass, replace
 
-from sadana import conversation_store, memory_store, observability, plugin_manifest, plugins
+from sadana import artifact_store, conversation_store, memory_store, observability, plugin_manifest, plugins
 from sadana.conversation import (
     ChildSpec,
     Conversation,
@@ -23,6 +23,7 @@ from sadana.conversation import (
     PluginCatalogEntry,
     ResolvedNames,
     ToolSpec,
+    TurnKey,
     TurnResult,
     _noop_persist,
     run_child,
@@ -121,7 +122,7 @@ class ChildSeqTracker:
     next_seq: int
 
 
-async def _noop_persist_pause(_result: plugins.DagResult) -> None:
+async def _noop_persist_pause(_turn_key: TurnKey, _seq_in_turn: int, _result: plugins.DagResult) -> None:
     """The default ``persist_pause``: a caller that never opted in behaves
     exactly as before this parameter existed — same posture as
     ``conversation.py``'s own ``_noop_persist``."""
@@ -141,7 +142,7 @@ def build_dispatch(
     record_turn: observability.RecordTurnFn = observability.noop_record,
     record_plugin_run: observability.RecordPluginRunFn = observability.noop_record,
     memory_context: memory_store.DispatchContext | None = None,
-    persist_pause: Callable[[plugins.DagResult], Awaitable[None]] = _noop_persist_pause,
+    persist_pause: Callable[[TurnKey, int, plugins.DagResult], Awaitable[None]] = _noop_persist_pause,
 ) -> tuple[DispatchFn, ChildSeqTracker]:
     """Builds one dispatch closure matching `conversation.py`'s own
     `dispatch` contract exactly, and the `ChildSeqTracker` it shares with
@@ -242,18 +243,36 @@ def build_dispatch(
                 failed_node="entry",
             )
         installed, entry = hit
+        # The run's own place to write, named from the key this run already
+        # has — the same (conversation, turn, seq) `record_plugin_run` below
+        # uses, so the files and the record of the run line up by reading
+        # either one (`docs/tasks/ARTIFACT-STORE-01-somewhere-to-put-what-a
+        # -plugin-makes/spec.md`). Nothing is created here; the directory
+        # appears only if a body actually asks for it.
+        output_dir = artifact_store.for_run(turn_key.conversation, turn_key.turn_seq, seq_in_turn)
         call_arguments = {**arguments, "_sadana_session_key": conversation.key}
         if memory_context is not None:
             call_arguments["_sadana_memory_ctx"] = memory_context
         result, duration_s = await observability.timed(
             plugin_manifest.run_graph(
-                installed.directory, installed.manifest, entry, call_arguments, ask=ask, approve=approve
+                installed.directory,
+                installed.manifest,
+                entry,
+                call_arguments,
+                ask=ask,
+                approve=approve,
+                output_dir=output_dir,
             )
         )
         await record_plugin_run(turn_key, seq_in_turn, result, duration_s)
-        seq_in_turn += 1
         if result.paused_node is not None:
-            await persist_pause(result)
+            # The same `(turn_key, seq_in_turn)` `record_plugin_run` was just
+            # handed, in the same order and shape as its sibling callback —
+            # a pause and the record of the run it paused name the run
+            # identically, which is what lets the resumed half find the
+            # directory the paused half wrote into.
+            await persist_pause(turn_key, seq_in_turn, result)
+        seq_in_turn += 1
         return result
 
     return dispatch, tracker
@@ -333,6 +352,15 @@ async def resume_paused_run(
     resume_state = plugins.ResumeState(
         node=pause.node, value=payload_text, trace=pause.trace, artifacts=pause.artifacts
     )
+    # The same directory the paused half wrote into — a resume is the same
+    # run continuing, so its files belong beside the ones already there. A
+    # pause row written before those two columns existed has neither, and
+    # this run gets no output directory, exactly as it did before.
+    output_dir = (
+        artifact_store.for_run(conversation_key, pause.turn_seq, pause.seq_in_turn)
+        if pause.turn_seq is not None and pause.seq_in_turn is not None
+        else None
+    )
     result = await plugin_manifest.run_graph(
         plugins._plugins_root() / pause.plugin,
         outcome.manifest,
@@ -341,11 +369,18 @@ async def resume_paused_run(
         ask=_unsupported_ask,
         approve=approve,
         resume=resume_state,
+        output_dir=output_dir,
     )
     if result.paused_node is None:
         conversation_store.delete_pause(conn, conversation_key=conversation_key)
     else:
-        conversation_store.save_pause_from_result(conn, conversation_key=conversation_key, result=result)
+        conversation_store.save_pause_from_result(
+            conn,
+            conversation_key=conversation_key,
+            result=result,
+            turn_seq=pause.turn_seq,
+            seq_in_turn=pause.seq_in_turn,
+        )
     return result
 
 

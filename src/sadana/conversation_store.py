@@ -80,7 +80,9 @@ CREATE TABLE IF NOT EXISTS plugin_pauses (
     entry             TEXT NOT NULL,
     node              TEXT NOT NULL,
     trace_json        TEXT NOT NULL,
-    artifacts_json    TEXT NOT NULL
+    artifacts_json    TEXT NOT NULL,
+    turn_seq          INTEGER,
+    seq_in_turn       INTEGER
 );
 """
 
@@ -152,36 +154,62 @@ def open_store(path: Path) -> sqlite3.Connection:
 # EXISTS`` above only covers a brand-new store; a store that already exists
 # needs each one added explicitly. C12 (docs/tasks/C12-context-resume-round-trip)
 # added the three below.
-_MIGRATED_COLUMNS = (
-    ("stable_prompt_len", "INTEGER"),
-    ("context_total_prompt_tokens", "INTEGER NOT NULL DEFAULT 0"),
-    ("context_total_completion_tokens", "INTEGER NOT NULL DEFAULT 0"),
-)
+# Columns added to a table that already shipped, by table. Applied with the
+# idempotent ``PRAGMA table_info`` + guarded ``ALTER TABLE ... ADD COLUMN``
+# shape CLAUDE.md prescribes (adapted from hermes-agent's own
+# ``gateway/delivery_ledger.py:130-141``, kind: production-code), never a
+# backfill migration.
+#
+# ``plugin_pauses``' two are nullable on purpose. A pause row written before
+# ``ARTIFACT-STORE-01`` has no idea which turn it belonged to and there is no
+# safe value to invent, so it reads back ``None`` and the run resumed from it
+# gets no output directory — exactly how it behaved before these existed
+# (CLAUDE.md: "a column with no safe default falls back to matching pre-fix
+# behavior at read time, so legacy rows keep loading and self-correct only
+# once genuinely rewritten").
+_MIGRATED_COLUMNS: dict[str, tuple[tuple[str, str], ...]] = {
+    "conversations": (
+        ("stable_prompt_len", "INTEGER"),
+        ("context_total_prompt_tokens", "INTEGER NOT NULL DEFAULT 0"),
+        ("context_total_completion_tokens", "INTEGER NOT NULL DEFAULT 0"),
+    ),
+    "plugin_pauses": (
+        ("turn_seq", "INTEGER"),
+        ("seq_in_turn", "INTEGER"),
+    ),
+}
 
 
 def _migrate_columns(conn: sqlite3.Connection) -> None:
-    """Adds any column in ``_MIGRATED_COLUMNS`` missing from an existing
-    ``conversations`` table — the ``PRAGMA table_info`` check below (adapted
-    from hermes-agent's own guarded ``ALTER TABLE ... ADD COLUMN`` pattern,
-    ``gateway/delivery_ledger.py:130-141``, kind: production-code) is what
-    makes a second ``open_store()`` call in this same process a no-op:
-    a column already present (a store this function already migrated, or
-    one created fresh with it already in ``_SCHEMA``) is simply skipped.
-    No exception guard is needed for that — declined hermes's own
-    concurrent-first-use ``sqlite3.OperationalError`` catch, since this
-    store's single-writer posture (spec.md's Non-goals) already excludes
-    the race it exists to survive. Runs any missing columns' ``ALTER
-    TABLE``s inside one ``write_txn`` — self-check caught that the
-    realistic first-run case (a store predating all three columns) would
-    otherwise cost three separate autocommitted DDL statements, three WAL
-    commits for one logical migration, where one does the job."""
-    existing = {row[1] for row in conn.execute("PRAGMA table_info(conversations)")}
-    missing = [(name, ddl_type) for name, ddl_type in _MIGRATED_COLUMNS if name not in existing]
-    if not missing:
-        return
-    with write_txn(conn) as c:
-        for name, ddl_type in missing:
-            c.execute(f"ALTER TABLE conversations ADD COLUMN {name} {ddl_type}")
+    """Adds every column in ``_MIGRATED_COLUMNS`` missing from the table that
+    owns it.
+
+    The ``PRAGMA table_info`` check is what makes a second ``open_store()``
+    call in this same process a no-op: a column already present — in a store
+    this function already migrated, or one created fresh with it already in
+    ``_SCHEMA`` — is simply skipped. No exception guard is needed for that;
+    declined hermes's own concurrent-first-use ``sqlite3.OperationalError``
+    catch, since this store's single-writer posture (spec.md's Non-goals)
+    already excludes the race it exists to survive.
+
+    One ``write_txn`` per table with anything missing, rather than one per
+    column: a self-check caught that the realistic first-run case (a store
+    predating all three ``conversations`` columns) would otherwise cost three
+    separate autocommitted DDL statements — three WAL commits for one logical
+    migration, where one does the job.
+
+    ``table`` is never caller-supplied; it is a literal key of the map above.
+    That is what makes the f-string interpolation safe, since SQLite takes no
+    parameter in a DDL identifier position.
+    """
+    for table, columns in _MIGRATED_COLUMNS.items():
+        existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+        missing = [(name, ddl_type) for name, ddl_type in columns if name not in existing]
+        if not missing:
+            continue
+        with write_txn(conn) as c:
+            for name, ddl_type in missing:
+                c.execute(f"ALTER TABLE {table} ADD COLUMN {name} {ddl_type}")
 
 
 @contextlib.contextmanager
@@ -476,6 +504,11 @@ class Pause:
     node: str
     trace: tuple[plugins.NodeTrace, ...]
     artifacts: tuple[plugins.Artifact, ...]
+    # Where the paused half wrote, so the resumed half writes there too.
+    # Trailing and defaulted so every construction predating them still means
+    # what it meant; `None` is a row written before they existed.
+    turn_seq: int | None = None
+    seq_in_turn: int | None = None
 
 
 def save_pause(
@@ -487,6 +520,8 @@ def save_pause(
     node: str,
     trace: tuple[plugins.NodeTrace, ...],
     artifacts: tuple[plugins.Artifact, ...],
+    turn_seq: int | None = None,
+    seq_in_turn: int | None = None,
 ) -> None:
     """Upserts by ``conversation_key`` — a run that pauses a second time
     (at a second `wait` node) overwrites its own prior pause row cleanly
@@ -494,11 +529,12 @@ def save_pause(
     outstanding pause per conversation" constraint."""
     with write_txn(conn) as c:
         c.execute(
-            "INSERT INTO plugin_pauses (conversation_key, plugin, entry, node, trace_json, artifacts_json) "
-            "VALUES (?, ?, ?, ?, ?, ?) "
+            "INSERT INTO plugin_pauses (conversation_key, plugin, entry, node, trace_json, artifacts_json, "
+            "turn_seq, seq_in_turn) VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
             "ON CONFLICT(conversation_key) DO UPDATE SET "
             "plugin=excluded.plugin, entry=excluded.entry, node=excluded.node, "
-            "trace_json=excluded.trace_json, artifacts_json=excluded.artifacts_json",
+            "trace_json=excluded.trace_json, artifacts_json=excluded.artifacts_json, "
+            "turn_seq=excluded.turn_seq, seq_in_turn=excluded.seq_in_turn",
             (
                 conversation_key,
                 plugin,
@@ -506,11 +542,20 @@ def save_pause(
                 node,
                 json.dumps([asdict(t) for t in trace]),
                 json.dumps([asdict(a) for a in artifacts]),
+                turn_seq,
+                seq_in_turn,
             ),
         )
 
 
-def save_pause_from_result(conn: sqlite3.Connection, *, conversation_key: str, result: plugins.DagResult) -> None:
+def save_pause_from_result(
+    conn: sqlite3.Connection,
+    *,
+    conversation_key: str,
+    result: plugins.DagResult,
+    turn_seq: int | None = None,
+    seq_in_turn: int | None = None,
+) -> None:
     """`save_pause()`, unpacking a `paused_node`-bearing `DagResult` — the
     one place that knows how a paused run's fields map onto a
     `plugin_pauses` row, called from both of this project's two paths that
@@ -528,6 +573,8 @@ def save_pause_from_result(conn: sqlite3.Connection, *, conversation_key: str, r
         node=result.paused_node,
         trace=result.trace,
         artifacts=result.artifacts,
+        turn_seq=turn_seq,
+        seq_in_turn=seq_in_turn,
     )
 
 
@@ -535,7 +582,8 @@ def load_pause(conn: sqlite3.Connection, *, conversation_key: str) -> Pause | No
     """``None`` when the conversation has no outstanding pause — the normal
     case every inbound message not resuming something checks first."""
     row = conn.execute(
-        "SELECT plugin, entry, node, trace_json, artifacts_json FROM plugin_pauses WHERE conversation_key = ?",
+        "SELECT plugin, entry, node, trace_json, artifacts_json, turn_seq, seq_in_turn "
+        "FROM plugin_pauses WHERE conversation_key = ?",
         (conversation_key,),
     ).fetchone()
     if row is None:
@@ -546,6 +594,8 @@ def load_pause(conn: sqlite3.Connection, *, conversation_key: str) -> Pause | No
         node=row["node"],
         trace=tuple(plugins.NodeTrace(**t) for t in json.loads(row["trace_json"])),
         artifacts=tuple(plugins.Artifact(**a) for a in json.loads(row["artifacts_json"])),
+        turn_seq=row["turn_seq"],
+        seq_in_turn=row["seq_in_turn"],
     )
 
 

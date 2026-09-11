@@ -1180,3 +1180,137 @@ def test_validate_refuses_a_non_boolean_secret(tmp_path: Path) -> None:
 def test_validate_rejects_every_shape_of_bad_setting_name(tmp_path: Path, bad: str) -> None:
     toml = _VALID_TOML + f'\n[[setting]]\nname = "{bad}"\npurpose = "k"\nsecret = true\n'
     assert validate(_write_plugin(tmp_path, toml=toml)) == InvalidSettingName(setting=bad)
+
+
+# ── run_graph(): the run's own output directory ──────────────────────────
+
+
+@pytest.mark.unit
+def test_a_call_body_two_steps_deep_can_write_into_the_runs_directory(tmp_path: Path) -> None:
+    """The riskiest assumption in this design, pinned: a `call` body runs
+    through `asyncio.to_thread`, and the directory reaches it through a
+    contextvar set on the event loop. If context ever stopped propagating
+    into that thread, this is what says so.
+
+    Also the depth requirement — the writing node is the second, which the
+    rejected `arguments`-based channel could not have reached."""
+    plugin_dir = _write_init_py(
+        tmp_path,
+        "from sadana import artifact_store\n"
+        "from sadana.plugins import Artifact\n\n"
+        "def build(value):\n"
+        "    return 'chart'\n\n"
+        "def render(value):\n"
+        "    path = artifact_store.output_dir() / (value + '.png')\n"
+        "    path.write_text('pretend png')\n"
+        "    return Artifact(kind='file', name=value + '.png', ref=str(path))\n",
+    )
+    out = tmp_path / "run-output"
+    manifest = _manifest(
+        Node(name="build", kind="compute", body="init:build", next="render"),
+        Node(name="render", kind="call", body="init:render"),
+    )
+
+    result = asyncio.run(
+        run_graph(plugin_dir, manifest, _entry("build"), {}, ask=_stub_ask_ok, approve=_stub_approve_ok, output_dir=out)
+    )
+
+    assert result.failed_node is None
+    assert (out / "chart.png").read_text() == "pretend png"
+    assert result.artifacts[0].name == "chart.png"
+
+
+@pytest.mark.unit
+def test_a_run_that_never_asks_leaves_no_directory_behind(tmp_path: Path) -> None:
+    """Created on the first ask and not before — an empty directory per run
+    is litter that accumulates."""
+    plugin_dir = _write_init_py(tmp_path, "def quiet(value):\n    return 'nothing made'\n")
+    out = tmp_path / "run-output"
+    manifest = _manifest(Node(name="quiet", kind="call", body="init:quiet"))
+
+    result = asyncio.run(
+        run_graph(plugin_dir, manifest, _entry("quiet"), {}, ask=_stub_ask_ok, approve=_stub_approve_ok, output_dir=out)
+    )
+
+    assert result.failed_node is None
+    assert not out.exists()
+
+
+@pytest.mark.unit
+def test_a_file_artifact_pointing_outside_the_directory_fails_its_node(tmp_path: Path) -> None:
+    """And nothing is moved or deleted on the strength of the claim — the
+    reason the runtime checks a returned `ref` rather than acting on it."""
+    victim = tmp_path / "precious.txt"
+    victim.write_text("do not touch")
+    plugin_dir = _write_init_py(
+        tmp_path,
+        "from sadana.plugins import Artifact\n\n"
+        f"def steal(value):\n"
+        f"    return Artifact(kind='file', name='stolen', ref={str(victim)!r})\n",
+    )
+    out = tmp_path / "run-output"
+    manifest = _manifest(Node(name="steal", kind="call", body="init:steal"))
+
+    result = asyncio.run(
+        run_graph(plugin_dir, manifest, _entry("steal"), {}, ask=_stub_ask_ok, approve=_stub_approve_ok, output_dir=out)
+    )
+
+    assert result.failed_node == "steal"
+    assert result.artifacts == ()
+    assert victim.read_text() == "do not touch"
+
+
+@pytest.mark.unit
+def test_a_file_artifact_is_refused_when_the_run_has_no_output_directory(tmp_path: Path) -> None:
+    """`output_dir=None` is every caller that predates this work item; a file
+    artifact has nothing to be contained by, so it cannot be honoured."""
+    plugin_dir = _write_init_py(
+        tmp_path,
+        "from sadana.plugins import Artifact\n\n"
+        "def make(value):\n"
+        "    return Artifact(kind='file', name='x', ref='/x')\n",
+    )
+    manifest = _manifest(Node(name="make", kind="call", body="init:make"))
+
+    result = asyncio.run(
+        run_graph(plugin_dir, manifest, _entry("make"), {}, ask=_stub_ask_ok, approve=_stub_approve_ok)
+    )
+
+    assert result.failed_node == "make"
+
+
+@pytest.mark.unit
+def test_a_link_artifact_is_untouched_by_the_containment_check(tmp_path: Path) -> None:
+    """A URL has no path to contain, and G2's behaviour for one must not
+    change just because file artifacts grew a rule."""
+    plugin_dir = _write_init_py(
+        tmp_path,
+        "from sadana.plugins import Artifact\n\n"
+        "def link(value):\n"
+        "    return Artifact(kind='link', name='report', ref='https://example.invalid/r')\n",
+    )
+    manifest = _manifest(Node(name="link", kind="call", body="init:link"))
+
+    result = asyncio.run(
+        run_graph(plugin_dir, manifest, _entry("link"), {}, ask=_stub_ask_ok, approve=_stub_approve_ok)
+    )
+
+    assert result.failed_node is None
+    assert result.artifacts[0].ref == "https://example.invalid/r"
+    assert result.text == "https://example.invalid/r"
+
+
+@pytest.mark.unit
+def test_output_dir_raises_into_the_node_when_the_run_was_given_none(tmp_path: Path) -> None:
+    plugin_dir = _write_init_py(
+        tmp_path,
+        "from sadana import artifact_store\n\ndef write(value):\n    return str(artifact_store.output_dir())\n",
+    )
+    manifest = _manifest(Node(name="write", kind="call", body="init:write"))
+
+    result = asyncio.run(
+        run_graph(plugin_dir, manifest, _entry("write"), {}, ask=_stub_ask_ok, approve=_stub_approve_ok)
+    )
+
+    assert result.failed_node == "write"
+    assert "NoOutputDirectory" in (result.trace[0].detail or "")

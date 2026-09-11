@@ -18,7 +18,7 @@ from types import ModuleType
 
 import jsonschema
 
-from sadana import plugins
+from sadana import artifact_store, plugins
 
 
 def load_skill(ref: plugins.SkillRef) -> str:
@@ -311,6 +311,43 @@ async def run_graph(
     ask: plugins.AskFn,
     approve: plugins.ApproveFn = _default_approve,
     resume: plugins.ResumeState | None = None,
+    output_dir: Path | None = None,
+) -> plugins.DagResult:
+    """``_run_graph``'s walk, wrapped in the one thing that must surround the
+    whole of it.
+
+    ``artifact_store.activate(output_dir)`` is the only channel by which a
+    node body learns where it may write. A body is never handed the path as an
+    argument — a run's directory is a function of the *run*, which nothing in
+    ``plugin.toml``, a body's signature or the threaded value names, so unlike
+    a plugin's settings it cannot be looked up from what the body already
+    knows (`docs/tasks/ARTIFACT-STORE-01-somewhere-to-put-what-a-plugin-makes
+    /spec.md` § Why a contextvar). ``asyncio.to_thread`` propagates context, so
+    a ``call`` body reaches it too.
+
+    Everything this function does beyond that activation is in
+    ``_run_graph``, whose docstring is the contract."""
+    with artifact_store.activate(output_dir):
+        return await _run_graph(
+            plugin_dir,
+            manifest,
+            entry,
+            arguments,
+            ask=ask,
+            approve=approve,
+            resume=resume,
+        )
+
+
+async def _run_graph(
+    plugin_dir: Path,
+    manifest: plugins.Manifest,
+    entry: plugins.Entry,
+    arguments: dict,
+    *,
+    ask: plugins.AskFn,
+    approve: plugins.ApproveFn,
+    resume: plugins.ResumeState | None,
 ) -> plugins.DagResult:
     """Walks ``manifest``'s declared steps from ``entry.start``, exactly as
     ``validate()`` already proved they connect and never loop back on
@@ -476,6 +513,14 @@ async def run_graph(
 
                 value = await asyncio.to_thread(run_body)
                 if isinstance(value, plugins.Artifact):
+                    # Checked on the value crossing back, not at write time: a
+                    # body is free to build a `ref` it never wrote to, so what
+                    # it *claims* is the thing worth checking — G2's own reason
+                    # for inspecting the returned value at all. Nothing is moved
+                    # or deleted on the strength of a `ref`, so a bad one costs
+                    # this node and nothing else.
+                    if value.kind == "file" and not artifact_store.contains_active(value.ref):
+                        return failed(node, "file artifact points outside the run's own output directory")
                     artifacts.append(value)
                     detail = f"emitted {value.kind} artifact {value.name!r}"
                     value = value.ref

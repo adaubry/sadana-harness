@@ -12,7 +12,15 @@ import pytest
 
 from conftest import open_conn
 from conftest import wait_then_summarize_installed as _wait_then_summarize_installed
-from sadana import context, conversation_store, model_access, plugin_dispatch, plugins
+from sadana import (
+    artifact_store,
+    context,
+    conversation_store,
+    model_access,
+    plugin_dispatch,
+    plugin_manifest,
+    plugins,
+)
 from sadana.conversation import (
     Conversation,
     ConversationTemplate,
@@ -655,3 +663,163 @@ def test_resume_paused_run_hitting_a_second_wait_node_overwrites_the_pause_row(
     pause = conversation_store.load_pause(conn, conversation_key="k1")
     assert pause is not None
     assert pause.node == "future2"
+
+
+# ── a dispatched run's output directory ──────────────────────────────────
+
+
+def _capture_output_dirs(monkeypatch: pytest.MonkeyPatch) -> list[Path | None]:
+    """Records the `output_dir` each `run_graph` call is given, and runs no
+    graph. Every test below cares only about which directory was chosen, not
+    what the walk then did with it."""
+    seen: list[Path | None] = []
+
+    async def fake_run_graph(*_args: object, **kwargs: object) -> plugins.DagResult:
+        seen.append(kwargs["output_dir"])  # type: ignore[arg-type]
+        return plugins.DagResult(plugin="p", entry="do_it", text="done")
+
+    monkeypatch.setattr(plugin_manifest, "run_graph", fake_run_graph)
+    return seen
+
+
+@pytest.mark.unit
+def test_a_dispatched_run_is_given_a_directory_named_from_its_own_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Named from the (conversation, turn, seq) key `record_plugin_run` is
+    already keyed by, so the files a run produced and the record of it
+    running can be lined up by reading either one. Nothing is created: the
+    directory appears only if a body actually asks."""
+    seen = _capture_output_dirs(monkeypatch)
+
+    monkeypatch.setenv("SADANA_STATE_DIR", str(tmp_path))
+    dispatch, _tracker = build_dispatch(
+        _conversation(), _one_ask_node_plugin_set(tmp_path), stable_prompt="", provider="p", model="m", now=0.0
+    )
+
+    asyncio.run(dispatch("do_it", {}))
+
+    assert len(seen) == 1
+    directory = seen[0]
+    assert directory is not None
+    # Named from all three parts of the run's own key, asserted against the
+    # real encoding rather than a shape: the conversation, the turn, and the
+    # sequence could each drop out of `for_run`'s path and a
+    # `tmp_path in parents` check would not notice.
+    assert directory == artifact_store.for_run("c1", 0, 0)
+    assert directory.parent.parent.name == artifact_store.run_dir_name("c1")
+    assert (directory.parent.name, directory.name) == ("0", "0")
+    assert not directory.exists()
+
+
+@pytest.mark.unit
+def test_two_runs_in_one_turn_get_different_directories(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """`seq_in_turn` is part of the name for exactly this reason — two runs
+    in one turn must not write into each other's space."""
+    seen = _capture_output_dirs(monkeypatch)
+
+    monkeypatch.setenv("SADANA_STATE_DIR", str(tmp_path))
+    dispatch, _tracker = build_dispatch(
+        _conversation(), _one_ask_node_plugin_set(tmp_path), stable_prompt="", provider="p", model="m", now=0.0
+    )
+
+    asyncio.run(dispatch("do_it", {}))
+    asyncio.run(dispatch("do_it", {}))
+
+    assert seen[0] != seen[1]
+
+
+@pytest.mark.unit
+def test_a_resumed_run_writes_into_the_directory_its_paused_half_used(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A resume is the same run continuing, so its files belong beside the
+    ones already there — which is the whole reason the pause row remembers
+    which turn and sequence it was."""
+    seen = _capture_output_dirs(monkeypatch)
+
+    _wait_then_summarize_installed(tmp_path)
+    monkeypatch.setattr(plugins, "_plugins_root", lambda: tmp_path)
+    monkeypatch.setenv("SADANA_STATE_DIR", str(tmp_path / "state"))
+    conn = open_conn()
+    conversation_store.save_pause(
+        conn,
+        conversation_key="k1",
+        plugin="p",
+        entry="do_it",
+        node="future",
+        trace=(),
+        artifacts=(),
+        turn_seq=7,
+        seq_in_turn=3,
+    )
+
+    asyncio.run(plugin_dispatch.resume_paused_run(conn, "k1", "the-answer"))
+
+    assert seen[0] == artifact_store.for_run("k1", 7, 3)
+
+
+@pytest.mark.unit
+def test_a_run_resumed_from_a_legacy_pause_row_gets_no_output_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A pause written before those columns existed has no idea which turn it
+    belonged to, so the resumed run behaves exactly as it did before this
+    work item — no directory, no error."""
+    seen = _capture_output_dirs(monkeypatch)
+
+    _wait_then_summarize_installed(tmp_path)
+    monkeypatch.setattr(plugins, "_plugins_root", lambda: tmp_path)
+    conn = open_conn()
+    conversation_store.save_pause(
+        conn, conversation_key="k1", plugin="p", entry="do_it", node="future", trace=(), artifacts=()
+    )
+
+    asyncio.run(plugin_dispatch.resume_paused_run(conn, "k1", "the-answer"))
+
+    assert seen == [None]
+
+
+@pytest.mark.unit
+def test_a_pause_records_the_same_sequence_number_its_directory_was_named_from(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The invariant behind "a resumed run writes where its paused half did",
+    and the riskiest line in this work item: `seq_in_turn += 1` sits *below*
+    the pause branch so both reads see the same number.
+
+    Move that increment back above the branch — where it was — and every
+    resumed run silently writes into the next run's directory. Nothing else
+    in the suite notices, because `resume_paused_run` is only ever tested
+    against a pause row handed to it directly.
+    """
+    seen: list[Path | None] = []
+    persisted: list[tuple[TurnKey, int]] = []
+
+    async def fake_run_graph(*_args: object, **kwargs: object) -> plugins.DagResult:
+        seen.append(kwargs["output_dir"])  # type: ignore[arg-type]
+        return plugins.DagResult(plugin="p", entry="do_it", text="waiting", paused_node="future")
+
+    async def capture(turn_key: TurnKey, seq_in_turn: int, _result: plugins.DagResult) -> None:
+        persisted.append((turn_key, seq_in_turn))
+
+    monkeypatch.setenv("SADANA_STATE_DIR", str(tmp_path))
+    monkeypatch.setattr(plugin_manifest, "run_graph", fake_run_graph)
+    dispatch, _tracker = build_dispatch(
+        _conversation(),
+        _one_ask_node_plugin_set(tmp_path),
+        stable_prompt="",
+        provider="p",
+        model="m",
+        now=0.0,
+        persist_pause=capture,
+    )
+
+    asyncio.run(dispatch("do_it", {}))
+    asyncio.run(dispatch("do_it", {}))
+
+    assert len(persisted) == 2
+    for directory, (turn_key, seq_in_turn) in zip(seen, persisted, strict=True):
+        assert directory == artifact_store.for_run("c1", turn_key.turn_seq, seq_in_turn)
+    # And the two runs really did differ, so the check above is not vacuous.
+    assert persisted[0][1] != persisted[1][1]
