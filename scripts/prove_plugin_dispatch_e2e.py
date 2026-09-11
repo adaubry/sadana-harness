@@ -133,7 +133,7 @@ async def main() -> None:
 
     print("\n=== turn 1: call plugin_c_entry via the real dispatch ===")
     dispatch, tracker = plugin_dispatch.build_dispatch(
-        conversation, plugin_set, stable_prompt=STABLE_PROMPT, provider=PROVIDER, model=MODEL, now=0.0
+        conversation, plugin_set, provider=PROVIDER, model=MODEL, now=0.0
     )
     capturing_dispatch_1, captured_1 = _make_capturing_dispatch(dispatch)
     result1, conversation = await plugin_dispatch.take_turn_and_reconcile(
@@ -158,7 +158,7 @@ async def main() -> None:
 
     print("\n=== turn 2: call plugin_c_entry again, proving the tracker's reconciliation contract ===")
     dispatch, tracker = plugin_dispatch.build_dispatch(
-        conversation, plugin_set, stable_prompt=STABLE_PROMPT, provider=PROVIDER, model=MODEL, now=0.0
+        conversation, plugin_set, provider=PROVIDER, model=MODEL, now=0.0
     )
     capturing_dispatch_2, captured_2 = _make_capturing_dispatch(dispatch)
     result2, conversation = await plugin_dispatch.take_turn_and_reconcile(

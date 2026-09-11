@@ -9,9 +9,18 @@ from pathlib import Path
 
 import pytest
 
-from conftest import make_runtime, never_send, open_conn, plain_response, tool_then_text
+from conftest import (
+    make_runtime,
+    never_send,
+    open_conn,
+    plain_response,
+    tool_call_response,
+    tool_then_text,
+    write_character,
+    write_skill,
+)
 from conftest import wait_then_summarize_installed as _wait_then_summarize_installed
-from sadana import client_surface, memory_store, model_access, plugin_dispatch, plugins
+from sadana import client_surface, memory_store, model_access, persona, persona_store, plugin_dispatch, plugins
 from sadana.client_surface import open_conversation, open_runtime, take_turn
 from sadana.conversation import (
     ConversationTemplate,
@@ -29,8 +38,9 @@ from sadana.conversation_store import ConversationAlreadyExists, ConversationNot
 def test_open_runtime_returns_a_runtime_a_turn_can_actually_run_on(monkeypatch: pytest.MonkeyPatch) -> None:
     """One assertion over the whole assembly: a turn on an `open_runtime()`
     result proves the store opened, the memory schema exists (creating a
-    conversation reads those tables), the persona seeded, and the plugin scan
-    survived an empty plugins directory."""
+    conversation reads those tables), the persona schema exists (creating one
+    resolves the account's character), and the plugin scan survived an empty
+    plugins directory."""
     monkeypatch.setattr(model_access, "send", lambda request: plain_response("reply"))
 
     runtime = open_runtime(provider="p", model="m")
@@ -337,3 +347,130 @@ def test_a_turn_holds_the_connection_lock_while_it_runs_and_releases_it_after(
 
     assert held == [True]
     assert client_surface.conn_lock.locked() is False
+
+
+# ── PERSONA-01: the voice belongs to the account, the conversation keeps it ──
+
+
+@pytest.mark.unit
+def test_a_conversation_is_created_in_the_voice_its_account_selected(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(model_access, "send", lambda request: plain_response("reply"))
+    write_character("working")
+    runtime = open_runtime(provider="p", model="m")
+    persona_store.set_selection(runtime.conn, "a1", "working", now=0.0)
+
+    asyncio.run(take_turn(runtime, account="a1", conversation="c1", text="hi", create_as="chat"))
+
+    convo = load(runtime.conn, "c1", now=0.0)
+    assert convo.stable_prompt == persona.render(
+        persona_store.load_character(persona_store.characters_dir_from_config(), "working")
+    )
+
+
+@pytest.mark.unit
+def test_two_accounts_on_one_runtime_get_their_own_voices(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The gateway opens one `Runtime` and answers everybody through it, which
+    is why the voice cannot live on the runtime."""
+    monkeypatch.setattr(model_access, "send", lambda request: plain_response("reply"))
+    write_character("working")
+    write_character("terse", body="You answer in one line.")
+    runtime = open_runtime(provider="p", model="m")
+    persona_store.set_selection(runtime.conn, "a1", "working", now=0.0)
+    persona_store.set_selection(runtime.conn, "a2", "terse", now=0.0)
+
+    asyncio.run(take_turn(runtime, account="a1", conversation="c1", text="hi", create_as="chat"))
+    asyncio.run(take_turn(runtime, account="a2", conversation="c2", text="hi", create_as="chat"))
+
+    assert "You read the code first." in load(runtime.conn, "c1", now=0.0).stable_prompt
+    assert "You answer in one line." in load(runtime.conn, "c2", now=0.0).stable_prompt
+
+
+@pytest.mark.unit
+def test_a_child_turn_speaks_the_conversations_voice_not_the_current_selection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Requirement 9. The selection changes underneath a live conversation;
+    the `ask` node's child must still be built from the voice that
+    conversation was created with."""
+    plugins_root = write_skill(tmp_path, plugin="p", skill="s1", body="Do the thing, then stop.")
+    monkeypatch.setenv("SADANA_PLUGINS_DIR", str(plugins_root))
+    (plugins_root / "p" / "s.json").write_text('{"type": "object"}', encoding="utf-8")
+    # A `compute` step ahead of the `ask`, because an `ask` reached with the
+    # raw tool-call arguments cannot run at all through this door today —
+    # `build_dispatch` injects a live `DispatchContext` under
+    # `_sadana_memory_ctx` and `_coerce_text` JSON-dumps it. Reported as its
+    # own finding; not this work item's to fix.
+    (plugins_root / "p" / "init.py").write_text("def prepare(value):\n    return 'summarize this'\n", encoding="utf-8")
+    write_character("working")
+    write_character("pirate", body="You are now a pirate.")
+
+    seen: list[str] = []
+
+    def _system_text(request: object) -> str:
+        """The system message as the provider receives it — one or more text
+        blocks, since `context.before_send` marks the stable prefix."""
+        first = request.messages[0]  # type: ignore[attr-defined]
+        if first.get("role") != "system":
+            return ""
+        content = first["content"]
+        if isinstance(content, str):
+            return content
+        return "".join(str(block.get("text", "")) for block in content)
+
+    def _send(request: object) -> model_access.Response:
+        system = _system_text(request)
+        seen.append(system)
+        if "Do the thing, then stop." in system:
+            return plain_response("child done")
+        if any(m.get("role") == "tool" for m in request.messages):  # type: ignore[attr-defined]
+            return plain_response("parent done")
+        return tool_call_response("do_it")
+
+    monkeypatch.setattr(model_access, "send", _send)
+
+    installed = plugins.InstalledPlugin(
+        name="p",
+        directory=plugins_root / "p",
+        manifest=plugins.Manifest(
+            name="p",
+            version="0.1.0",
+            description="d",
+            entries=(plugins.Entry(tool="do_it", purpose="p", parameters="s.json", start="prepare"),),
+            nodes=(
+                plugins.Node(name="prepare", kind="compute", body="init:prepare", next="ask_step"),
+                plugins.Node(name="ask_step", kind="ask", skill="s1"),
+            ),
+        ),
+    )
+    conn = open_conn()
+    runtime = make_runtime(conn, plugin_set=plugin_dispatch.build_plugin_set((installed,)))
+    persona_store.set_selection(conn, "a1", "working", now=0.0)
+
+    asyncio.run(take_turn(runtime, account="a1", conversation="c1", text="hi", create_as="chat"))
+    persona_store.set_selection(conn, "a1", "pirate", now=1.0)
+    asyncio.run(take_turn(runtime, account="a1", conversation="c1", text="again", create_as=None))
+
+    child_prompts = [system for system in seen if "Do the thing, then stop." in system]
+    assert child_prompts, "the ask node never spawned a child"
+    for prompt in child_prompts:
+        assert prompt.startswith("You read the code first.")
+        assert "You are now a pirate." not in prompt
+
+
+@pytest.mark.unit
+def test_a_conversation_row_written_before_stable_prompt_len_still_answers(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Acceptance criterion 10. A row from before C12 added the column loads
+    with `stable_prompt_len` defaulted to the whole prompt's length
+    (`conversation_store.py:335`), which makes `stable_prompt` wider than the
+    voice — documented in plan.md § Risks. What must not happen is that such
+    a conversation stops answering."""
+    monkeypatch.setattr(model_access, "send", lambda request: plain_response("reply"))
+    runtime = open_runtime(provider="p", model="m")
+    asyncio.run(take_turn(runtime, account="a1", conversation="legacy", text="hi", create_as="chat"))
+    runtime.conn.execute("UPDATE conversations SET stable_prompt_len = NULL WHERE key = 'legacy'")
+    runtime.conn.commit()
+
+    outcome = asyncio.run(take_turn(runtime, account="a1", conversation="legacy", text="still there?", create_as=None))
+
+    assert outcome.ok is True
+    assert outcome.answer == "reply"

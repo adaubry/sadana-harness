@@ -132,7 +132,6 @@ def build_dispatch(
     conversation: Conversation,
     plugin_set: PluginSet,
     *,
-    stable_prompt: str,
     provider: str,
     model: str,
     now: float,
@@ -215,7 +214,11 @@ def build_dispatch(
             run_child(
                 parent,
                 spec,
-                stable_prompt=stable_prompt,
+                # The conversation's own voice, not the process's: read here,
+                # at the one place a child is built, so no caller can hand
+                # this a prompt belonging to some other conversation
+                # (CLAUDE.md, PERSONA-01's own rule).
+                stable_prompt=parent.stable_prompt,
                 provider=provider,
                 model=model,
                 dispatch=dispatch,

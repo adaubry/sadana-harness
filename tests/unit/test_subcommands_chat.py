@@ -9,12 +9,11 @@ from pathlib import Path
 import pytest
 
 from conftest import conversation as _build_conversation
-from conftest import plain_response, tool_call_response, tool_then_text
+from conftest import plain_response, tool_call_response, tool_then_text, write_character
 from conftest import wait_then_summarize_installed as _wait_then_summarize_installed
-from sadana import memory_store, model_access
+from sadana import memory_store, model_access, persona_store
 from sadana.conversation import Conversation, IterationBudget
 from sadana.conversation_store import ConversationNotFound, create, load, open_store, store_path_from_config
-from sadana.persona import persona_path_from_config
 from sadana.subcommands.chat import build_chat_parser, cmd_chat
 
 
@@ -160,13 +159,22 @@ def test_cmd_chat_resume_unknown_key_raises_conversation_not_found() -> None:
 
 @pytest.mark.unit
 def test_cmd_chat_resume_keeps_original_persona_after_a_later_edit(monkeypatch: pytest.MonkeyPatch) -> None:
+    character = write_character("working")
+    conn = open_store(store_path_from_config())
+    try:
+        persona_store.ensure_schema(conn)
+        persona_store.set_selection(conn, "local", "working", now=0.0)
+    finally:
+        conn.close()
+
     responses = iter([plain_response("first reply")])
     monkeypatch.setattr(model_access, "send", lambda request: next(responses))
     _feed(monkeypatch, "hello")
     assert cmd_chat(_args(key="persona-test")) == 0
     original_prompt = _load("persona-test").system_prompt
+    assert "You read the code first." in original_prompt
 
-    persona_path_from_config().write_text("You are now a pirate.\n", encoding="utf-8")
+    character.write_text("---\ndescription: a voice\n---\nYou are now a pirate.\n", encoding="utf-8")
 
     responses = iter([plain_response("second reply")])
     monkeypatch.setattr(model_access, "send", lambda request: next(responses))

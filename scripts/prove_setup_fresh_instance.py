@@ -227,8 +227,6 @@ def scenario_before_setup_send_needs_credential_and_after_setup_chat_completes(s
 
     print("\n=== 5b. after setup: a real `sadana chat` turn completes with the stored key ===")
     os.environ["SADANA_STATE_DIR"] = str(state)
-    saved_chat_persona = os.environ.get("SADANA_CHAT_PERSONA_PATH")
-    os.environ["SADANA_CHAT_PERSONA_PATH"] = str(state / "persona.md")
     try:
         config.load_dotenv()
         assert os.environ.get("OPENROUTER_API_KEY") == OPENROUTER_KEY, "stored key not in env"
@@ -252,10 +250,6 @@ def scenario_before_setup_send_needs_credential_and_after_setup_chat_completes(s
         assert "echo: ping" in output, f"expected the turn's reply in the chat output, got {output!r}"
         print("[ok] `sadana chat` completed a real turn with the stored key in the environment")
     finally:
-        if saved_chat_persona is None:
-            os.environ.pop("SADANA_CHAT_PERSONA_PATH", None)
-        else:
-            os.environ["SADANA_CHAT_PERSONA_PATH"] = saved_chat_persona
         os.environ.pop("OPENROUTER_API_KEY", None)
         os.environ.pop("SADANA_GATEWAY_WEBHOOK_SECRET", None)
         if saved_state is None:
@@ -278,8 +272,6 @@ def scenario_gateway_guard(state: Path, tmp: Path) -> None:
 def scenario_gateway_with_stored_secret(state: Path) -> None:
     print("\n=== 6b. gateway_daemon.run() starts with the stored secret ===")
     os.environ["SADANA_STATE_DIR"] = str(state)
-    saved_chat_persona = os.environ.get("SADANA_CHAT_PERSONA_PATH")
-    os.environ["SADANA_CHAT_PERSONA_PATH"] = str(state / "persona.md")
     try:
         config.load_dotenv()
         saved_host = os.environ.get("SADANA_GATEWAY_HOST")
@@ -337,10 +329,6 @@ def scenario_gateway_with_stored_secret(state: Path) -> None:
             if saved_port is not None:
                 os.environ["SADANA_GATEWAY_PORT"] = saved_port
     finally:
-        if saved_chat_persona is None:
-            os.environ.pop("SADANA_CHAT_PERSONA_PATH", None)
-        else:
-            os.environ["SADANA_CHAT_PERSONA_PATH"] = saved_chat_persona
         os.environ.pop("OPENROUTER_API_KEY", None)
         os.environ.pop("SADANA_GATEWAY_WEBHOOK_SECRET", None)
 
@@ -367,7 +355,6 @@ def main() -> None:
             "SADANA_STATE_DIR",
             "SADANA_GATEWAY_HOST",
             "SADANA_GATEWAY_PORT",
-            "SADANA_CHAT_PERSONA_PATH",
         )
         for key in env_keys:
             os.environ.pop(key, None)

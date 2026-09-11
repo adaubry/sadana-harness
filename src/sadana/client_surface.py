@@ -1,9 +1,9 @@
 """One door in: every client takes a turn through here.
 
 `docs/tasks/CLIENT-SURFACE-01-one-door-in/spec.md`. I/O: opens the SQLite
-store, reads the persona file, scans the plugins directory — its own file per
-CLAUDE.md's rule that a module touching real I/O is separate from a block's
-pure ones.
+store, reads the selected character's file, scans the plugins directory — its
+own file per CLAUDE.md's rule that a module touching real I/O is separate from
+a block's pure ones.
 
 Three calls. `open_runtime()` once per process, assembling everything a
 turn needs that does not differ turn to turn. `open_conversation()` for a
@@ -47,6 +47,7 @@ from sadana import (
     memory_store,
     model_access,
     observability,
+    persona_store,
     plugin_dispatch,
     plugin_manifest,
     plugins,
@@ -63,7 +64,6 @@ from sadana.conversation import (
     iteration_budget_from_config,
     wall_clock_budget_from_config,
 )
-from sadana.persona import load_or_seed_persona, persona_path_from_config
 
 # Serializes every `take_turn` call against every other, and against a
 # caller's own direct `conn` touches (`scheduling.tick`).
@@ -108,8 +108,15 @@ conn_lock = threading.Lock()
 @dataclass(frozen=True)
 class Runtime:
     """What a client holds for the life of its process: the open store, the
-    scan of installed plugins, the persona, the provider and model names, and
-    the observability recorder bound to that same connection.
+    scan of installed plugins, the provider and model names, and the
+    observability recorder bound to that same connection.
+
+    No persona. A character belongs to an account
+    (`docs/tasks/PERSONA-01-characters-you-write/spec.md`), and one process
+    serves whichever accounts arrive — `cmd_gateway_run` opens exactly one
+    `Runtime` and answers everybody through it — so a process-lifetime voice
+    was a per-account value held for the wrong lifetime. It is resolved in
+    `_create()`, from the account, at the only moment it can still matter.
 
     Everything here is what `cmd_chat` and `cmd_gateway_run` each already
     built once per process, in their own copy of the same eight lines. What a
@@ -127,7 +134,6 @@ class Runtime:
 
     conn: sqlite3.Connection
     plugin_set: plugin_dispatch.PluginSet
-    persona: str
     provider: str
     model: str
     recorder: observability.Recorder
@@ -151,15 +157,14 @@ def open_runtime(*, provider: str | None = None, model: str | None = None) -> Ru
     (`cmd_gateway_run`) does not, exactly as before this module existed.
     """
     config.load_dotenv()
-    persona = load_or_seed_persona(persona_path_from_config())
     memory_store.ensure_plugin_seeded(plugins._plugins_root())
     plugin_set = plugin_dispatch.build_plugin_set(plugin_manifest.discover_plugins())
     conn = conversation_store.open_store(conversation_store.store_path_from_config())
     memory_store.ensure_schema(conn)
+    persona_store.ensure_schema(conn)
     return Runtime(
         conn=conn,
         plugin_set=plugin_set,
-        persona=persona,
         provider=provider or config.env("SADANA_MODEL_ACCESS_PROVIDER", model_access.DEFAULT_PROVIDER),
         model=model or config.env("SADANA_MODEL_ACCESS_MODEL", model_access.DEFAULT_MODEL),
         recorder=observability.make_recorder(conn),
@@ -211,9 +216,15 @@ def _create(
     hold `conn_lock`, which is non-reentrant.
 
     The system message is composed from what is remembered about `account`
-    right now (MEMORY-01), and the recipe from the runtime's own persona and
-    plugin scan — which is the assembly `cmd_chat` and `handle_inbound` each
-    used to own a copy of.
+    right now (MEMORY-01), the recipe's voice from the character that same
+    account has selected (PERSONA-01), and the rest of the recipe from the
+    runtime's plugin scan — which is the assembly `cmd_chat` and
+    `handle_inbound` each used to own a copy of.
+
+    This is the only place a persona is resolved, which is what makes the
+    intent's constraint structural rather than maintained: a conversation
+    takes its voice once, at birth, and every later turn reads that voice off
+    the conversation itself.
 
     Raises `conversation_store.ConversationAlreadyExists` if the name is
     taken; callers that mean get-or-create reach here only after a failed
@@ -224,7 +235,9 @@ def _create(
         ConversationTemplate(
             name=template_name,
             recipe=TemplateRecipe(
-                stable_prompt=runtime.persona,
+                stable_prompt=persona_store.resolve_voice(
+                    runtime.conn, account, persona_store.characters_dir_from_config()
+                ),
                 catalog=runtime.plugin_set.catalog,
                 tool_specs=runtime.plugin_set.tool_specs,
             ),
@@ -355,7 +368,6 @@ async def take_turn(
         dispatch, tracker = plugin_dispatch.build_dispatch(
             convo,
             runtime.plugin_set,
-            stable_prompt=runtime.persona,
             provider=runtime.provider,
             model=runtime.model,
             now=now,

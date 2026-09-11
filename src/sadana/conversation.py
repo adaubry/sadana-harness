@@ -110,7 +110,7 @@ def append(
             )
     elif message.role == "tool":
         raise TranscriptInvariantError(
-            f"no tool_call is pending; nothing to pair " f"tool_call_id={message.tool_call_id!r} against"
+            f"no tool_call is pending; nothing to pair tool_call_id={message.tool_call_id!r} against"
         )
 
     new_messages = messages + (message,)
@@ -1037,6 +1037,22 @@ class Conversation:
     next_child_seq: int = 0  # CONV-07's own counter; see run_child below.
 
     @property
+    def stable_prompt(self) -> str:
+        """The voice this conversation was created with, byte-exact — the
+        recipe's ``stable_prompt``, which ``create_conversation`` composed
+        into ``system_prompt`` ahead of the context tier and whose length it
+        recorded as ``stable_prompt_len``.
+
+        The one place that formula is written, so a caller needing a
+        conversation's own stable prefix (``client_surface.take_turn``, for
+        the ``stable_prompt`` a child turn is built from) reads it here
+        rather than re-deriving it — CLAUDE.md: a turn's or child turn's
+        stable prompt is read from the conversation itself, never from
+        process-wide state. ``rotate_prompt`` is what keeps this honest
+        across a rewrite of ``system_prompt``."""
+        return self.system_prompt[: self.stable_prompt_len]
+
+    @property
     def pending_turn_key(self) -> TurnKey:
         """The `TurnKey` a `take_turn()` call made with this `Conversation`
         is about to mint (`run_turn`'s own `turn_seq=conversation.next_turn_seq`
@@ -1101,11 +1117,23 @@ def rotate_prompt(conversation: Conversation, *, reason: PromptRotationReason, n
     """The only function in this module that increments ``prompt_epoch``.
     Recomputes ``prompt_sha256`` against ``new_prompt`` and the
     conversation's existing ``tool_surface`` so the result is
-    self-consistent for the very next turn's own PROLOGUE check. ``reason``
+    self-consistent for the very next turn's own PROLOGUE check. Raises
+    ``PromptDriftError`` if ``new_prompt`` does not still begin with
+    ``conversation.stable_prompt``: this is the only writer of
+    ``system_prompt`` after creation, so it is the one place CLAUDE.md's
+    "any writer must preserve ``system_prompt[:stable_prompt_len]``" is
+    checkable
+    rather than merely stated. Compression, its only caller, rewrites the
+    tier *after* the stable prefix, so this never fires for it. ``reason``
     selects behavior at the call site (there being only one member today)
     and is not stored — no reader exists yet (spec.md's Rejected
     alternatives)."""
     del reason  # accepted for call-site clarity only; see docstring.
+    if not new_prompt.startswith(conversation.stable_prompt):
+        raise PromptDriftError(
+            "a rotated system prompt must preserve the conversation's stable prefix "
+            f"(the first {conversation.stable_prompt_len} characters)"
+        )
     return replace(
         conversation,
         system_prompt=new_prompt,

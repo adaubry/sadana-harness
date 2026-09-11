@@ -15,7 +15,7 @@ from pathlib import Path
 
 import pytest
 
-from sadana import client_surface, memory_store, model_access, observability, plugin_dispatch, plugins
+from sadana import client_surface, memory_store, model_access, observability, persona_store, plugin_dispatch, plugins
 from sadana.context import ContextState
 from sadana.conversation import (
     Conversation,
@@ -195,6 +195,30 @@ def write_skill(
     return tmp_path / "plugins"
 
 
+def write_character(
+    name: str,
+    *,
+    body: str = "You read the code first.",
+    description: str = "a voice",
+    tone: str = "",
+    characters_dir: Path | None = None,
+) -> Path:
+    """One character file, written the way a person writes one — shared by
+    ``test_persona_store.py``, ``test_subcommands_persona.py``,
+    ``test_client_surface.py`` and ``test_subcommands_chat.py``, which each
+    need the same on-disk shape ``persona_store.load_character`` reads.
+    Defaults to the configured characters directory, which the isolated-state
+    fixture already points at this test's own tmp home. A test that wants a
+    *malformed* character writes over the returned path itself; this helper
+    only produces valid ones."""
+    root = persona_store.characters_dir_from_config() if characters_dir is None else characters_dir
+    root.mkdir(parents=True, exist_ok=True)
+    header = f"description: {description}" + (f"\ntone: {tone}" if tone else "")
+    path = root / f"{name}.md"
+    path.write_text(f"---\n{header}\n---\n{body}\n", encoding="utf-8")
+    return path
+
+
 def run_git(args: list[str], *, cwd: Path) -> None:
     """A real ``git`` subprocess call — shared by ``test_plugin_install.py``
     and ``test_subcommands_plugin.py``, both of which exercise
@@ -233,20 +257,21 @@ def make_runtime(
     ``test_scheduling.py``, all of which drive a turn without going through
     ``open_runtime()``'s own disk assembly.
 
-    No ``persona`` parameter: no test asserts anything about
-    ``Runtime.persona``, so a keyword for it would read as significant at
-    every call site while changing nothing. A test that ever does care can
-    build the frozen ``Runtime`` itself, or use ``dataclasses.replace``.
+    No ``persona`` parameter, and no ``Runtime.persona`` to pass one to:
+    PERSONA-01 moved the voice onto the account, resolved inside
+    ``_create()``. A test that wants a conversation created under a specific
+    character writes that character's file and selects it for the account,
+    the same way a person does.
 
-    Ensures the ``memory_store`` schema itself: ``take_turn``'s docstring names
+    Ensures the ``memory_store`` and ``persona_store`` schemas itself: ``take_turn``'s docstring names
     that as the obligation of whoever builds a ``Runtime`` by hand, the same
     way ``test_gateway_dispatch.py`` already called ``ensure_schema`` for a
     direct bridge call."""
     memory_store.ensure_schema(conn)
+    persona_store.ensure_schema(conn)
     return client_surface.Runtime(
         conn=conn,
         plugin_set=plugin_set,
-        persona="You are a test persona.\n",
         provider="p",
         model="m",
         recorder=observability.make_recorder(conn),

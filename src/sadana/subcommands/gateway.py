@@ -65,8 +65,8 @@ def cmd_gateway_run(args: argparse.Namespace) -> int:
         print("SADANA_GATEWAY_WEBHOOK_SECRET is not set; refusing to start", file=sys.stderr)
         return 1
 
-    # One door, opened once: the provider, the model, the persona, the plugin
-    # scan, the store, the memory schema and the recorder — the eight lines
+    # One door, opened once: the provider, the model, the plugin scan, the
+    # store, the memory and persona schemas and the recorder — the eight lines
     # this function used to own a copy of, and `cmd_chat` the other
     # (CLIENT-SURFACE-01). The daemon runs until killed, so the connection is
     # deliberately not closed here, exactly as before.

@@ -148,7 +148,7 @@ def test_build_plugin_set_does_not_check_for_a_duplicate_tool_name(tmp_path: Pat
 @pytest.mark.unit
 def test_build_dispatch_unknown_tool_returns_a_dag_result_not_an_exception() -> None:
     plugin_set = PluginSet(catalog=(), tool_specs=(), by_tool={})
-    dispatch, _tracker = build_dispatch(_conversation(), plugin_set, stable_prompt="", provider="p", model="m", now=0.0)
+    dispatch, _tracker = build_dispatch(_conversation(), plugin_set, provider="p", model="m", now=0.0)
     result = asyncio.run(dispatch("nonexistent_tool", {}))
     assert result.failed_node == "entry"
     assert "nonexistent_tool" in result.text
@@ -236,7 +236,7 @@ def test_build_dispatch_ask_updates_the_tracker_from_run_childs_updated_parent(
 
     plugin_set = _one_ask_node_plugin_set(tmp_path)
     conversation = _conversation()
-    dispatch, tracker = build_dispatch(conversation, plugin_set, stable_prompt="", provider="p", model="m", now=0.0)
+    dispatch, tracker = build_dispatch(conversation, plugin_set, provider="p", model="m", now=0.0)
 
     result = asyncio.run(dispatch("do_it", {}))
 
@@ -254,7 +254,7 @@ def test_build_dispatch_ask_reports_failure_when_the_child_did_not_complete(
     monkeypatch.setattr(plugin_dispatch, "run_child", fake_run_child)
 
     plugin_set = _one_ask_node_plugin_set(tmp_path)
-    dispatch, _tracker = build_dispatch(_conversation(), plugin_set, stable_prompt="", provider="p", model="m", now=0.0)
+    dispatch, _tracker = build_dispatch(_conversation(), plugin_set, provider="p", model="m", now=0.0)
 
     result = asyncio.run(dispatch("do_it", {}))
 
@@ -343,7 +343,6 @@ def test_build_dispatch_calls_record_plugin_run_once_per_dispatch_call(tmp_path:
     dispatch, _tracker = build_dispatch(
         conversation,
         plugin_set,
-        stable_prompt="",
         provider="p",
         model="m",
         now=0.0,
@@ -369,7 +368,6 @@ def test_build_dispatch_does_not_call_record_plugin_run_for_an_unknown_tool() ->
     dispatch, _tracker = build_dispatch(
         _conversation(),
         plugin_set,
-        stable_prompt="",
         provider="p",
         model="m",
         now=0.0,
@@ -390,7 +388,7 @@ def test_build_dispatch_ask_calls_record_turn_with_the_childs_own_turn_result(
     record_turn, _record_plugin_run, calls = _fake_recorder()
 
     dispatch, _tracker = build_dispatch(
-        _conversation(), plugin_set, stable_prompt="", provider="p", model="m", now=0.0, record_turn=record_turn
+        _conversation(), plugin_set, provider="p", model="m", now=0.0, record_turn=record_turn
     )
     asyncio.run(dispatch("do_it", {}))
 
@@ -418,7 +416,6 @@ def test_build_dispatch_does_not_add_its_own_guard_around_the_given_recorder(tmp
     dispatch, _tracker = build_dispatch(
         _conversation(),
         plugin_set,
-        stable_prompt="",
         provider="p",
         model="m",
         now=0.0,
@@ -443,7 +440,7 @@ def test_build_dispatch_threads_a_given_approve_to_run_graph(tmp_path: Path) -> 
         return True
 
     dispatch, _tracker = build_dispatch(
-        _conversation(), plugin_set, stable_prompt="", provider="p", model="m", now=0.0, approve=fake_approve
+        _conversation(), plugin_set, provider="p", model="m", now=0.0, approve=fake_approve
     )
 
     result = asyncio.run(dispatch("do_it", {"a": 1}))
@@ -491,7 +488,6 @@ def test_build_dispatch_memory_context_wins_over_a_model_supplied_value(tmp_path
     dispatch, _tracker = build_dispatch(
         _conversation(),
         plugin_set,
-        stable_prompt="",
         provider="p",
         model="m",
         now=0.0,
@@ -519,7 +515,7 @@ def test_build_dispatch_memory_context_none_omits_the_memory_key_but_keeps_the_s
         return True
 
     dispatch, _tracker = build_dispatch(
-        _conversation(), plugin_set, stable_prompt="", provider="p", model="m", now=0.0, approve=approve_ok
+        _conversation(), plugin_set, provider="p", model="m", now=0.0, approve=approve_ok
     )
     result = asyncio.run(dispatch("do_it", {"a": 1}))
 
@@ -542,7 +538,7 @@ def test_build_dispatch_session_key_wins_over_a_model_supplied_value(tmp_path: P
         return True
 
     dispatch, _tracker = build_dispatch(
-        _conversation(), plugin_set, stable_prompt="", provider="p", model="m", now=0.0, approve=approve_ok
+        _conversation(), plugin_set, provider="p", model="m", now=0.0, approve=approve_ok
     )
     result = asyncio.run(dispatch("do_it", {"_sadana_session_key": "attacker-supplied"}))
 

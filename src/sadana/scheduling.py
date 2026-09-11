@@ -96,8 +96,8 @@ def run_tick_loop(runtime: client_surface.Runtime, *, interval_seconds: float) -
 
     Takes the `Runtime` rather than mirroring `tick()`'s parameters:
     CLIENT-SURFACE-01 moved the seven values this used to forward — the
-    connection, the plugin set, the persona, the provider, the model and the
-    two recording callables — into one value assembled once by
+    connection, the plugin set, the provider, the model and the two
+    recording callables — into one value assembled once by
     `client_surface.open_runtime()`. The earlier note here, about why the
     five duplicated keyword names beat a `**kwargs` shrink, is obsolete along
     with the names themselves."""

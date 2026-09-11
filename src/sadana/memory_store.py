@@ -131,9 +131,8 @@ def set_rubric_override(conn: sqlite3.Connection, account_key: memory.AccountKey
 
 def ensure_plugin_seeded(plugins_root: Path) -> None:
     """If `plugins_root / "memory"` doesn't exist yet, copies the shipped
-    plugin source there — the same "if missing, write the default" idiom
-    `persona.py:load_or_seed_persona` already uses for one file, extended
-    to a directory tree. A no-op on every call after the first.
+    plugin source there — the "if missing, write the default" idiom, for a
+    directory tree rather than one file. A no-op on every call after the first.
 
     Copies into a sibling temp directory first and renames it into place,
     so a process killed mid-copy never leaves a half-written `memory/`

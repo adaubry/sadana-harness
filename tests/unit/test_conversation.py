@@ -25,6 +25,7 @@ from sadana.conversation import (
     MessageKey,
     PluginCatalogEntry,
     PromptDriftError,
+    PromptRotationReason,
     ProviderFailure,
     TemplateRecipe,
     ToolSpec,
@@ -52,6 +53,7 @@ from sadana.conversation import (
     pending_tool_call_ids,
     repair,
     repair_tool_call_arguments,
+    rotate_prompt,
     run_child,
     run_turn,
     surface_hash,
@@ -1408,6 +1410,34 @@ def test_take_turn_twice_accumulates_one_shared_history(monkeypatch: pytest.Monk
     assert "second" in contents
     assert len(after_second.messages) == 4
     assert after_second.next_turn_seq == 2
+
+
+@pytest.mark.unit
+def test_stable_prompt_is_the_voice_the_conversation_was_created_with() -> None:
+    conversation, _t = create_conversation(_template(), "c1", "remembered thing", iteration_budget=_budget())
+    assert conversation.stable_prompt == "You are helpful."
+    assert conversation.system_prompt.startswith(conversation.stable_prompt)
+
+
+@pytest.mark.unit
+def test_rotate_prompt_keeps_a_prompt_that_preserves_the_stable_prefix() -> None:
+    conversation, _t = create_conversation(_template(), "c1", "hi", iteration_budget=_budget())
+    rotated = rotate_prompt(
+        conversation,
+        reason=PromptRotationReason.COMPRESSION,
+        new_prompt=conversation.stable_prompt + "\n\na rewritten tier",
+    )
+    assert rotated.stable_prompt == conversation.stable_prompt
+    assert rotated.prompt_epoch == conversation.prompt_epoch + 1
+
+
+@pytest.mark.unit
+def test_rotate_prompt_refuses_to_rewrite_the_stable_prefix() -> None:
+    """CLAUDE.md: any writer of `system_prompt` must preserve bytes
+    `[0:stable_prompt_len]`. `rotate_prompt` is the only one there is."""
+    conversation, _t = create_conversation(_template(), "c1", "hi", iteration_budget=_budget())
+    with pytest.raises(PromptDriftError):
+        rotate_prompt(conversation, reason=PromptRotationReason.COMPRESSION, new_prompt="a different voice entirely")
 
 
 @pytest.mark.unit

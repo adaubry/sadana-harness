@@ -108,7 +108,6 @@ async def main() -> None:
         return plugin_dispatch.build_dispatch(
             conversation,
             plugin_set,
-            stable_prompt=STABLE_PROMPT,
             provider=PROVIDER,
             model=MODEL,
             now=0.0,
