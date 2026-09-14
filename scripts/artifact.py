@@ -8,6 +8,7 @@ and carries the trace its methodology is supposed to leave behind.
     scripts/artifact.py new A1 config-contract   start a work item
     scripts/artifact.py status                   where am I, what is missing
     scripts/artifact.py check                    validate — exits non-zero
+    scripts/artifact.py approve                  write 'approved' — run this yourself, never an agent
     scripts/artifact.py gate <write|edit|commit> <path>   used by the hook
 
 The design decision worth understanding:
@@ -371,6 +372,51 @@ def cmd_check(tid: str | None) -> int:
     return 0
 
 
+def cmd_approve(tid: str | None) -> int:
+    """Write 'approved' on the one valid artifact still waiting for it.
+
+    This is the user's own act, not an agent's — CLAUDE.md forbids an agent
+    from writing the word, so this command exists to be typed by a person,
+    with a `!`-prefix in Claude Code or directly in a shell, never run on the
+    user's behalf. It edits only the captured status word inside the
+    `Author: ... Status: ...` line, so — unlike a blanket sed — it cannot
+    touch prose elsewhere in the file that happens to contain the same text.
+    """
+    d = task_dir(tid)
+    if not d:
+        print("no active task.", file=sys.stderr)
+        return 1
+    waiting = []
+    for s, probs in stage_state(d):
+        path = d / s.artifact
+        if not path.exists():
+            continue
+        if probs:
+            print(f"Cannot approve {path}: {len(probs)} problem(s) remain. Fix those first.", file=sys.stderr)
+            return 1
+        if s.needs_approval and status_of(path) != "approved":
+            waiting.append(path)
+    if not waiting:
+        print("nothing is awaiting approval.")
+        return 0
+    if len(waiting) > 1:
+        print("more than one artifact is awaiting approval:", file=sys.stderr)
+        for p in waiting:
+            print(f"  - {p}", file=sys.stderr)
+        print("approve the earlier one first, or edit its Status line by hand.", file=sys.stderr)
+        return 1
+    path = waiting[0]
+    text = path.read_text(encoding="utf-8")
+    m = STATUS_RE.search(text)
+    if not m:
+        print(f"{path}: no Author/Status line found.", file=sys.stderr)
+        return 1
+    start, end = m.span(1)
+    path.write_text(text[:start] + "approved" + text[end:], encoding="utf-8")
+    print(f"{path}: Status → approved.")
+    return 0
+
+
 def _refuse_unapproved(path: Path, prefix: str = "") -> int:
     """Said identically by all three branches, because it is one rule."""
     st = status_of(path) or "missing"
@@ -472,6 +518,8 @@ def main(argv: list[str]) -> int:
         return cmd_status(argv[2] if len(argv) > 2 else None)
     if c == "check":
         return cmd_check(argv[2] if len(argv) > 2 else None)
+    if c == "approve":
+        return cmd_approve(argv[2] if len(argv) > 2 else None)
     if c == "gate" and len(argv) == 4:
         return cmd_gate(argv[2], argv[3])
     print(__doc__)
