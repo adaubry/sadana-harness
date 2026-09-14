@@ -264,3 +264,12 @@ mapping onto the console's five is written once, in H20, on the box side — the
 box translates before it answers, so the console never learns eight names and
 the harness never loses the distinction between running out of turns and
 running out of clock.
+
+**A promoted `messages.create` operation carries `resource: null`.** Found
+during H20, not anticipated by any prompt: the door's own `run_bounded`
+computes a create's `resource` once, from the URL's own id segment, before
+the slow call ever runs — and a create path carries no id segment to compute
+one from. Read the assistant's reply from the conversation's own messages
+once the operation settles (`succeeded` or `failed`), the same call the
+message list already serves. H30, which reopens the door's framework, is
+where a create-time resource hint gets added and this note retires.

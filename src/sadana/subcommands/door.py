@@ -19,8 +19,11 @@ import sys
 import time
 from pathlib import Path
 
-from sadana import config, conversation_store, gateway_daemon, stores
+from sadana import client_surface, config, gateway_daemon
 from sadana.door import auth, capabilities
+from sadana.door.nouns import artifacts, harness, runs, spans, traces
+from sadana.door.nouns.conversations import ConversationsNoun
+from sadana.door.nouns.messages import MessagesNoun
 from sadana.door.nouns import approvals, harness
 from sadana.door.operations import resume_on_start
 from sadana.door.router import DoorContext
@@ -87,7 +90,13 @@ def cmd_door_serve(args: argparse.Namespace) -> int:
     harness_id = config.env("SADANA_DOOR_HARNESS_ID", "hrn_dev")
     org = config.env("SADANA_DOOR_ORG", "") or None
 
-    conns = stores.Connections(conversation_store.store_path_from_config())
+    # H20: `conversations.py`/`messages.py` are the first nouns that need a
+    # `client_surface.Runtime` (to call `open_conversation`/`take_turn`) —
+    # `open_runtime()` is the one place that assembly already lives, so this
+    # replaces `door.py`'s own bare `stores.Connections(...)` call rather than
+    # building a second, narrower one beside it.
+    turn_runtime = client_surface.open_runtime()
+    conns = turn_runtime.connections
     resume_on_start(conns)
 
     ctx = DoorContext(
@@ -96,6 +105,13 @@ def cmd_door_serve(args: argparse.Namespace) -> int:
         verifier=verifier,
         capabilities=capabilities.declared(),
         nouns={
+            "artifacts": artifacts,
+            "conversations": ConversationsNoun(turn_runtime),
+            "harness": harness,
+            "messages": MessagesNoun(turn_runtime),
+            "runs": runs,
+            "spans": spans,
+            "traces": traces,
             "approvals": approvals,
             "harness": harness,
         },
