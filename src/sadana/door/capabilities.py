@@ -43,6 +43,7 @@ DECLARED: tuple[str, ...] = (
     "artifacts.download",
     "approvals.wait",
     "approvals.call",
+    "schedules.write",
     # H21 (docs/tasks/H21-watched-streaming-live-runs-stop/spec.md): a
     # turn can stream, a run's live state is real, and a run can be asked
     # to stop.

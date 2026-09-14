@@ -164,6 +164,35 @@ CREATE TABLE IF NOT EXISTS approvals (
 -- `conversation_key` alone cannot be the table's primary key.
 CREATE UNIQUE INDEX IF NOT EXISTS idx_approvals_one_waiting_per_conversation
     ON approvals (conversation_key) WHERE state = 'waiting';
+
+-- H27 (docs/tasks/H27-door-nouns-schedules/spec.md). Replaces
+-- `scheduled_triggers` as the thing the console reads and writes — that
+-- table is left in place above, empty of meaning from here on, and every
+-- row it held is copied once into this one (`adopt_scheduled_triggers`).
+-- `cron` and `interval_seconds` are both nullable because a row is either
+-- a door-created cron schedule (`interval_seconds` stays NULL forever) or
+-- a migrated legacy interval trigger (`cron` starts NULL, and stays NULL
+-- unless a later `update` through the door sets it); `scheduling.tick`
+-- prefers `cron` whenever it is not NULL.
+
+CREATE TABLE IF NOT EXISTS schedules (
+    id                TEXT PRIMARY KEY,
+    name              TEXT UNIQUE NOT NULL,
+    cron              TEXT,
+    timezone          TEXT NOT NULL DEFAULT 'UTC',
+    interval_seconds  REAL,
+    trigger_text      TEXT NOT NULL,
+    plugin            TEXT,
+    conversation_key  TEXT,
+    account_key       TEXT NOT NULL,
+    next_run_at       REAL NOT NULL,
+    last_run_at       REAL,
+    last_state        TEXT,
+    state             TEXT NOT NULL DEFAULT 'active',
+    created_at        REAL NOT NULL,
+    updated_at        REAL NOT NULL,
+    version           INTEGER NOT NULL DEFAULT 1
+);
 """
 
 #: Indexes on columns H16 added, run **after** ``migrate_columns`` and never
@@ -963,6 +992,316 @@ def delete_scheduled_trigger(conn: sqlite3.Connection, *, name: str) -> None:
     a silent no-op, matching ``DELETE``'s own natural idempotence."""
     with write_txn(conn) as c:
         c.execute("DELETE FROM scheduled_triggers WHERE name = ?", (name,))
+
+
+# ── H27: schedules ───────────────────────────────────────────────────────
+# Full contract: docs/tasks/H27-door-nouns-schedules/spec.md.
+
+
+@dataclass(frozen=True)
+class ScheduleRow:
+    """One row of ``schedules`` — read back exactly as stored, the
+    console-facing replacement for ``ScheduledTrigger``."""
+
+    id: str
+    name: str
+    cron: str | None
+    timezone: str
+    interval_seconds: float | None
+    trigger_text: str
+    plugin: str | None
+    conversation_key: str | None
+    account_key: str
+    next_run_at: float
+    last_run_at: float | None
+    last_state: str | None
+    state: str
+    created_at: float
+    updated_at: float
+    version: int
+
+
+_SCHEDULE_COLUMNS_SQL = (
+    "id, name, cron, timezone, interval_seconds, trigger_text, plugin, conversation_key, account_key, "
+    "next_run_at, last_run_at, last_state, state, created_at, updated_at, version"
+)
+
+
+def _schedule_row(row: sqlite3.Row) -> ScheduleRow:
+    return ScheduleRow(
+        id=row["id"],
+        name=row["name"],
+        cron=row["cron"],
+        timezone=row["timezone"],
+        interval_seconds=row["interval_seconds"],
+        trigger_text=row["trigger_text"],
+        plugin=row["plugin"],
+        conversation_key=row["conversation_key"],
+        account_key=row["account_key"],
+        next_run_at=row["next_run_at"],
+        last_run_at=row["last_run_at"],
+        last_state=row["last_state"],
+        state=row["state"],
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+        version=row["version"],
+    )
+
+
+def get_schedule(conn: sqlite3.Connection, *, account_key: str, id: str) -> ScheduleRow | None:
+    """One schedule by id, scoped to ``account_key`` in the same query —
+    another account's row simply isn't found, which is what makes the
+    door's later ``404`` (never ``403``) nearly free (spec.md § Design),
+    the same shape ``memory_store.get_entry_by_id`` already uses."""
+    row = conn.execute(
+        f"SELECT {_SCHEDULE_COLUMNS_SQL} FROM schedules WHERE id = ? AND account_key = ?", (id, account_key)
+    ).fetchone()
+    return _schedule_row(row) if row is not None else None
+
+
+def list_schedules(conn: sqlite3.Connection, *, account_key: str) -> tuple[ScheduleRow, ...]:
+    rows = conn.execute(
+        f"SELECT {_SCHEDULE_COLUMNS_SQL} FROM schedules WHERE account_key = ? ORDER BY created_at", (account_key,)
+    ).fetchall()
+    return tuple(_schedule_row(r) for r in rows)
+
+
+def due_schedules(conn: sqlite3.Connection, *, now: float) -> tuple[ScheduleRow, ...]:
+    """Every *active* schedule whose ``next_run_at`` has arrived, across
+    every account — ``scheduling.tick`` fires each as its own
+    ``account_key``. Unscoped by design: a tick is the one caller that
+    legitimately needs every account's due rows in one query."""
+    rows = conn.execute(
+        f"SELECT {_SCHEDULE_COLUMNS_SQL} FROM schedules WHERE state = 'active' AND next_run_at <= ? ORDER BY name",
+        (now,),
+    ).fetchall()
+    return tuple(_schedule_row(r) for r in rows)
+
+
+def _record_schedule_change(c: sqlite3.Connection, *, id: str, kind: str, at: float) -> None:
+    """Inside the caller's own transaction, matching
+    ``_record_conversation_change``'s shape: the update and the read of its
+    own result are both inside one transaction, so the announced ``version``
+    is the one that actually committed."""
+    row = c.execute("SELECT state, version FROM schedules WHERE id = ?", (id,)).fetchone()
+    if row is None:
+        return
+    ledger.record_change(c, noun="schedules", id=id, kind=kind, state=row["state"], version=row["version"], at=at)
+
+
+def create_schedule(
+    conn: sqlite3.Connection,
+    *,
+    name: str,
+    cron: str | None,
+    timezone: str,
+    interval_seconds: float | None,
+    trigger_text: str,
+    plugin: str | None,
+    conversation_key: str | None,
+    account_key: str,
+    next_run_at: float,
+    now: float,
+) -> ScheduleRow:
+    """Mints a fresh id and inserts. Takes ``next_run_at`` as a value —
+    this module stays cron-agnostic; the caller (the door's own ``create``,
+    or ``adopt_scheduled_triggers`` below) is the one that knows whether it
+    came from ``cron.next_after`` or a copied legacy value. Raises
+    ``sqlite3.IntegrityError`` on a duplicate ``name``, uncaught here —
+    ``door/nouns/schedules.py`` maps that to ``409 CONFLICT``."""
+    schedule_id = ids.make_id("sch")
+    with write_txn(conn) as c:
+        c.execute(
+            "INSERT INTO schedules (id, name, cron, timezone, interval_seconds, trigger_text, plugin, "
+            "conversation_key, account_key, next_run_at, last_run_at, last_state, state, created_at, "
+            "updated_at, version) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, 'active', ?, ?, 1)",
+            (
+                schedule_id,
+                name,
+                cron,
+                timezone,
+                interval_seconds,
+                trigger_text,
+                plugin,
+                conversation_key,
+                account_key,
+                next_run_at,
+                now,
+                now,
+            ),
+        )
+        # `state`/`version` are compile-time constants for a fresh insert
+        # ('active'/1), unlike every other write below — no re-select
+        # needed to announce them, unlike `_record_schedule_change`'s own
+        # re-select for a write whose new version SQLite itself computed.
+        ledger.record_change(c, noun="schedules", id=schedule_id, kind="created", state="active", version=1, at=now)
+    return ScheduleRow(
+        id=schedule_id,
+        name=name,
+        cron=cron,
+        timezone=timezone,
+        interval_seconds=interval_seconds,
+        trigger_text=trigger_text,
+        plugin=plugin,
+        conversation_key=conversation_key,
+        account_key=account_key,
+        next_run_at=next_run_at,
+        last_run_at=None,
+        last_state=None,
+        state="active",
+        created_at=now,
+        updated_at=now,
+        version=1,
+    )
+
+
+def update_schedule(
+    conn: sqlite3.Connection,
+    *,
+    account_key: str,
+    id: str,
+    now: float,
+    name: str | None = None,
+    cron: str | None = None,
+    timezone: str | None = None,
+    plugin: str | None = None,
+    conversation_key: str | None = None,
+    trigger_text: str | None = None,
+    next_run_at: float | None = None,
+) -> None:
+    """Updates only the columns the caller actually passed. ``None`` means
+    "leave unchanged" for every field here — the same convention
+    ``persona_store.update_character`` already uses — since nothing in this
+    work item asks for explicitly clearing ``plugin``/``conversation_key``
+    back to null once set, only for setting them. Scoped by ``id AND
+    account_key`` the same way ``get_schedule`` is; a mismatched account
+    touches zero rows, the same silent-no-op posture
+    ``delete_scheduled_trigger`` already takes toward an unknown name."""
+    fields = {
+        "name": name,
+        "cron": cron,
+        "timezone": timezone,
+        "plugin": plugin,
+        "conversation_key": conversation_key,
+        "trigger_text": trigger_text,
+        "next_run_at": next_run_at,
+    }
+    given = {k: v for k, v in fields.items() if v is not None}
+    if not given:
+        return
+    set_clause = ", ".join(f"{k} = ?" for k in given) + ", updated_at = ?, version = version + 1"
+    with write_txn(conn) as c:
+        c.execute(
+            f"UPDATE schedules SET {set_clause} WHERE id = ? AND account_key = ?",
+            (*given.values(), now, id, account_key),
+        )
+        _record_schedule_change(c, id=id, kind="changed", at=now)
+
+
+def set_schedule_state(
+    conn: sqlite3.Connection,
+    *,
+    account_key: str,
+    id: str,
+    to_state: str,
+    now: float,
+    next_run_at: float | None = None,
+) -> None:
+    """``pause``/``resume``. ``next_run_at`` is only ever passed on
+    ``resume`` — recomputed by the caller from the moment of resume, never
+    reused from whatever was showing while paused (spec.md requirement 6);
+    ``pause`` leaves it untouched, which is safe precisely because a
+    ``paused`` row is excluded from ``due_schedules`` regardless of what its
+    ``next_run_at`` says."""
+    columns = "state = ?, updated_at = ?" if next_run_at is None else "state = ?, next_run_at = ?, updated_at = ?"
+    params = (to_state, now) if next_run_at is None else (to_state, next_run_at, now)
+    with write_txn(conn) as c:
+        c.execute(
+            f"UPDATE schedules SET {columns}, version = version + 1 WHERE id = ? AND account_key = ?",
+            (*params, id, account_key),
+        )
+        _record_schedule_change(c, id=id, kind="changed", at=now)
+
+
+def remove_schedule(conn: sqlite3.Connection, *, account_key: str, id: str) -> None:
+    """The tombstone-then-delete shape ``memory_store.delete_entry`` already
+    established: the ledger's ``deleted`` row is written first, inside the
+    same transaction, because afterwards there is no id left to name it
+    by."""
+    at = time.time()
+    with write_txn(conn) as c:
+        row = c.execute("SELECT id FROM schedules WHERE id = ? AND account_key = ?", (id, account_key)).fetchone()
+        if row is not None:
+            ledger.record_change(c, noun="schedules", id=id, kind="deleted", state=None, version=None, at=at)
+        c.execute("DELETE FROM schedules WHERE id = ? AND account_key = ?", (id, account_key))
+
+
+def advance_schedule(
+    conn: sqlite3.Connection, *, id: str, next_run_at: float, last_run_at: float, last_state: str, now: float
+) -> None:
+    """The post-fire write ``scheduling.tick`` makes for every schedule it
+    fires — unscoped by ``account_key``: the tick already has the row from
+    ``due_schedules`` and is a trusted internal caller, not the door."""
+    with write_txn(conn) as c:
+        c.execute(
+            "UPDATE schedules SET next_run_at = ?, last_run_at = ?, last_state = ?, updated_at = ?, "
+            "version = version + 1 WHERE id = ?",
+            (next_run_at, last_run_at, last_state, now, id),
+        )
+        _record_schedule_change(c, id=id, kind="changed", at=now)
+
+
+def adopt_scheduled_triggers(conn: sqlite3.Connection, *, owner: str, now: float) -> int:
+    """Moves every *recurring* ``scheduled_triggers`` row into ``schedules``,
+    once — the ``client_surface._adopt_scheduled_memories`` precedent
+    (PERSONA-02), applied to this table instead. ``cron`` stays ``NULL`` and
+    ``interval_seconds``/``next_run_at`` carry over unchanged: a legacy row
+    keeps firing exactly as it already was, not recomputed.
+
+    A one-shot trigger (``interval_seconds IS NULL``, ``upsert_scheduled_
+    trigger``'s own documented meaning for that value) is deliberately
+    **not** migrated: `schedules` has no "fire once, then vanish" concept —
+    a migrated one-shot row would land with both ``cron`` and
+    ``interval_seconds`` null, which `scheduling.next_schedule_run` treats
+    as a broken row (`ValueError`) and `tick` then leaves permanently due,
+    permanently un-advanceable, forever logging a warning (a deploy-stage
+    cold review caught this by reproducing it). A one-shot trigger still
+    fires correctly and gets deleted through the untouched `due_triggers`
+    loop; it simply never gets a `schedules` counterpart, which fits — a
+    row that fires once and disappears is not something an account needs to
+    see, pause or resume.
+
+    Idempotent: a row already copied (matched by ``name``, the natural key
+    both tables share) is skipped, so a second call finds nothing left to
+    move and returns 0 — safe to call on every store open. Each row is its
+    own ``create_schedule`` call — its own transaction — rather than one
+    transaction wrapping the whole loop, since ``write_txn`` does not nest;
+    a crash partway through leaves the remaining rows uncopied, which the
+    next open's call finds and finishes."""
+    legacy = conn.execute(
+        "SELECT name, trigger_text, next_run_at, interval_seconds FROM scheduled_triggers "
+        "WHERE interval_seconds IS NOT NULL"
+    ).fetchall()
+    already_copied = {r["name"] for r in conn.execute("SELECT name FROM schedules").fetchall()}
+    moved = 0
+    for row in legacy:
+        if row["name"] in already_copied:
+            continue
+        create_schedule(
+            conn,
+            name=row["name"],
+            cron=None,
+            timezone="UTC",
+            interval_seconds=row["interval_seconds"],
+            trigger_text=row["trigger_text"],
+            plugin=None,
+            conversation_key=None,
+            account_key=owner,
+            next_run_at=row["next_run_at"],
+            now=now,
+        )
+        moved += 1
+    return moved
 
 
 @dataclass(frozen=True)

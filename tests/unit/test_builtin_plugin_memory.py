@@ -9,7 +9,7 @@ import asyncio
 import pytest
 
 from conftest import open_conn
-from sadana.memory_store import DispatchContext, ensure_schema, list_entries
+from sadana.memory_store import DispatchContext, ensure_schema, list_entries, list_entries_full
 from sadana.plugin_manifest import run_graph, validate
 from sadana.plugins import SkillRef, Valid
 
@@ -74,3 +74,44 @@ def test_builtin_memory_plugin_fails_safely_without_context() -> None:
 
     assert result.failed_node == "write"
     assert list_entries(conn, "a1") == ()
+
+
+# ── H26: kind/source/conversation_key reach the store ────────────────────
+
+
+@pytest.mark.unit
+def test_builtin_memory_plugin_passes_through_a_given_kind_and_conversation() -> None:
+    conn = open_conn()
+    ensure_schema(conn)
+    outcome = validate(_builtin_dir())
+    assert isinstance(outcome, Valid)
+    entry = outcome.manifest.entries[0]
+    ctx = DispatchContext(account_key="a1", conn=conn, conversation_key="conv_1")  # pragma: allowlist secret
+    arguments = {"entry_key": "dog_name", "content": "Buddy", "kind": "preference", "_sadana_memory_ctx": ctx}
+
+    result = asyncio.run(
+        run_graph(_builtin_dir(), outcome.manifest, entry, arguments, ask=_stub_ask, approve=_approve_ok)
+    )
+
+    assert result.failed_node is None
+    row = list_entries_full(conn, "a1")[0]
+    assert (row.kind, row.source, row.conversation_key) == ("preference", "conversation", "conv_1")
+
+
+@pytest.mark.unit
+def test_builtin_memory_plugin_defaults_a_missing_kind_to_fact() -> None:
+    conn = open_conn()
+    ensure_schema(conn)
+    outcome = validate(_builtin_dir())
+    assert isinstance(outcome, Valid)
+    entry = outcome.manifest.entries[0]
+    ctx = DispatchContext(account_key="a1", conn=conn)  # pragma: allowlist secret
+    arguments = {"entry_key": "dog_name", "content": "Buddy", "_sadana_memory_ctx": ctx}
+
+    result = asyncio.run(
+        run_graph(_builtin_dir(), outcome.manifest, entry, arguments, ask=_stub_ask, approve=_approve_ok)
+    )
+
+    assert result.failed_node is None
+    row = list_entries_full(conn, "a1")[0]
+    assert row.kind == "fact"

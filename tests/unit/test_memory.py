@@ -127,3 +127,22 @@ def test_owner_account_is_resolved_fresh_not_captured(monkeypatch: pytest.Monkey
     assert memory.owner_account() == "before"
     monkeypatch.setenv("SADANA_MEMORY_ACCOUNT", "after")
     assert memory.owner_account() == "after"
+
+
+# ── H26: the cosmetic label on what got remembered ───────────────────────
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("kind", ["decision", "preference", "fact"])
+def test_normalize_kind_passes_through_known_words(kind: str) -> None:
+    assert memory.normalize_kind(kind) == kind
+
+
+@pytest.mark.unit
+def test_normalize_kind_defaults_unknown_string_to_fact() -> None:
+    assert memory.normalize_kind("opinion") == "fact"
+
+
+@pytest.mark.unit
+def test_normalize_kind_defaults_missing_value_to_fact() -> None:
+    assert memory.normalize_kind(None) == "fact"

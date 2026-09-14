@@ -9,7 +9,7 @@ import pytest
 
 from conftest import make_runtime, open_connections, plain_response, write_character
 from sadana import conversation_store, gateway_dispatch, memory, model_access, persona, persona_store, plugin_dispatch
-from sadana.conversation_store import due_triggers, load, upsert_scheduled_trigger
+from sadana.conversation_store import create_schedule, due_triggers, get_schedule, load, upsert_scheduled_trigger
 from sadana.door.nouns import approvals as door_approvals
 from sadana.gateway import MessageEvent, session_key_for
 from sadana.scheduling import _advance, _is_due, tick
@@ -107,6 +107,100 @@ def test_tick_one_failing_trigger_does_not_stop_the_others_and_stays_due(
     assert {c.chat_id for c in calls} == {"broken", "fine"}
     remaining = due_triggers(conn, now=0.0)
     assert [t.name for t in remaining] == ["broken"]
+
+
+# ── H27: schedules fire alongside scheduled_triggers ────────────────────
+
+_ACCOUNT = "console:u1"  # pragma: allowlist secret — an account name, not a credential
+
+
+def _make_schedule(conn, **overrides):
+    fields = dict(
+        name="digest",
+        cron="0 9 * * *",
+        timezone="UTC",
+        interval_seconds=None,
+        trigger_text="go",
+        plugin=None,
+        conversation_key=None,
+        account_key=_ACCOUNT,
+        next_run_at=0.0,
+        now=0.0,
+    )
+    fields.update(overrides)
+    return create_schedule(conn, **fields)
+
+
+@pytest.mark.unit
+def test_tick_fires_a_due_cron_schedule_exactly_once_under_an_injected_now(monkeypatch: pytest.MonkeyPatch) -> None:
+    connections = open_connections()
+    schedule = _make_schedule(connections.writer, next_run_at=0.0)
+    calls: list[MessageEvent] = []
+    accounts: list[str | None] = []
+    monkeypatch.setattr(gateway_dispatch, "handle_inbound", _fake_handle_inbound(calls, accounts=accounts))
+    match_instant = 1_700_000_000.0  # any fixed instant well past the seeded next_run_at=0.0
+
+    fired = asyncio.run(tick(make_runtime(connections), now=match_instant))
+
+    assert fired == 1
+    assert [c.chat_id for c in calls] == ["digest"]
+    assert accounts == [_ACCOUNT]
+    row = get_schedule(connections.writer, account_key=_ACCOUNT, id=schedule.id)
+    assert row is not None
+    assert row.next_run_at > match_instant  # advanced to the next match, not re-armed at the same instant
+
+    # A second tick at the same instant must not fire it again — the
+    # schedule has already advanced past `match_instant`.
+    fired_again = asyncio.run(tick(make_runtime(connections), now=match_instant))
+    assert fired_again == 0
+
+
+@pytest.mark.unit
+def test_tick_records_last_run_at_and_last_state_on_a_successful_fire(monkeypatch: pytest.MonkeyPatch) -> None:
+    connections = open_connections()
+    schedule = _make_schedule(connections.writer, next_run_at=0.0)
+    monkeypatch.setattr(gateway_dispatch, "handle_inbound", _fake_handle_inbound([]))
+
+    asyncio.run(tick(make_runtime(connections), now=1_700_000_000.0))
+
+    row = get_schedule(connections.writer, account_key=_ACCOUNT, id=schedule.id)
+    assert row is not None
+    assert row.last_run_at == 1_700_000_000.0
+    assert row.last_state == "completed"
+
+
+@pytest.mark.unit
+def test_tick_never_fires_a_paused_schedule(monkeypatch: pytest.MonkeyPatch) -> None:
+    connections = open_connections()
+    schedule = _make_schedule(connections.writer, next_run_at=0.0)
+    conversation_store.set_schedule_state(
+        connections.writer, account_key=_ACCOUNT, id=schedule.id, to_state="paused", now=0.0
+    )
+    calls: list[MessageEvent] = []
+    monkeypatch.setattr(gateway_dispatch, "handle_inbound", _fake_handle_inbound(calls))
+
+    fired = asyncio.run(tick(make_runtime(connections), now=9_999_999_999.0))
+
+    assert fired == 0
+    assert calls == []
+
+
+@pytest.mark.unit
+def test_tick_one_failing_schedule_does_not_stop_a_trigger_and_stays_due(monkeypatch: pytest.MonkeyPatch) -> None:
+    connections = open_connections()
+    schedule = _make_schedule(connections.writer, name="broken", next_run_at=0.0)
+    upsert_scheduled_trigger(connections.writer, name="fine", trigger_text="go", next_run_at=0.0, interval_seconds=None)
+    calls: list[MessageEvent] = []
+    monkeypatch.setattr(gateway_dispatch, "handle_inbound", _fake_handle_inbound(calls, raise_for="broken"))
+
+    fired = asyncio.run(tick(make_runtime(connections), now=9_999_999_999.0))
+
+    assert fired == 1
+    assert {c.chat_id for c in calls} == {"broken", "fine"}
+    row = get_schedule(connections.writer, account_key=_ACCOUNT, id=schedule.id)
+    assert row is not None
+    assert row.next_run_at == 0.0  # never advanced — stays due, retried next tick
+    assert row.last_run_at is None
 
 
 # ── H18: expiry runs on the same tick ────────────────────────────────────
