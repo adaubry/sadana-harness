@@ -28,19 +28,62 @@ import shutil
 import sqlite3
 import subprocess
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from sadana import plugins
-from sadana.conversation_store import write_txn
+from sadana import ids, ledger, plugins
+from sadana.conversation_store import fill_legacy_identity, migrate_columns, write_txn
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS plugin_registry (
     name           TEXT PRIMARY KEY,
     repo_url       TEXT NOT NULL,
-    registered_at  REAL NOT NULL
+    registered_at  REAL NOT NULL,
+    -- H16.
+    id             TEXT,
+    updated_at     REAL,
+    version        INTEGER NOT NULL DEFAULT 1
+);
+
+-- H16 requirement 9: one row per directory holding a `plugin.toml`, so the
+-- inventory can be enumerated without walking the plugins root (P3).
+--
+-- Listed the way `editor_server._list_plugins` lists — including a plugin that
+-- does not validate, which gets `state = 'error'`. `discover_plugins()` is
+-- deliberately not the source: it returns only what fully validates, which is
+-- right for deciding what an agent may call and exactly wrong for an index
+-- whose job is to say what is *there*.
+--
+-- `name` is the PRIMARY KEY because a plugin directory's name is its natural
+-- key and already has the filesystem behind it; `id` is UNIQUE beside it as
+-- the thing a ledger row points at.
+CREATE TABLE IF NOT EXISTS plugin_state (
+    name          TEXT PRIMARY KEY,
+    id            TEXT UNIQUE NOT NULL,
+    state         TEXT NOT NULL DEFAULT 'installed',
+    source_repo   TEXT,
+    source_tag    TEXT,
+    installed_at  REAL NOT NULL,
+    updated_at    REAL NOT NULL,
+    version       INTEGER NOT NULL DEFAULT 1
 );
 """
+
+#: See `conversation_store._MIGRATED_COLUMNS`.
+_MIGRATED_COLUMNS: dict[str, tuple[tuple[str, str], ...]] = {
+    "plugin_registry": (
+        ("id", "TEXT"),
+        ("updated_at", "REAL"),
+        ("version", "INTEGER NOT NULL DEFAULT 1"),
+    ),
+}
+
+#: Every word `plugin_state.state` may hold. `installed` and `error` are
+#: recomputed from disk by `reconcile_plugin_state`; `disabled` is a decision
+#: somebody made and is never overruled by an observation. H24 adds the verb
+#: that writes it.
+PLUGIN_STATES = frozenset({"installed", "error", "disabled"})
 
 _GIT_TIMEOUT_S = 60
 _SHA_RE = re.compile(r"^[0-9a-fA-F]{40}$")
@@ -150,10 +193,12 @@ def describe_fetch_failure(outcome: TagMismatch | FetchFailed) -> str:
 
 def _ensure_schema(conn: sqlite3.Connection) -> None:
     """Idempotent, the same `CREATE TABLE IF NOT EXISTS` posture
-    `observability.make_recorder()` already takes on this same
-    connection — no column to migrate yet, so no `ALTER TABLE` guard is
-    needed."""
+    `observability.make_recorder()` already takes on this same connection.
+    H16 added three columns to `plugin_registry`, which is what the migration
+    map is for."""
     conn.executescript(_SCHEMA)
+    migrate_columns(conn, _MIGRATED_COLUMNS)
+    fill_legacy_identity(conn, "plugin_registry", "plg", time_columns=("updated_at",))
 
 
 def register(conn: sqlite3.Connection, name: str, repo_url: str, *, now: float) -> RegisterOutcome:
@@ -163,12 +208,15 @@ def register(conn: sqlite3.Connection, name: str, repo_url: str, *, now: float) 
     if not plugins.PLUGIN_NAME_RE.fullmatch(name):
         return InvalidName(name=name)
     _ensure_schema(conn)
+    at = time.time()
+    registry_id = ids.make_id("plg")
     try:
         with write_txn(conn) as c:
             c.execute(
-                "INSERT INTO plugin_registry (name, repo_url, registered_at) VALUES (?, ?, ?)",
-                (name, repo_url, now),
+                "INSERT INTO plugin_registry (name, repo_url, registered_at, id, updated_at) VALUES (?, ?, ?, ?, ?)",
+                (name, repo_url, now, registry_id, at),
             )
+            ledger.record_change(c, noun="plugins", id=registry_id, kind="created", state=None, version=1, at=at)
     except sqlite3.IntegrityError:
         return NameTaken(name=name)
     return Registered(name=name)
@@ -348,4 +396,167 @@ def install(
                 os.replace(backup, target)
             return FetchFailed(detail=f"could not place plugin: {exc}")
 
+    _record_installed(conn, name, repo_url=repo_url, tag=tag)
     return Installed(name=name, directory=target, revision=fetched.revision)
+
+
+def _record_installed(conn: sqlite3.Connection, name: str, *, repo_url: str, tag: str) -> None:
+    """Upsert the `plugin_state` row for a plugin that just landed on disk.
+
+    Outside the placement transaction on purpose: the plugin is already at
+    `target` by the time this runs, and an index row is a derived record of a
+    filesystem fact, never the fact itself. If this failed, the next
+    `reconcile_plugin_state` finds the directory and inserts the row — which is
+    exactly what the reconciliation is for.
+
+    `state` is left alone on an update: a plugin somebody disabled and then
+    upgraded stays disabled, because upgrading is not the same as re-enabling
+    and silently turning it back on is the surprise.
+    """
+    at = time.time()
+    with write_txn(conn) as c:
+        existing = c.execute("SELECT id FROM plugin_state WHERE name = ?", (name,)).fetchone()
+        c.execute(
+            "INSERT INTO plugin_state (name, id, source_repo, source_tag, installed_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT (name) DO UPDATE SET source_repo = excluded.source_repo, "
+            "source_tag = excluded.source_tag, updated_at = excluded.updated_at, "
+            "version = plugin_state.version + 1",
+            (name, ids.make_id("plg"), repo_url, tag, at, at),
+        )
+        row = c.execute("SELECT id, state, version FROM plugin_state WHERE name = ?", (name,)).fetchone()
+        ledger.record_change(
+            c,
+            noun="plugins",
+            id=row["id"],
+            kind="changed" if existing else "created",
+            state=row["state"],
+            version=row["version"],
+            at=at,
+        )
+
+
+def reconcile_plugin_state(conn: sqlite3.Connection, plugins_root: Path) -> None:
+    """Make the `plugin_state` index match the plugins directory.
+
+    Every directory holding a `plugin.toml` gets a row, whether or not it
+    validates — a broken plugin is one the console most needs to show, and
+    hiding it is what `editor_server._list_plugins` already declined to do.
+    `state` is `'installed'` when it validates and `'error'` when it does not.
+
+    A row already marked `'disabled'` keeps that word. Only `'installed'` and
+    `'error'` are recomputed from disk: whether a plugin *works* is a fact
+    about the files, but whether it is *switched off* is a decision somebody
+    made, and a reconciliation must not overrule a decision with an
+    observation. Nothing writes `'disabled'` yet — H24 adds that verb, and
+    `client_surface._enabled_plugin_set` already honours it, over
+    `disabled_names()` below.
+
+    A row whose directory has gone is announced as `deleted` and removed.
+    """
+    at = time.time()
+    found = {}
+    if plugins_root.is_dir():
+        for child in sorted(plugins_root.iterdir()):
+            if child.is_dir() and (child / "plugin.toml").is_file():
+                found[child.name] = "installed" if _validates(child) else "error"
+    known = {
+        row["name"]: (row["id"], row["state"], row["version"])
+        for row in conn.execute("SELECT id, name, state, version FROM plugin_state")
+    }
+    # Read first, and take no transaction at all when nothing moved — which is
+    # every open after the first. `write_txn` takes SQLite's database-level
+    # write lock, so an unconditional one here would have every `sadana` command
+    # contend with a running gateway for the length of its own commit.
+    # `fill_legacy_identity` already takes this shape for the same reason.
+    if not _plugin_state_differs(found, known):
+        return
+    with write_txn(conn) as c:
+        for name, state in found.items():
+            if name not in known:
+                plugin_id = ids.make_id("plg")
+                c.execute(
+                    "INSERT INTO plugin_state (name, id, state, installed_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+                    (name, plugin_id, state, at, at),
+                )
+                ledger.record_change(c, noun="plugins", id=plugin_id, kind="created", state=state, version=1, at=at)
+                continue
+            plugin_id, known_state, version = known[name]
+            if known_state in ("disabled", state):
+                continue
+            c.execute(
+                "UPDATE plugin_state SET state = ?, updated_at = ?, version = version + 1 WHERE id = ?",
+                (state, at, plugin_id),
+            )
+            ledger.record_change(
+                c, noun="plugins", id=plugin_id, kind="changed", state=state, version=version + 1, at=at
+            )
+        for name, (plugin_id, _state, _version) in known.items():
+            if name in found:
+                continue
+            ledger.record_change(c, noun="plugins", id=plugin_id, kind="deleted", state=None, version=None, at=at)
+            c.execute("DELETE FROM plugin_state WHERE id = ?", (plugin_id,))
+
+
+def disabled_names(conn: sqlite3.Connection) -> frozenset[str]:
+    """Every plugin name somebody has switched off.
+
+    Lives here because this module owns `plugin_state`. The first cut had
+    `plugin_dispatch` querying the table directly, which put one module's
+    column names inside another with nothing keeping them true — the same
+    weakness `spec.md` § Concerns already names as the ledger's worst
+    property, and there is no reason to repeat it where the import is legal.
+
+    Empty when the table does not exist yet: a connection whose schemas were
+    never ensured must not lose every tool, because failing closed here turns
+    a setup omission into a silent, total loss of capability.
+
+    Nothing writes `disabled` yet — H24 adds that verb. This and the filter in
+    `client_surface.open_runtime` are here now so H24 adds only the verb and
+    cannot forget the enforcement.
+    """
+    try:
+        rows = conn.execute("SELECT name FROM plugin_state WHERE state = 'disabled'").fetchall()
+    except sqlite3.OperationalError:
+        return frozenset()
+    return frozenset(row["name"] for row in rows)
+
+
+def _plugin_state_differs(found: dict[str, str], known: dict[str, tuple[str, str, int]]) -> bool:
+    """Whether `reconcile_plugin_state` has anything to write. Pure, so the
+    steady-state answer costs no transaction and can be tested directly.
+
+    A `disabled` row matches whatever is on disk: switching a plugin off is a
+    decision somebody made, and an observation must not overrule it.
+    """
+    if set(found) != set(known):
+        return True
+    return any(state != "disabled" and state != found[name] for name, (_id, state, _v) in known.items())
+
+
+def _validates(directory: Path) -> bool:
+    """Whether `directory`'s manifest is well-formed — **without running any of
+    its code**.
+
+    `check_bodies=False` is the whole point, not an optimisation. The default
+    imports and executes the plugin's own body module to confirm a named
+    function exists, and this function is reached from
+    `stores.reconcile_indexes`, which runs whenever a process opens a
+    `Connections`. At the default, opening the store would import and execute
+    every installed plugin's Python before doing anything else —
+    CLAUDE.md: "A check that can execute code as a side effect of validating
+    it must offer a mode that never executes anything, and any caller handling
+    input from a source it doesn't already trust uses that mode." A plugin
+    installed from a git tag is such a source, and an index has no business
+    running one.
+
+    `editor_server._assess` reached the same conclusion for the same reason:
+    listing what is there is a different question from deciding what may run.
+
+    Imported inside the function rather than at module scope: `plugin_manifest`
+    imports this module's sibling `plugins`, and a top-level import would tie
+    the install path to the validation path for a check only the index needs.
+    """
+    from sadana import plugin_manifest
+
+    return isinstance(plugin_manifest.validate(directory, check_bodies=False), plugins.Valid)

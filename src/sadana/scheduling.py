@@ -53,20 +53,22 @@ async def tick(runtime: client_surface.Runtime) -> int:
     failure deserves — "no catch-up" (requirement 5) is about the daemon
     having been down, not about one attempt failing while it was up.
 
-    Every direct touch of `runtime.conn` this function makes (the
-    due-triggers query, the post-fire advance/delete) is wrapped in
-    `client_surface.conn_lock` — the same lock `take_turn()` already holds
-    for its own whole body. `run_tick_loop` runs on its own
-    background thread, and without this a deploy-stage cold review found it
-    racing `conn` against every webhook request's own thread, violating
-    `conversation_store.open_store()`'s documented single-writer-at-a-time
-    contract. `handle_inbound()` itself is called *outside* any lock this
-    function holds — it acquires the same, non-reentrant lock internally,
-    so nesting would deadlock."""
+    Every direct touch of the store this function makes is now narrower than
+    it was. Before H16 the due-triggers query and the post-fire advance/delete
+    were all wrapped in one process-wide `conn_lock`, because a deploy-stage
+    cold review found this loop — which runs on its own background thread —
+    racing the single connection against every webhook request's thread. The
+    guarantee is unchanged and the mechanism is smaller: the query reads
+    through this thread's own read-only connection, so it waits for nobody, and
+    the two writes go through `write_txn`, which takes the writer lock for the
+    length of a transaction.
+
+    `handle_inbound()` is still called holding no lock of ours. It reaches
+    `take_turn`, which takes that conversation's own lock internally, and
+    taking it here first would deadlock against it."""
     conn = runtime.conn
     now = time.time()
-    with client_surface.conn_lock:
-        due = conversation_store.due_triggers(conn, now=now)
+    due = conversation_store.due_triggers(runtime.connections.reader(), now=now)
     fired = 0
     for trigger in due:
         event = MessageEvent(platform="schedule", chat_id=trigger.name, thread_id=None, text=trigger.trigger_text)
@@ -80,13 +82,12 @@ async def tick(runtime: client_surface.Runtime) -> int:
         except Exception:
             logger.warning("scheduled trigger %r failed to fire", trigger.name, exc_info=True)
             continue
-        with client_surface.conn_lock:
-            if trigger.interval_seconds is None:
-                conversation_store.delete_scheduled_trigger(conn, name=trigger.name)
-            else:
-                conversation_store.advance_scheduled_trigger(
-                    conn, name=trigger.name, next_run_at=_advance(now, trigger.interval_seconds)
-                )
+        if trigger.interval_seconds is None:
+            conversation_store.delete_scheduled_trigger(conn, name=trigger.name)
+        else:
+            conversation_store.advance_scheduled_trigger(
+                conn, name=trigger.name, next_run_at=_advance(now, trigger.interval_seconds)
+            )
         fired += 1
     return fired
 

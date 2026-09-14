@@ -13,7 +13,7 @@ from conftest import SYSTEM_PROMPT as _SYSTEM_PROMPT
 from conftest import conversation as _conversation
 from conftest import tool_call_response as _tool_call_response
 from conftest import tool_spec as _spec
-from sadana import conversation_store, model_access, plugins
+from sadana import conversation_store, ids, ledger, model_access, plugins
 from sadana.context import ContextState
 from sadana.conversation import (
     ExitReason,
@@ -415,7 +415,7 @@ def test_search_matches_template_name_substring_case_insensitively(tmp_path: Pat
         conn,
         _conversation(key="k1", template_name="eval-harness"),
         now=0.0,
-        account_key="a1",  # pragma: allowlist secret,  # pragma: allowlist secret
+        account_key="a1",  # pragma: allowlist secret
     )
     create(conn, _conversation(key="k2", template_name="other"), now=0.0, account_key="a1")  # pragma: allowlist secret
 
@@ -708,3 +708,215 @@ def test_a_store_whose_plugin_pauses_predates_these_columns_migrates_and_still_l
     # Idempotent: a second open of the same file must not re-run the ALTER.
     reopened = open_store(path)
     assert load_pause(reopened, conversation_key="k1") is not None
+
+
+# ── H16: identity, the ledger, and the legacy fill ─────────────────────────
+
+
+_PRE_H16_CONVERSATIONS = """CREATE TABLE conversations (
+    key                    TEXT PRIMARY KEY,
+    template_name          TEXT NOT NULL,
+    system_prompt          TEXT NOT NULL,
+    prompt_sha256          TEXT NOT NULL,
+    prompt_epoch           INTEGER NOT NULL,
+    tool_surface_json      TEXT NOT NULL,
+    next_turn_seq          INTEGER NOT NULL,
+    iteration_max_total    INTEGER NOT NULL,
+    iteration_used         INTEGER NOT NULL,
+    wall_clock_remaining_s REAL,
+    next_child_seq         INTEGER NOT NULL
+)"""
+
+_PRE_H16_MESSAGES = (
+    "CREATE TABLE messages (conversation_key TEXT NOT NULL, msg_seq INTEGER NOT NULL, role TEXT NOT NULL, "
+    "content TEXT, tool_calls_json TEXT NOT NULL, tool_call_id TEXT, "
+    "PRIMARY KEY (conversation_key, msg_seq))"
+)
+
+
+def _pre_h16_store(path: Path, *, messages: int = 1) -> None:
+    """A store as it was written before H16, by hand.
+
+    The only way to exercise the migration: `open_store` would create the
+    current `_SCHEMA`, which already has every column, so a row that merely
+    omits them cannot be produced through the module's own API. Same technique
+    the C12 migration test above already uses.
+    """
+    raw = sqlite3.connect(path)
+    raw.execute(_PRE_H16_CONVERSATIONS)
+    raw.execute(_PRE_H16_MESSAGES)
+    raw.execute(
+        "INSERT INTO conversations (key, template_name, system_prompt, prompt_sha256, prompt_epoch, "
+        "tool_surface_json, next_turn_seq, iteration_max_total, iteration_used, wall_clock_remaining_s, "
+        "next_child_seq) VALUES ('legacy', 't1', ?, 'h', 0, '[]', 0, 10, 0, NULL, 0)",
+        (_SYSTEM_PROMPT,),
+    )
+    for seq in range(messages):
+        raw.execute(
+            "INSERT INTO messages (conversation_key, msg_seq, role, content, tool_calls_json, tool_call_id) "
+            "VALUES ('legacy', ?, 'user', 'hi', '[]', NULL)",
+            (seq,),
+        )
+    raw.commit()
+    raw.close()
+
+
+def _columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    return {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+
+
+@pytest.mark.unit
+def test_a_fresh_store_carries_every_identity_column(tmp_path: Path) -> None:
+    conn = open_store(tmp_path / "c.db")
+
+    assert {"id", "created_at", "updated_at", "version", "state", "tags_json", "agent"} <= _columns(
+        conn, "conversations"
+    )
+    assert {"id", "created_at", "state", "run_id"} <= _columns(conn, "messages")
+
+
+@pytest.mark.unit
+def test_a_pre_h16_store_gains_every_identity_column(tmp_path: Path) -> None:
+    path = tmp_path / "c.db"
+    _pre_h16_store(path)
+
+    conn = open_store(path)
+
+    assert {"id", "created_at", "updated_at", "version", "state", "tags_json", "agent"} <= _columns(
+        conn, "conversations"
+    )
+    assert {"id", "created_at", "state", "run_id"} <= _columns(conn, "messages")
+
+
+@pytest.mark.unit
+def test_the_legacy_fill_gives_every_old_row_an_id_and_a_floor_timestamp(tmp_path: Path) -> None:
+    path = tmp_path / "c.db"
+    _pre_h16_store(path, messages=3)
+
+    conn = open_store(path)
+
+    row = conn.execute("SELECT id, created_at, updated_at, version, state FROM conversations").fetchone()
+    assert ids.parse_id("conv", row["id"]) is not None
+    assert row["created_at"] == row["updated_at"]
+    assert row["version"] == 1
+    assert row["state"] == "active"
+    assert conn.execute("SELECT COUNT(*) FROM messages WHERE id IS NULL").fetchone()[0] == 0
+
+
+@pytest.mark.unit
+def test_the_legacy_fill_is_idempotent_and_writes_no_ledger_rows(tmp_path: Path) -> None:
+    """A mirror's first sync reads the inventory, so filling a row that did
+    not really change must not announce itself as news."""
+    path = tmp_path / "c.db"
+    _pre_h16_store(path, messages=3)
+
+    first = open_store(path)
+    filled = first.execute("SELECT id, created_at FROM conversations").fetchone()
+    assert ledger.ledger_head(first) == 0
+    first.close()
+
+    second = open_store(path)
+
+    assert tuple(second.execute("SELECT id, created_at FROM conversations").fetchone()) == tuple(filled)
+    assert ledger.ledger_head(second) == 0
+
+
+@pytest.mark.unit
+def test_create_mints_an_id_and_records_one_change(tmp_path: Path) -> None:
+    conn = open_store(tmp_path / "c.db")
+
+    create(conn, _conversation(key="k1"), now=0.0, account_key="local", agent="reviewer")  # pragma: allowlist secret
+
+    changes = ledger.changes_since(conn, 0, 10)
+    row = conn.execute("SELECT id, agent, version, state FROM conversations WHERE key = 'k1'").fetchone()
+    assert ids.parse_id("conv", row["id"]) is not None
+    assert row["agent"] == "reviewer"
+    assert [(c.noun, c.kind, c.id) for c in changes] == [("conversations", "created", row["id"])]
+
+
+@pytest.mark.unit
+def test_an_account_with_no_character_selected_records_no_agent(tmp_path: Path) -> None:
+    """`None` is an answer — the neutral voice — not a missing value."""
+    conn = open_store(tmp_path / "c.db")
+
+    create(conn, _conversation(key="k1"), now=0.0, account_key="local")  # pragma: allowlist secret
+
+    assert conn.execute("SELECT agent FROM conversations WHERE key = 'k1'").fetchone()["agent"] is None
+
+
+@pytest.mark.unit
+def test_saving_an_existing_conversation_keeps_its_id_and_bumps_its_version(tmp_path: Path) -> None:
+    """The whole of "key immutable, id unique" in one assertion: a second
+    write must not mint a second identity for the same thing."""
+    conn = open_store(tmp_path / "c.db")
+    convo = _conversation(key="k1")
+    create(conn, convo, now=0.0, account_key="local", agent="reviewer")  # pragma: allowlist secret
+    before = conn.execute("SELECT id, created_at, agent FROM conversations WHERE key = 'k1'").fetchone()
+
+    save(conn, convo, now=0.0)
+
+    after = conn.execute("SELECT id, created_at, agent, version FROM conversations WHERE key = 'k1'").fetchone()
+    assert after["id"] == before["id"]
+    assert after["created_at"] == before["created_at"]
+    assert after["agent"] == before["agent"]
+    assert after["version"] == 2
+
+
+@pytest.mark.unit
+def test_saving_records_one_message_change_per_row_that_genuinely_landed(tmp_path: Path) -> None:
+    """A turn flushes repeatedly and the flushes overlap. Counting the input
+    would announce changes that did not happen."""
+    conn = open_store(tmp_path / "c.db")
+    convo = _conversation(key="k1", messages=(Message(role="user", content="one"),))
+    create(conn, convo, now=0.0, account_key="local")  # pragma: allowlist secret
+
+    grown = replace(convo, messages=(*convo.messages, Message(role="assistant", content="two")))
+    save(conn, grown, now=0.0)
+    save(conn, grown, now=0.0)  # the same history again: nothing new landed
+
+    message_changes = [c for c in ledger.changes_since(conn, 0, 50) if c.noun == "messages"]
+    assert len(message_changes) == 2
+    assert len({c.id for c in message_changes}) == 2
+
+
+@pytest.mark.unit
+def test_a_change_row_cannot_outlive_the_write_it_describes(tmp_path: Path) -> None:
+    """`create` raising on a duplicate key must leave nothing behind — not the
+    conversation row, and not the announcement of it."""
+    conn = open_store(tmp_path / "c.db")
+    create(conn, _conversation(key="k1"), now=0.0, account_key="local")  # pragma: allowlist secret
+    head = ledger.ledger_head(conn)
+
+    with pytest.raises(ConversationAlreadyExists):
+        create(conn, _conversation(key="k1"), now=0.0, account_key="local")  # pragma: allowlist secret
+
+    assert ledger.ledger_head(conn) == head
+
+
+@pytest.mark.unit
+def test_pausing_and_resuming_each_record_a_change_on_the_conversation(tmp_path: Path) -> None:
+    """A pause is not one of `ledger.NOUNS` and has no id; what an observer
+    needs to learn is that the conversation started and stopped waiting."""
+    conn = open_store(tmp_path / "c.db")
+    create(conn, _conversation(key="k1"), now=0.0, account_key="local")  # pragma: allowlist secret
+    head = ledger.ledger_head(conn)
+
+    save_pause(conn, conversation_key="k1", plugin="p", entry="e", node="n", trace=(), artifacts=())
+    delete_pause(conn, conversation_key="k1")
+
+    after = ledger.changes_since(conn, head, 10)
+    assert [(c.noun, c.kind) for c in after] == [("conversations", "changed"), ("conversations", "changed")]
+    assert [c.version for c in after] == [2, 3]
+
+
+@pytest.mark.unit
+def test_the_stored_timestamps_are_wall_clock_not_the_monotonic_now_threaded_in(tmp_path: Path) -> None:
+    """`client_surface` passes `time.monotonic()` as `now`, because that is
+    what a wall-clock budget needs. A timestamp two machines compare cannot
+    come from there (`console_fit_plan.md` §5(g))."""
+    conn = open_store(tmp_path / "c.db")
+
+    create(conn, _conversation(key="k1"), now=0.0, account_key="local")  # pragma: allowlist secret
+
+    created_at = conn.execute("SELECT created_at FROM conversations WHERE key = 'k1'").fetchone()["created_at"]
+    assert created_at > 1_700_000_000.0

@@ -37,7 +37,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import sqlite3
-import threading
 import time
 from dataclasses import dataclass, replace
 
@@ -51,6 +50,7 @@ from sadana import (
     observability,
     persona_store,
     plugin_dispatch,
+    plugin_install,
     plugin_manifest,
     plugins,
     stores,
@@ -71,44 +71,26 @@ from sadana.conversation import (
 
 logger = logging.getLogger(__name__)
 
-# Serializes every `take_turn` call against every other, and against a
-# caller's own direct `conn` touches (`scheduling.tick`).
-# `conversation_store.open_store()`'s docstring states its connection is safe
-# only "by one thread at a time, different call to call," and a channel
-# adapter built on `ThreadingHTTPServer` (`channel_webhook.py`) hands each
-# inbound request its own thread. Moved here from `gateway_dispatch.py`, where
-# it lived while that module was the only bridge.
+# H16 replaced this module's one process-wide lock with a lock per
+# conversation (`stores.conversation_lock`) and a write lock held only inside a
+# transaction (`conversation_store.write_txn`). The old one was held for a
+# whole turn — including the model round trip — so a second person's message,
+# and even a plain listing, waited behind somebody else's sentence. That is
+# correct for one person at a terminal and wrong for an organisation sharing a
+# box, which is what `docs/reference/console_fit_plan.md` §2.1 reverses.
 #
-# What a turn survives: two OS threads calling `take_turn` on the same
-# runtime (they serialize), and a scheduler tick landing mid-turn (same lock).
-# The model round trip is bounded (`SADANA_MODEL_ACCESS_TIMEOUT_S`), so it is
-# not an unbounded hold.
+# What this survives: two turns on two conversations in two threads, and a
+# reader listing conversations while a turn runs. What it does not: two turns
+# on one conversation on one event loop; a call node at its approval gate (H18
+# removes this).
 #
-# What it does not survive, and a client author has to know both:
-#  1. Two turns awaited concurrently on one event loop — this is a
-#     `threading.Lock`, so the second blocks the loop instead of yielding.
-#     Every caller today runs its own `asyncio.run`, and the terminal's loop
-#     has exactly one caller.
-#  2. A `call` node reaching its approval gate. `plugin_manifest`'s default
-#     `approve` blocks on `input()` with no timeout, and neither this module
-#     nor `gateway_dispatch` overrides it — so the lock is held until stdin
-#     answers. Harmless for a terminal (one caller, a real person at the
-#     prompt); in `cmd_gateway_run` one such message stalls every other
-#     webhook thread and the scheduler tick until it is answered, which in a
-#     service is never. Inherited from the bridge this module replaced, not
-#     introduced here, and not fixed here either: a non-interactive client
-#     needs a way to fail closed instead, which is a parameter this door does
-#     not have yet. Recorded in
-#     `docs/tasks/CLIENT-SURFACE-01-one-door-in/review.md`.
-#
-# ponytail: one module-level lock for the whole process, correct while there
-# is one store path per process. A second store path, or a caller that wants
-# two turns on one loop, is the signal for CLAUDE.md's own named upgrade —
-# refcounted per-path connections, the shape hermes-agent arrived at after
-# 11+ production incidents — not for a second lock beside this one.
-# Non-reentrant: a caller holding it must not call `take_turn` inside the
-# `with` block (`scheduling.tick` documents the same).
-conn_lock = threading.Lock()
+# The second of those is worth spelling out, because it is unchanged and still
+# bites: `plugin_manifest`'s default `approve` blocks on `input()` with no
+# timeout, so a `call` node reaching its gate holds its conversation's lock
+# until stdin answers. That is now one conversation rather than the whole
+# process — every other conversation keeps working — but for the conversation
+# itself, in a service, it is still forever. A non-interactive client needs a
+# way to fail closed, which is a parameter this door does not have yet.
 
 
 @dataclass(frozen=True)
@@ -138,11 +120,23 @@ class Runtime:
     store safe.
     """
 
-    conn: sqlite3.Connection
+    connections: stores.Connections
     plugin_set: plugin_dispatch.PluginSet
     provider: str
     model: str
     recorder: observability.Recorder
+
+    @property
+    def conn(self) -> sqlite3.Connection:
+        """The process's one writer.
+
+        A property rather than a field since H16, so that every caller written
+        against the old shape keeps working while the reader/writer split
+        arrives underneath them. A caller that only reads should ask for
+        `connections.reader()` instead and not queue behind a turn; a caller
+        inside a turn uses this, as before.
+        """
+        return self.connections.writer
 
 
 def open_runtime(*, provider: str | None = None, model: str | None = None) -> Runtime:
@@ -157,23 +151,40 @@ def open_runtime(*, provider: str | None = None, model: str | None = None) -> Ru
     idempotent and never overrides a live environment variable
     (`config.py:31`), so calling it twice costs nothing.
 
-    The returned `Runtime` owns an open connection. A client that should not
-    hold it for the life of the process closes it with
+    The returned `Runtime` owns open connections. A client that should not
+    hold them for the life of the process closes the writer with
     `contextlib.closing(runtime.conn)`; a daemon that runs until killed
-    (`cmd_gateway_run`) does not, exactly as before this module existed.
+    (`cmd_gateway_run`) does not, exactly as before this module existed. The
+    thread-local readers are deliberately not closeable as a set — see
+    `stores.Connections.reader`.
     """
     config.load_dotenv()
     builtin_seed.seed_all(plugins._plugins_root())
-    plugin_set = plugin_dispatch.build_plugin_set(plugin_manifest.discover_plugins())
-    conn = conversation_store.open_store(conversation_store.store_path_from_config())
-    stores.ensure_schemas(conn)
-    _adopt_scheduled_memories(conn)
+    # Connections first: its constructor ensures every schema and reconciles
+    # `plugin_state` against the directory that was just seeded, and
+    # `_enabled_plugin_set` reads that table to know what is switched off.
+    connections = stores.Connections(conversation_store.store_path_from_config())
+    _adopt_scheduled_memories(connections.writer)
     return Runtime(
-        conn=conn,
-        plugin_set=plugin_set,
+        connections=connections,
+        plugin_set=_enabled_plugin_set(connections.writer),
         provider=provider or config.env("SADANA_MODEL_ACCESS_PROVIDER", model_access.DEFAULT_PROVIDER),
         model=model or config.env("SADANA_MODEL_ACCESS_MODEL", model_access.DEFAULT_MODEL),
-        recorder=observability.make_recorder(conn),
+        recorder=observability.make_recorder(connections.writer),
+    )
+
+
+def _enabled_plugin_set(conn: sqlite3.Connection) -> plugin_dispatch.PluginSet:
+    """Every installed plugin except the ones somebody switched off.
+
+    The filter is here, at the one caller that has a store, rather than inside
+    `build_plugin_set` — which stays a function of its arguments and needs no
+    database. `plugin_install` owns `plugin_state` and answers which names are
+    disabled; this is the only place the two meet.
+    """
+    disabled = plugin_install.disabled_names(conn)
+    return plugin_dispatch.build_plugin_set(
+        p for p in plugin_manifest.discover_plugins() if p.manifest.name not in disabled
     )
 
 
@@ -242,7 +253,7 @@ def _create(
     now: float,
 ) -> Conversation:
     """Build and insert one new conversation. Lock-free: both callers already
-    hold `conn_lock`, which is non-reentrant.
+    hold the conversation's own lock, which is non-reentrant.
 
     The system message is composed from what is remembered about `account`
     right now (MEMORY-01), the recipe's voice from the character that same
@@ -258,15 +269,23 @@ def _create(
     Raises `conversation_store.ConversationAlreadyExists` if the name is
     taken; callers that mean get-or-create reach here only after a failed
     load."""
-    entries = memory_store.list_entries(runtime.conn, account)
-    override = memory_store.get_rubric_override(runtime.conn, account)
+    # Every read here goes through this thread's own read-only connection, not
+    # the writer. Sharing the writer for reads was H16's own defect, caught by
+    # its deploy review: a SQLite transaction belongs to a *connection*, so a
+    # read issued on the writer while another thread sits inside `write_txn`
+    # runs inside that thread's transaction and sees rows it may still roll
+    # back. The per-conversation lock does not help — it partitions
+    # `conversations`, and these tables are shared across every conversation an
+    # account has. A fact that never existed would otherwise be composed into a
+    # system prompt that is then byte-stable for the life of the conversation.
+    reader = runtime.connections.reader()
+    entries = memory_store.list_entries(reader, account)
+    override = memory_store.get_rubric_override(reader, account)
     convo, _template = create_conversation(
         ConversationTemplate(
             name=template_name,
             recipe=TemplateRecipe(
-                stable_prompt=persona_store.resolve_voice(
-                    runtime.conn, account, persona_store.characters_dir_from_config()
-                ),
+                stable_prompt=persona_store.resolve_voice(reader, account, persona_store.characters_dir_from_config()),
                 catalog=runtime.plugin_set.catalog,
                 tool_specs=runtime.plugin_set.tool_specs,
             ),
@@ -276,7 +295,19 @@ def _create(
         iteration_budget=iteration_budget_from_config(),
         wall_clock_budget=wall_clock_budget_from_config(now),
     )
-    conversation_store.create(runtime.conn, convo, now=now, account_key=account)
+    # The character's *name*, recorded beside the conversation at the one
+    # moment it is resolved (H16 requirement 6). `resolve_voice` already read
+    # the selection to render the text; this reads it again to store what it
+    # was called, because the rendered text is not something to store and the
+    # name is. Two indexed lookups where one would do, and the alternative is a
+    # function returning both halves for one caller.
+    conversation_store.create(
+        runtime.conn,
+        convo,
+        now=now,
+        account_key=account,
+        agent=persona_store.get_selection(reader, account),
+    )
     return convo
 
 
@@ -310,11 +341,11 @@ def open_conversation(
     This is the call that keeps the existence decision inside the door. The
     first cut of this work item left it in `subcommands/chat.py`, which
     probed the store directly — a client reaching around the door, outside
-    `conn_lock`, for the next client to copy.
+    any lock, for the next client to copy.
     """
-    with conn_lock:
+    with stores.conversation_lock(conversation):
         if template_name is None:
-            if not conversation_store.exists(runtime.conn, conversation):
+            if not conversation_store.exists(runtime.connections.reader(), conversation):
                 raise conversation_store.ConversationNotFound(conversation)
             return
         _create(
@@ -362,20 +393,27 @@ async def take_turn(
     never called, no turn happens, and the resumed text is appended as one new
     `assistant` message. This is the path `subcommands/chat.py` never had.
 
-    Serialized by this module's `conn_lock` for the whole turn — see its
-    comment for exactly what that survives. Assumes the `memory_store` schema
+    Serialized for the whole turn by *this conversation's* lock — see this
+    module's own comment above for exactly what that survives. Another
+    conversation's turn runs at the same time; a reader waits for neither.
+
+    Reads go through this thread's own read-only connection and writes through
+    the process's one writer. That split is not an optimisation: a SQLite
+    transaction belongs to a connection, so reading on the writer while another
+    thread is inside `write_txn` reads *that thread's uncommitted rows*. See
+    `_create` for the case that made it concrete. Assumes the `memory_store` schema
     is already present on `runtime.conn`; `open_runtime()` ensures it once,
     and a caller that hand-builds a `Runtime` (this module's own tests) owns
     that setup itself.
     """
-    with conn_lock:
+    with stores.conversation_lock(conversation):
         conn = runtime.conn
         now = time.monotonic()
 
-        pause = conversation_store.load_pause(conn, conversation_key=conversation)
+        pause = conversation_store.load_pause(runtime.connections.reader(), conversation_key=conversation)
         if pause is not None:
             resumed = await plugin_dispatch.resume_paused_run(conn, conversation, text)
-            convo = conversation_store.load(conn, conversation, now=now)
+            convo = conversation_store.load(runtime.connections.reader(), conversation, now=now)
             messages, _msg_key = append(conversation, convo.messages, Message(role="assistant", content=resumed.text))
             await asyncio.to_thread(conversation_store.save, conn, replace(convo, messages=messages), now=now)
             return TurnOutcome(
@@ -385,7 +423,7 @@ async def take_turn(
             )
 
         try:
-            convo = conversation_store.load(conn, conversation, now=now)
+            convo = conversation_store.load(runtime.connections.reader(), conversation, now=now)
         except conversation_store.ConversationNotFound:
             if create_as is None:
                 raise

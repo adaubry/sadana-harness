@@ -11,7 +11,7 @@ import pytest
 
 from conftest import conversation as build_conversation
 from conftest import open_conn, write_character
-from sadana import conversation_store, memory_store, persona, persona_store, stores
+from sadana import conversation_store, ledger, memory_store, persona, persona_store, stores
 from sadana.persona import CharacterError
 
 
@@ -198,3 +198,92 @@ def test_known_accounts_unions_the_three_sources_without_duplicating(conn: sqlit
 @pytest.mark.unit
 def test_account_exists_is_false_for_a_name_nothing_has_used(conn: sqlite3.Connection) -> None:
     assert persona_store.account_exists(conn, "nobody") is False
+
+
+# ── H16: the selections ledger and the agents index ────────────────────────
+
+
+@pytest.mark.unit
+def test_selecting_and_clearing_a_character_record_changes(conn: sqlite3.Connection) -> None:
+    persona_store.set_selection(conn, "a1", "reviewer", now=1.0)
+    persona_store.set_selection(conn, "a1", "pirate", now=2.0)
+    selection_id = conn.execute("SELECT id FROM persona_selections").fetchone()["id"]
+
+    persona_store.clear_selection(conn, "a1")
+
+    changes = [c for c in ledger.changes_since(conn, 0, 20) if c.id == selection_id]
+    assert [c.kind for c in changes] == ["created", "changed", "deleted"]
+
+
+@pytest.mark.unit
+def test_reconciling_indexes_a_character_that_appeared(conn: sqlite3.Connection, tmp_path: Path) -> None:
+    characters_dir = tmp_path / "characters"
+    write_character("reviewer", characters_dir=characters_dir)
+
+    persona_store.reconcile_agents(conn, characters_dir)
+
+    row = conn.execute("SELECT id, name, version, state FROM agents").fetchone()
+    assert (row["name"], row["version"], row["state"]) == ("reviewer", 1, "active")
+    assert [(c.noun, c.kind, c.id) for c in ledger.changes_since(conn, 0, 10)] == [("agents", "created", row["id"])]
+
+
+@pytest.mark.unit
+def test_reconciling_an_unchanged_character_announces_nothing(conn: sqlite3.Connection, tmp_path: Path) -> None:
+    """The common case — every open, every character, no change. A
+    reconciliation that announced itself would drown the ledger in news about
+    nothing."""
+    characters_dir = tmp_path / "characters"
+    write_character("reviewer", characters_dir=characters_dir)
+    persona_store.reconcile_agents(conn, characters_dir)
+    head = ledger.ledger_head(conn)
+
+    persona_store.reconcile_agents(conn, characters_dir)
+
+    assert ledger.ledger_head(conn) == head
+
+
+@pytest.mark.unit
+def test_reconciling_an_edited_character_bumps_its_version(conn: sqlite3.Connection, tmp_path: Path) -> None:
+    """By content hash, not modification time: a file restored from a backup
+    has an old mtime and new bytes."""
+    characters_dir = tmp_path / "characters"
+    write_character("reviewer", characters_dir=characters_dir)
+    persona_store.reconcile_agents(conn, characters_dir)
+    before = conn.execute("SELECT id, content_sha256 FROM agents").fetchone()
+
+    write_character("reviewer", body="You read the tests first.", characters_dir=characters_dir)
+    persona_store.reconcile_agents(conn, characters_dir)
+
+    after = conn.execute("SELECT id, content_sha256, version FROM agents").fetchone()
+    assert after["id"] == before["id"]
+    assert after["content_sha256"] != before["content_sha256"]
+    assert after["version"] == 2
+    assert ledger.changes_since(conn, 0, 10)[-1].kind == "changed"
+
+
+@pytest.mark.unit
+def test_reconciling_a_vanished_character_tombstones_it(conn: sqlite3.Connection, tmp_path: Path) -> None:
+    characters_dir = tmp_path / "characters"
+    path = write_character("reviewer", characters_dir=characters_dir)
+    persona_store.reconcile_agents(conn, characters_dir)
+    agent_id = conn.execute("SELECT id FROM agents").fetchone()["id"]
+
+    path.unlink()
+    persona_store.reconcile_agents(conn, characters_dir)
+
+    assert conn.execute("SELECT COUNT(*) FROM agents").fetchone()[0] == 0
+    last = ledger.changes_since(conn, 0, 10)[-1]
+    assert (last.kind, last.id) == ("deleted", agent_id)
+
+
+@pytest.mark.unit
+def test_a_character_that_does_not_parse_gets_no_row(conn: sqlite3.Connection, tmp_path: Path) -> None:
+    """Matching `list_characters`' own posture: a half-written file is not yet
+    a character, and a row would put it in front of the console as one."""
+    characters_dir = tmp_path / "characters"
+    characters_dir.mkdir(parents=True)
+    (characters_dir / "broken.md").write_text("no front matter here", encoding="utf-8")
+
+    persona_store.reconcile_agents(conn, characters_dir)
+
+    assert conn.execute("SELECT COUNT(*) FROM agents").fetchone()[0] == 0

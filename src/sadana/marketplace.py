@@ -25,12 +25,13 @@ from __future__ import annotations
 import json
 import sqlite3
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
-from sadana import plugin_install, plugin_manifest, plugins
-from sadana.conversation_store import write_txn
+from sadana import ids, ledger, plugin_install, plugin_manifest, plugins
+from sadana.conversation_store import fill_legacy_identity, migrate_columns, write_txn
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS marketplace_releases (
@@ -43,16 +44,31 @@ CREATE TABLE IF NOT EXISTS marketplace_releases (
     reason         TEXT,
     submitted_at   REAL NOT NULL,
     decided_at     REAL,
+    -- H16.
+    id             TEXT,
+    updated_at     REAL,
+    version        INTEGER NOT NULL DEFAULT 1,
     PRIMARY KEY (plugin_name, tag)
 );
 """
+
+#: See `conversation_store._MIGRATED_COLUMNS`.
+_MIGRATED_COLUMNS: dict[str, tuple[tuple[str, str], ...]] = {
+    "marketplace_releases": (
+        ("id", "TEXT"),
+        ("updated_at", "REAL"),
+        ("version", "INTEGER NOT NULL DEFAULT 1"),
+    ),
+}
 
 
 def _ensure_schema(conn: sqlite3.Connection) -> None:
     """Idempotent, the same posture `plugin_install._ensure_schema()` and
     `observability.make_recorder()` already take on this same
-    connection."""
+    connection. H16 added three columns, which is what the map is for."""
     conn.executescript(_SCHEMA)
+    migrate_columns(conn, _MIGRATED_COLUMNS)
+    fill_legacy_identity(conn, "marketplace_releases", "plg", time_columns=("updated_at",))
 
 
 @dataclass(frozen=True)
@@ -174,14 +190,17 @@ def _insert_release(
     now: float,
 ) -> bool:
     """`False` (nothing written) if `(plugin_name, tag)` already has a row."""
+    at = time.time()
+    release_id = ids.make_id("plg")
     try:
         with write_txn(conn) as c:
             c.execute(
                 "INSERT INTO marketplace_releases "
-                "(plugin_name, tag, repo_url, revision, manifest_json, status, reason, submitted_at, decided_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)",
-                (plugin_name, tag, repo_url, revision, manifest_json, status, reason, now),
+                "(plugin_name, tag, repo_url, revision, manifest_json, status, reason, submitted_at, decided_at, "
+                "id, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)",
+                (plugin_name, tag, repo_url, revision, manifest_json, status, reason, now, release_id, at),
             )
+            ledger.record_change(c, noun="plugins", id=release_id, kind="created", state=status, version=1, at=at)
     except sqlite3.IntegrityError:
         return False
     return True
@@ -216,6 +235,8 @@ def _claim_release(
     name. `BEGIN IMMEDIATE` takes SQLite's write lock at the database
     level, not just within this connection, so a second connection's own
     `BEGIN IMMEDIATE` blocks until this one commits or rolls back."""
+    at = time.time()
+    release_id = ids.make_id("plg")
     try:
         with write_txn(conn) as c:
             owning = _owning_repo_url(c, plugin_name)
@@ -223,10 +244,11 @@ def _claim_release(
                 raise _NameConflict(owning)
             c.execute(
                 "INSERT INTO marketplace_releases "
-                "(plugin_name, tag, repo_url, revision, manifest_json, status, reason, submitted_at, decided_at) "
-                "VALUES (?, ?, ?, ?, ?, 'pending', NULL, ?, NULL)",
-                (plugin_name, tag, repo_url, revision, manifest_json, now),
+                "(plugin_name, tag, repo_url, revision, manifest_json, status, reason, submitted_at, decided_at, "
+                "id, updated_at) VALUES (?, ?, ?, ?, ?, 'pending', NULL, ?, NULL, ?, ?)",
+                (plugin_name, tag, repo_url, revision, manifest_json, now, release_id, at),
             )
+            ledger.record_change(c, noun="plugins", id=release_id, kind="created", state="pending", version=1, at=at)
     except _NameConflict as exc:
         return NameOwnedByAnotherRepo(plugin_name=plugin_name, owning_repo_url=exc.owning_repo_url)
     except sqlite3.IntegrityError:
@@ -304,12 +326,27 @@ def decide(
     if row["status"] != "pending":
         return AlreadyDecided(plugin_name=plugin_name, tag=tag, status=row["status"])
 
+    at = time.time()
     with write_txn(conn) as c:
         c.execute(
-            "UPDATE marketplace_releases SET status = ?, reason = ?, decided_at = ? "
-            "WHERE plugin_name = ? AND tag = ?",
-            (decision, reason, now, plugin_name, tag),
+            "UPDATE marketplace_releases SET status = ?, reason = ?, decided_at = ?, updated_at = ?, "
+            "version = version + 1 WHERE plugin_name = ? AND tag = ?",
+            (decision, reason, now, at, plugin_name, tag),
         )
+        decided = c.execute(
+            "SELECT id, status, version FROM marketplace_releases WHERE plugin_name = ? AND tag = ?",
+            (plugin_name, tag),
+        ).fetchone()
+        if decided["id"] is not None:
+            ledger.record_change(
+                c,
+                noun="plugins",
+                id=decided["id"],
+                kind="changed",
+                state=decided["status"],
+                version=decided["version"],
+                at=at,
+            )
     return Decided(plugin_name=plugin_name, tag=tag, status=decision)
 
 

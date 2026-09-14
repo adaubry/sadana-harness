@@ -12,7 +12,7 @@ import pytest
 from conftest import (
     make_runtime,
     never_send,
-    open_conn,
+    open_connections,
     plain_response,
     tool_call_response,
     tool_then_text,
@@ -20,7 +20,18 @@ from conftest import (
     write_skill,
 )
 from conftest import wait_then_summarize_installed as _wait_then_summarize_installed
-from sadana import client_surface, memory_store, model_access, persona, persona_store, plugin_dispatch, plugins
+from sadana import (
+    client_surface,
+    conversation_store,
+    memory_store,
+    model_access,
+    persona,
+    persona_store,
+    plugin_dispatch,
+    plugin_install,
+    plugins,
+    stores,
+)
 from sadana.client_surface import open_conversation, open_runtime, take_turn
 from sadana.conversation import (
     ConversationTemplate,
@@ -83,9 +94,10 @@ def test_take_turn_creates_the_conversation_under_the_template_name_it_is_given(
     observable — `sadana conversations` prints it and searches it — and there
     is no way to ask for creation without saying what to call the thing."""
     monkeypatch.setattr(model_access, "send", lambda request: plain_response("reply"))
-    conn = open_conn()
+    connections = open_connections()
+    conn = connections.writer
 
-    asyncio.run(take_turn(make_runtime(conn), account="a", conversation="k-new", text="hi", create_as="chat"))
+    asyncio.run(take_turn(make_runtime(connections), account="a", conversation="k-new", text="hi", create_as="chat"))
 
     assert load(conn, "k-new", now=0.0).template_name == "chat"
 
@@ -97,8 +109,9 @@ def test_take_turn_refuses_an_unknown_conversation_when_create_as_is_none(monkey
     *turn* outcome comes back as a value."""
 
     monkeypatch.setattr(model_access, "send", never_send)
-    conn = open_conn()
-    runtime = make_runtime(conn)
+    connections = open_connections()
+    conn = connections.writer
+    runtime = make_runtime(connections)
 
     with pytest.raises(ConversationNotFound):
         asyncio.run(take_turn(runtime, account="a", conversation="k-missing", text="hi", create_as=None))
@@ -115,9 +128,10 @@ def test_open_conversation_with_a_template_name_creates_it_before_any_turn() -> 
     """A terminal shows a prompt before it has a line to send, so the
     conversation exists from the moment the client starts — with no messages
     and no turns taken."""
-    conn = open_conn()
+    connections = open_connections()
+    conn = connections.writer
 
-    open_conversation(make_runtime(conn), account="a", conversation="k-started", template_name="chat")
+    open_conversation(make_runtime(connections), account="a", conversation="k-started", template_name="chat")
 
     started = load(conn, "k-started", now=0.0)
     assert (started.template_name, started.messages, started.next_turn_seq) == ("chat", (), 0)
@@ -127,8 +141,8 @@ def test_open_conversation_with_a_template_name_creates_it_before_any_turn() -> 
 def test_open_conversation_refuses_a_name_that_is_already_taken() -> None:
     """`sadana chat --key NAME` means "a new one, called this". The door says
     so rather than silently continuing someone's existing conversation."""
-    conn = open_conn()
-    runtime = make_runtime(conn)
+    connections = open_connections()
+    runtime = make_runtime(connections)
     open_conversation(runtime, account="a", conversation="k-taken", template_name="chat")
 
     with pytest.raises(ConversationAlreadyExists):
@@ -139,8 +153,8 @@ def test_open_conversation_refuses_a_name_that_is_already_taken() -> None:
 def test_open_conversation_with_no_template_name_requires_it_to_exist() -> None:
     """`--resume KEY` means "this one already exists", and has to fail before
     a prompt appears rather than after the person has typed a line."""
-    conn = open_conn()
-    runtime = make_runtime(conn)
+    connections = open_connections()
+    runtime = make_runtime(connections)
 
     with pytest.raises(ConversationNotFound):
         open_conversation(runtime, account="a", conversation="k-absent", template_name=None)
@@ -155,9 +169,11 @@ def test_open_conversation_with_no_template_name_requires_it_to_exist() -> None:
 @pytest.mark.unit
 def test_a_completed_turn_reports_ok_with_its_text_as_the_answer(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(model_access, "send", lambda request: plain_response("reply"))
-    conn = open_conn()
+    connections = open_connections()
 
-    outcome = asyncio.run(take_turn(make_runtime(conn), account="a", conversation="k-ok", text="hi", create_as="chat"))
+    outcome = asyncio.run(
+        take_turn(make_runtime(connections), account="a", conversation="k-ok", text="hi", create_as="chat")
+    )
 
     assert outcome.ok is True
     assert outcome.answer == "reply"
@@ -175,7 +191,8 @@ def test_a_non_completed_turn_still_carries_its_own_text_in_answer(monkeypatch: 
     Also the `create_as=None` path over a conversation that does exist.
     """
     monkeypatch.setattr(model_access, "send", lambda request: plain_response("here is what we did"))
-    conn = open_conn()
+    connections = open_connections()
+    conn = connections.writer
     exhausted, _template = create_conversation(
         ConversationTemplate(name="chat", recipe=TemplateRecipe(stable_prompt="p", catalog=(), tool_specs=())),
         "k-exhausted",
@@ -185,7 +202,7 @@ def test_a_non_completed_turn_still_carries_its_own_text_in_answer(monkeypatch: 
     create(conn, exhausted, now=0.0, account_key="a1")  # pragma: allowlist secret
 
     outcome = asyncio.run(
-        take_turn(make_runtime(conn), account="a", conversation="k-exhausted", text="hi", create_as=None)
+        take_turn(make_runtime(connections), account="a", conversation="k-exhausted", text="hi", create_as=None)
     )
 
     assert outcome.ok is False
@@ -204,12 +221,15 @@ def test_take_turn_recalls_the_account_it_was_given_and_no_other(monkeypatch: py
     memories, which must not leak into a turn that named someone else."""
     monkeypatch.setattr(model_access, "send", lambda request: plain_response("reply"))
     monkeypatch.setenv("SADANA_MEMORY_ACCOUNT", "someone-else")
-    conn = open_conn()
+    connections = open_connections()
+    conn = connections.writer
     memory_store.ensure_schema(conn)
     memory_store.write_entry(conn, "stated", "dog_name", "Their dog is named Buddy.", now=0.0)
     memory_store.write_entry(conn, "someone-else", "cat_name", "Their cat is named Smudge.", now=0.0)
 
-    asyncio.run(take_turn(make_runtime(conn), account="stated", conversation="k-acct", text="hi", create_as="chat"))
+    asyncio.run(
+        take_turn(make_runtime(connections), account="stated", conversation="k-acct", text="hi", create_as="chat")
+    )
 
     system_prompt = load(conn, "k-acct", now=0.0).system_prompt
     assert "Their dog is named Buddy." in system_prompt
@@ -232,8 +252,9 @@ def test_a_paused_run_is_persisted_and_the_next_turn_resumes_it_without_the_mode
     this is the behaviour that replaces it for every client at once."""
     installed = _wait_then_summarize_installed(tmp_path)
     monkeypatch.setattr(plugins, "_plugins_root", lambda: tmp_path)
-    conn = open_conn()
-    runtime = make_runtime(conn, plugin_set=plugin_dispatch.build_plugin_set((installed,)))
+    connections = open_connections()
+    conn = connections.writer
+    runtime = make_runtime(connections, plugin_set=plugin_dispatch.build_plugin_set((installed,)))
 
     monkeypatch.setattr(model_access, "send", tool_then_text())
     first = asyncio.run(take_turn(runtime, account="a", conversation="k-pause", text="start it", create_as="chat"))
@@ -280,36 +301,44 @@ class _RecordingLock:
 
 
 @pytest.mark.unit
-def test_two_threads_taking_a_turn_on_one_runtime_serialize(monkeypatch: pytest.MonkeyPatch) -> None:
-    """`conversation_store.open_store()` passes `check_same_thread=False` so one
-    connection can be used from more than one thread, and its own docstring is
-    explicit that it is still only safe "by one thread at a time". A webhook
-    served by `ThreadingHTTPServer` gives every request its own thread, so this
-    is the real condition, not a hypothetical.
+def test_two_threads_taking_a_turn_on_one_conversation_serialize(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Two turns on **one** conversation still take it in turns, and must.
 
-    The two threads are released together by a `threading.Barrier` and the model
-    stub holds the critical section open long enough that an unserialized pair
-    would overlap. `max_held_at_once == 1` is an invariant, not a timing
-    assumption: it cannot fail unless an overlap genuinely happened.
+    A conversation is a sequence. Two turns run into it at once would
+    interleave a history rather than share it, so this is the half of the old
+    process-wide lock that H16 keeps — narrowed from the whole box to the one
+    conversation being written.
+
+    The two threads are released together by a `threading.Barrier` and the
+    model stub holds the critical section open long enough that an
+    unserialized pair would overlap. `max_held_at_once == 1` is an invariant,
+    not a timing assumption: it cannot fail unless an overlap genuinely
+    happened.
     """
     recording_lock = _RecordingLock()
-    monkeypatch.setattr(client_surface, "conn_lock", recording_lock)
-    conn = open_conn()
-    runtime = make_runtime(conn)
-    start = threading.Barrier(2)
+    # Module state, so it is put back: `_conversation_locks` is deliberately
+    # never evicted, and a test that seeded it would otherwise leak a lock into
+    # every test that runs after it in this process.
+    monkeypatch.setitem(stores._conversation_locks, "k-shared", recording_lock)  # type: ignore[arg-type]
+    connections = open_connections()
+    conn = connections.writer
+    runtime = make_runtime(connections)
+    start_barrier = threading.Barrier(2)
 
     def _slow_send(_request: object) -> model_access.Response:
         time.sleep(0.05)  # wide enough that two unserialized turns would overlap
         return plain_response("reply")
 
     monkeypatch.setattr(model_access, "send", _slow_send)
-    outcomes: dict[str, client_surface.TurnOutcome] = {}
+    outcomes: list[client_surface.TurnOutcome] = []
 
-    def _turn(key: str) -> None:
-        start.wait(timeout=5)
-        outcomes[key] = asyncio.run(take_turn(runtime, account="a", conversation=key, text="hi", create_as="chat"))
+    def _turn() -> None:
+        start_barrier.wait(timeout=5)
+        outcomes.append(
+            asyncio.run(take_turn(runtime, account="a", conversation="k-shared", text="hi", create_as="chat"))
+        )
 
-    threads = [threading.Thread(target=_turn, args=(key,)) for key in ("k-thread-a", "k-thread-b")]
+    threads = [threading.Thread(target=_turn) for _ in range(2)]
     for thread in threads:
         thread.start()
     for thread in threads:
@@ -318,35 +347,42 @@ def test_two_threads_taking_a_turn_on_one_runtime_serialize(monkeypatch: pytest.
 
     assert recording_lock.acquisitions == 2
     assert recording_lock.max_held_at_once == 1
-    assert [o.ok for o in outcomes.values()] == [True, True]
-    assert load(conn, "k-thread-a", now=0.0).next_turn_seq == 1
-    assert load(conn, "k-thread-b", now=0.0).next_turn_seq == 1
+    assert [o.ok for o in outcomes] == [True, True]
+    assert load(conn, "k-shared", now=0.0).next_turn_seq == 2
 
 
 @pytest.mark.unit
-def test_a_turn_holds_the_connection_lock_while_it_runs_and_releases_it_after(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """`conversation_store.open_store()`'s connection is safe for one thread
-    at a time and `channel_webhook.py` hands every request its own thread, so
-    the whole turn is serialized. Proven from inside the turn rather than with
-    a substituted lock: the model call happens mid-turn, so the lock must be
-    held at that moment and free once the call returns. This proves the
-    wiring, not real concurrency — the same thing `test_scheduling.py`'s own
-    lock test says about itself."""
-    held: list[bool] = []
+def test_a_turn_holds_only_its_own_conversations_lock(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The whole of H16's concurrency change, stated in one assertion.
+
+    Proven from inside the turn, at the moment the model is being called —
+    which is the moment that used to hold the entire process still. This
+    conversation's lock is held; another conversation's is free, so a second
+    person's turn could start right then. `test_store_concurrency.py` proves
+    that one actually does.
+    """
+    observed: list[tuple[bool, bool]] = []
 
     def _send(_request: object) -> model_access.Response:
-        held.append(client_surface.conn_lock.locked())
+        observed.append((stores.conversation_lock("k-lock").locked(), stores.conversation_lock("k-other").locked()))
         return plain_response("reply")
 
     monkeypatch.setattr(model_access, "send", _send)
-    conn = open_conn()
+    connections = open_connections()
 
-    asyncio.run(take_turn(make_runtime(conn), account="a", conversation="k-lock", text="hi", create_as="chat"))
+    asyncio.run(take_turn(make_runtime(connections), account="a", conversation="k-lock", text="hi", create_as="chat"))
 
-    assert held == [True]
-    assert client_surface.conn_lock.locked() is False
+    assert observed == [(True, False)]
+    assert stores.conversation_lock("k-lock").locked() is False
+
+
+@pytest.mark.unit
+def test_the_same_conversation_name_always_gets_the_same_lock() -> None:
+    """Addressed by name, never by holding the object: a second caller asking
+    for the same conversation must get the lock the first one is holding, or
+    they are not excluding each other at all."""
+    assert stores.conversation_lock("k-a") is stores.conversation_lock("k-a")
+    assert stores.conversation_lock("k-a") is not stores.conversation_lock("k-b")
 
 
 # ── PERSONA-01: the voice belongs to the account, the conversation keeps it ──
@@ -442,8 +478,9 @@ def test_a_child_turn_speaks_the_conversations_voice_not_the_current_selection(
             ),
         ),
     )
-    conn = open_conn()
-    runtime = make_runtime(conn, plugin_set=plugin_dispatch.build_plugin_set((installed,)))
+    connections = open_connections()
+    conn = connections.writer
+    runtime = make_runtime(connections, plugin_set=plugin_dispatch.build_plugin_set((installed,)))
     persona_store.set_selection(conn, "a1", "working", now=0.0)
 
     asyncio.run(take_turn(runtime, account="a1", conversation="c1", text="hi", create_as="chat"))
@@ -474,3 +511,37 @@ def test_a_conversation_row_written_before_stable_prompt_len_still_answers(monke
 
     assert outcome.ok is True
     assert outcome.answer == "reply"
+
+
+@pytest.mark.unit
+def test_a_disabled_plugin_is_not_offered_to_the_model(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The production path, not a composition a test wrote for itself.
+
+    H16's deploy review found the disabled-plugin exclusion covered only by a
+    test that re-implemented the filter inline, leaving
+    `_enabled_plugin_set` — the one caller that actually runs — untested. This
+    drives that function and asserts the plugin reaches neither the catalog
+    the model reads nor the tools it may call.
+    """
+    plugins_root = tmp_path / "plugins"
+    for name in ("keeper", "switched-off"):
+        directory = plugins_root / name
+        directory.mkdir(parents=True)
+        (directory / "s.json").write_text('{"type": "object"}')
+        (directory / "plugin.toml").write_text(
+            f'[plugin]\nname = "{name}"\nversion = "0.1.0"\ndescription = "d"\n\n'
+            f'[[entry]]\ntool = "{name.replace("-", "_")}_tool"\npurpose = "p"\n'
+            'parameters = "s.json"\nstart = "a"\n\n'
+            '[[node]]\nname = "a"\nkind = "stop"\n'
+        )
+    monkeypatch.setattr(plugins, "_plugins_root", lambda: plugins_root)
+    connections = open_connections()
+    plugin_install.reconcile_plugin_state(connections.writer, plugins_root)
+    with conversation_store.write_txn(connections.writer) as c:
+        c.execute("UPDATE plugin_state SET state = 'disabled' WHERE name = 'switched-off'")
+
+    plugin_set = client_surface._enabled_plugin_set(connections.writer)
+
+    assert [entry.name for entry in plugin_set.catalog] == ["keeper"]
+    assert [spec.name for spec in plugin_set.tool_specs] == ["keeper_tool"]
+    assert "switched_off_tool" not in plugin_set.by_tool

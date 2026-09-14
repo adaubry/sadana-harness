@@ -18,8 +18,10 @@ from sadana import (
     conversation_store,
     model_access,
     plugin_dispatch,
+    plugin_install,
     plugin_manifest,
     plugins,
+    stores,
 )
 from sadana.conversation import (
     Conversation,
@@ -34,6 +36,7 @@ from sadana.conversation import (
     build_surface,
     create_conversation,
 )
+from sadana.conversation_store import write_txn
 from sadana.memory_store import DispatchContext
 from sadana.plugin_dispatch import ChildSeqTracker, PluginSet, build_dispatch, build_plugin_set, take_turn_and_reconcile
 from sadana.plugins import Entry, InstalledPlugin, Manifest, Node
@@ -818,3 +821,63 @@ def test_a_pause_records_the_same_sequence_number_its_directory_was_named_from(
         assert directory == artifact_store.for_run("c1", turn_key.turn_seq, seq_in_turn)
     # And the two runs really did differ, so the check above is not vacuous.
     assert persisted[0][1] != persisted[1][1]
+
+
+# ── H16: a plugin somebody switched off is not offered to the model ────────
+
+
+def _one_plugin(tmp_path: Path, name: str) -> InstalledPlugin:
+    plugin_dir = tmp_path / name
+    _write_schema(plugin_dir)
+    return InstalledPlugin(
+        name=name,
+        directory=plugin_dir,
+        manifest=Manifest(
+            name=name,
+            version="0.1.0",
+            description="d",
+            entries=(Entry(tool=f"{name}_tool", purpose="Does it.", parameters="s.json", start="a"),),
+            nodes=(Node(name="a", kind="stop"),),
+        ),
+    )
+
+
+@pytest.mark.unit
+def test_a_disabled_plugin_contributes_no_catalog_line_and_no_tool(tmp_path: Path) -> None:
+    """Not merely hidden from the catalog: the tool spec goes too, so the
+    model is never told a tool exists that it must not call. H24 adds the verb
+    that writes `disabled`; the enforcement is here now so H24 cannot ship the
+    verb without it."""
+    conn = open_conn()
+    stores.ensure_schemas(conn)
+    installed = [_one_plugin(tmp_path, "plugin-on"), _one_plugin(tmp_path, "plugin-off")]
+    with write_txn(conn) as c:
+        c.execute(
+            "INSERT INTO plugin_state (name, id, state, installed_at, updated_at) "
+            "VALUES ('plugin-off', 'plg_x', 'disabled', 0.0, 0.0)"
+        )
+
+    disabled = plugin_install.disabled_names(conn)
+    plugin_set = build_plugin_set(p for p in installed if p.manifest.name not in disabled)
+
+    assert [entry.name for entry in plugin_set.catalog] == ["plugin-on"]
+    assert [spec.name for spec in plugin_set.tool_specs] == ["plugin-on_tool"]
+    assert "plugin-off_tool" not in plugin_set.by_tool
+
+
+@pytest.mark.unit
+def test_build_plugin_set_needs_no_store_at_all(tmp_path: Path) -> None:
+    """It is a function of its arguments. Three scripts assemble a plugin set
+    from a temporary directory with no database in sight, and the caller that
+    does have one filters before calling."""
+    plugin_set = build_plugin_set([_one_plugin(tmp_path, "plugin-on")])
+
+    assert [entry.name for entry in plugin_set.catalog] == ["plugin-on"]
+
+
+@pytest.mark.unit
+def test_a_store_with_no_plugin_state_table_disables_nothing() -> None:
+    """A connection whose schemas were never ensured must not lose every tool.
+    Failing closed here would turn a setup omission into a silent, total loss
+    of capability."""
+    assert plugin_install.disabled_names(open_conn()) == frozenset()

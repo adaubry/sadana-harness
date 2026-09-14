@@ -93,7 +93,19 @@ def build_plugin_set(installed: Iterable[plugins.InstalledPlugin]) -> PluginSet:
     `conversation.build_surface` already raises `DuplicateToolError` on
     exactly that, the moment a template's recipe becomes a real
     conversation, before any dispatch call could ever observe `by_tool`'s
-    version of events."""
+    version of events.
+
+    Takes values, not a database. H16 needs a plugin somebody switched off to
+    contribute no catalog line and no tool, and the first cut did that with an
+    optional `conn` here — which meant this module hard-coding another module's
+    table and column names, with nothing checking the two stayed true, and
+    swallowing an `OperationalError` to keep the callers that have no store
+    working. The filtering belongs where the knowledge is: `plugin_install`
+    owns `plugin_state` and answers `disabled_names()`, and
+    `client_surface.open_runtime` — the one caller that has a store — filters
+    before calling this. The three script callers pass what they have and this
+    function stays a function of its arguments.
+    """
     catalog = []
     tool_specs = []
     by_tool: dict[str, tuple[plugins.InstalledPlugin, plugins.Entry]] = {}

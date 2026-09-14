@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from conftest import make_runtime, plain_response
+from conftest import make_runtime, open_connections, plain_response
 from conftest import wait_then_summarize_installed as _wait_then_summarize_installed
 from sadana import channel_webhook, memory_store, model_access, plugin_dispatch, plugins
 from sadana.conversation import ConversationTemplate, IterationBudget, TemplateRecipe, create_conversation
@@ -17,9 +17,7 @@ from sadana.conversation_store import (
     create,
     load,
     load_pause,
-    open_store,
     save_pause,
-    store_path_from_config,
 )
 from sadana.gateway import MessageEvent
 from sadana.gateway_dispatch import handle_inbound
@@ -32,14 +30,16 @@ def test_handle_inbound_continues_the_same_conversation_across_calls(monkeypatch
     responses = iter([plain_response("first reply"), plain_response("second reply")])
     monkeypatch.setattr(model_access, "send", lambda request: next(responses))
 
-    conn = open_store(store_path_from_config())
+    connections = open_connections()
+
+    conn = connections.writer
     event = MessageEvent(platform="webhook", chat_id="chat-1", thread_id=None, text="hello")
 
-    ok1, text1 = asyncio.run(handle_inbound(make_runtime(conn), event))
+    ok1, text1 = asyncio.run(handle_inbound(make_runtime(connections), event))
     assert ok1 is True
     assert text1 == "first reply"
 
-    ok2, text2 = asyncio.run(handle_inbound(make_runtime(conn), event))
+    ok2, text2 = asyncio.run(handle_inbound(make_runtime(connections), event))
     assert ok2 is True
     assert text2 == "second reply"
 
@@ -59,10 +59,12 @@ def test_handle_inbound_records_the_turn(monkeypatch: pytest.MonkeyPatch) -> Non
     `plugin_dispatch` layer."""
     monkeypatch.setattr(model_access, "send", lambda request: plain_response("reply"))
 
-    conn = open_store(store_path_from_config())
+    connections = open_connections()
+
+    conn = connections.writer
     event = MessageEvent(platform="webhook", chat_id="chat-2", thread_id=None, text="hello")
 
-    asyncio.run(handle_inbound(make_runtime(conn), event))
+    asyncio.run(handle_inbound(make_runtime(connections), event))
 
     row = conn.execute(
         "SELECT * FROM turn_runs WHERE conversation_key = ? AND turn_seq = 0", ("webhook:chat-2",)
@@ -81,13 +83,14 @@ def test_handle_inbound_shares_recall_across_threads_of_the_same_account(monkeyp
     account (`memory.account_key_for` does not) — both must recall the same
     stored entry."""
     monkeypatch.setattr(model_access, "send", lambda request: plain_response("reply"))
-    conn = open_store(store_path_from_config())
+    connections = open_connections()
+    conn = connections.writer
     memory_store.ensure_schema(conn)
     memory_store.write_entry(conn, "webhook:chat-3", "dog_name", "Their dog is named Buddy.", now=0.0)
 
     for thread_id in ("thread-a", "thread-b"):
         event = MessageEvent(platform="webhook", chat_id="chat-3", thread_id=thread_id, text="hi")
-        asyncio.run(handle_inbound(make_runtime(conn), event))
+        asyncio.run(handle_inbound(make_runtime(connections), event))
         loaded = load(conn, f"webhook:chat-3:{thread_id}", now=0.0)
         assert "Their dog is named Buddy." in loaded.system_prompt
 
@@ -95,12 +98,13 @@ def test_handle_inbound_shares_recall_across_threads_of_the_same_account(monkeyp
 @pytest.mark.unit
 def test_handle_inbound_never_recalls_a_different_chat_ids_memories(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(model_access, "send", lambda request: plain_response("reply"))
-    conn = open_store(store_path_from_config())
+    connections = open_connections()
+    conn = connections.writer
     memory_store.ensure_schema(conn)
     memory_store.write_entry(conn, "webhook:chat-4", "dog_name", "Their dog is named Buddy.", now=0.0)
 
     event = MessageEvent(platform="webhook", chat_id="chat-5", thread_id=None, text="hi")
-    asyncio.run(handle_inbound(make_runtime(conn), event))
+    asyncio.run(handle_inbound(make_runtime(connections), event))
 
     loaded = load(conn, "webhook:chat-5", now=0.0)
     assert "Their dog is named Buddy." not in loaded.system_prompt
@@ -115,10 +119,11 @@ def test_handle_inbound_with_no_pause_row_is_unaffected_by_the_check(monkeypatch
     top of `handle_inbound`: a conversation with no `plugin_pauses` row
     takes today's exact existing path, unchanged."""
     monkeypatch.setattr(model_access, "send", lambda request: plain_response("reply"))
-    conn = open_store(store_path_from_config())
+    connections = open_connections()
+    conn = connections.writer
     event = MessageEvent(platform="webhook", chat_id="chat-nopause", thread_id=None, text="hello")
 
-    ok, text = asyncio.run(handle_inbound(make_runtime(conn), event))
+    ok, text = asyncio.run(handle_inbound(make_runtime(connections), event))
 
     assert ok is True
     assert text == "reply"
@@ -136,7 +141,9 @@ def test_handle_inbound_with_a_pause_row_resumes_without_calling_the_model(
     _wait_then_summarize_installed(tmp_path)  # writes tmp_path/p/plugin.toml et al.
     monkeypatch.setattr(plugins, "_plugins_root", lambda: tmp_path)
 
-    conn = open_store(store_path_from_config())
+    connections = open_connections()
+
+    conn = connections.writer
     key = "webhook:chat-resume"
     conversation, _t = create_conversation(
         ConversationTemplate(name="t", recipe=TemplateRecipe(stable_prompt="p", catalog=(), tool_specs=())),
@@ -148,7 +155,7 @@ def test_handle_inbound_with_a_pause_row_resumes_without_calling_the_model(
     save_pause(conn, conversation_key=key, plugin="p", entry="do_it", node="future", trace=(), artifacts=())
 
     event = MessageEvent(platform="webhook", chat_id="chat-resume", thread_id=None, text="42")
-    ok, text = asyncio.run(handle_inbound(make_runtime(conn), event))
+    ok, text = asyncio.run(handle_inbound(make_runtime(connections), event))
 
     assert ok is True
     assert text == "answered: 42"
@@ -186,11 +193,13 @@ def test_handle_inbound_persists_a_pause_row_when_a_turns_dispatch_call_pauses(
 
     monkeypatch.setattr(model_access, "send", _stateful_send)
 
-    conn = open_store(store_path_from_config())
+    connections = open_connections()
+
+    conn = connections.writer
     key = "webhook:chat-first-pause"
     event = MessageEvent(platform="webhook", chat_id="chat-first-pause", thread_id=None, text="start it")
 
-    ok, text = asyncio.run(handle_inbound(make_runtime(conn, plugin_set=plugin_set), event))
+    ok, text = asyncio.run(handle_inbound(make_runtime(connections, plugin_set=plugin_set), event))
 
     assert ok is True
     assert text == "okay, I'll wait for it."
@@ -207,10 +216,11 @@ def test_handle_inbound_persists_a_pause_row_when_a_turns_dispatch_call_pauses(
 def test_a_webhook_message_still_runs_under_its_own_chat_id(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("SADANA_MEMORY_ACCOUNT", "adam")
     monkeypatch.setattr(model_access, "send", lambda request: plain_response("reply"))
-    conn = open_store(store_path_from_config())
+    connections = open_connections()
+    conn = connections.writer
     event = MessageEvent(platform="webhook", chat_id="chat-9", thread_id=None, text="hello")
 
-    asyncio.run(handle_inbound(make_runtime(conn), event))
+    asyncio.run(handle_inbound(make_runtime(connections), event))
 
     assert accounts_with_conversations(conn) == frozenset({"webhook:chat-9"})
 
@@ -222,14 +232,15 @@ def test_an_account_in_the_payload_is_not_an_account(monkeypatch: pytest.MonkeyP
     key and dropped on the floor, so the turn still runs as the sender."""
     monkeypatch.setenv("SADANA_MEMORY_ACCOUNT", "adam")
     monkeypatch.setattr(model_access, "send", lambda request: plain_response("reply"))
-    conn = open_store(store_path_from_config())
+    connections = open_connections()
+    conn = connections.writer
     body = json.dumps({"chat_id": "chat-9", "text": "hello", "account": "adam"}).encode("utf-8")
 
     outcome = channel_webhook.parse_webhook_request(
         headers={"X-Sadana-Webhook-Secret": _SECRET}, body=body, secret=_SECRET
     )
     assert isinstance(outcome, MessageEvent)
-    asyncio.run(handle_inbound(make_runtime(conn), outcome))
+    asyncio.run(handle_inbound(make_runtime(connections), outcome))
 
     assert accounts_with_conversations(conn) == frozenset({"webhook:chat-9"})
 
@@ -239,9 +250,10 @@ def test_a_trusted_caller_may_state_the_account(monkeypatch: pytest.MonkeyPatch)
     """The other half of the same rule: `scheduling.tick()` decided who this
     is before calling, and that override reaches the door."""
     monkeypatch.setattr(model_access, "send", lambda request: plain_response("reply"))
-    conn = open_store(store_path_from_config())
+    connections = open_connections()
+    conn = connections.writer
     event = MessageEvent(platform="schedule", chat_id="daily", thread_id=None, text="go")
 
-    asyncio.run(handle_inbound(make_runtime(conn), event, account="adam"))
+    asyncio.run(handle_inbound(make_runtime(connections), event, account="adam"))
 
     assert accounts_with_conversations(conn) == frozenset({"adam"})

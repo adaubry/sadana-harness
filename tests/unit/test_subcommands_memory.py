@@ -56,7 +56,7 @@ def test_cmd_memory_list_only_shows_the_given_account(capsys: pytest.CaptureFixt
 
 
 @pytest.mark.unit
-def test_cmd_memory_forget_removes_an_entry(capsys: pytest.CaptureFixture[str]) -> None:
+def test_cmd_memory_forget_stops_an_entry_being_recalled(capsys: pytest.CaptureFixture[str]) -> None:
     _write("a1", "dog_name", "Buddy")
     _write("a1", "tz", "UTC+2")
 

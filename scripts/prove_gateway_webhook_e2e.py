@@ -159,7 +159,8 @@ def main() -> None:
     runtime = client_surface.open_runtime(provider="p", model="m")
 
     # client_surface.take_turn() serializes its own conn access
-    # (client_surface.conn_lock) — no lock needed here.
+    # (each conversation gets its own, in `stores.conversation_lock`) — no
+    # lock needed here.
     def on_message(event: MessageEvent) -> tuple[bool, str]:
         return asyncio.run(gateway_dispatch.handle_inbound(runtime, event))
 

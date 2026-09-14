@@ -17,7 +17,9 @@ Still a function rather than two inline call sites: `channel_webhook` (via
 `subcommands/gateway.py`) and `scheduling.py` both deliver a `MessageEvent`,
 so this mapping has two real callers.
 
-`conn_lock` moved to `client_surface.py`, with the body it guards.
+The lock moved to `client_surface.py` with the body it guards, and H16 split it
+into one lock per conversation (`stores.conversation_lock`) plus a writer lock
+held inside each transaction.
 """
 
 from __future__ import annotations

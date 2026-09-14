@@ -12,7 +12,7 @@ import pytest
 from conftest import make_upstream_repo as _make_upstream_repo
 from conftest import open_conn as _conn
 from conftest import run_git as _run_git
-from sadana import marketplace
+from sadana import ids, ledger, marketplace
 
 
 def _make_broken_upstream_repo(tmp_path: Path, *, plugin_name: str = "broken", tag: str = "v1.0.0") -> Path:
@@ -324,3 +324,46 @@ def test_approved_plugin_names_only_lists_approved_plugins(tmp_path: Path) -> No
         conn.close()
 
     assert names == ("approved-one",)
+
+
+# ── H16: releases carry an identity and announce their decisions ───────────
+
+
+@pytest.mark.unit
+def test_submitting_then_deciding_records_a_creation_and_a_change(tmp_path: Path) -> None:
+    repo = _make_upstream_repo(tmp_path, plugin_name="greeter", tag="v1.0.0")
+    conn = _conn()
+    try:
+        marketplace.submit(conn, str(repo), "v1.0.0", now=time.time())
+        marketplace.decide(conn, "greeter", "v1.0.0", "approved", now=time.time())
+
+        row = conn.execute("SELECT id, version FROM marketplace_releases").fetchone()
+        changes = ledger.changes_since(conn, 0, 10)
+    finally:
+        conn.close()
+
+    assert ids.parse_id("plg", row["id"]) is not None
+    assert row["version"] == 2
+    assert [(c.noun, c.kind, c.state) for c in changes] == [
+        ("plugins", "created", "pending"),
+        ("plugins", "changed", "approved"),
+    ]
+    assert {c.id for c in changes} == {row["id"]}
+
+
+@pytest.mark.unit
+def test_a_release_that_was_refused_leaves_no_change_behind(tmp_path: Path) -> None:
+    """A second submission of the same tag writes nothing, so it must
+    announce nothing — the transaction that rolls back takes its ledger row
+    with it."""
+    repo = _make_upstream_repo(tmp_path, plugin_name="greeter", tag="v1.0.0")
+    conn = _conn()
+    try:
+        marketplace.submit(conn, str(repo), "v1.0.0", now=time.time())
+        head = ledger.ledger_head(conn)
+
+        marketplace.submit(conn, str(repo), "v1.0.0", now=time.time())
+
+        assert ledger.ledger_head(conn) == head
+    finally:
+        conn.close()

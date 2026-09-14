@@ -25,7 +25,9 @@ def build_memory_parser(subparsers: argparse._SubParsersAction[argparse.Argument
     list_parser.add_argument("account", help="the account to list memories for")
     list_parser.set_defaults(func=cmd_memory_list)
 
-    forget_parser = memory_subparsers.add_parser("forget", help="remove one remembered entry")
+    forget_parser = memory_subparsers.add_parser(
+        "forget", help="stop using one remembered entry (it is kept, not destroyed)"
+    )
     forget_parser.add_argument("account", help="the account the entry belongs to")
     forget_parser.add_argument("entry_key", help="the entry's key, as shown by `memory list`")
     forget_parser.set_defaults(func=cmd_memory_forget)
@@ -50,9 +52,16 @@ def cmd_memory_list(args: argparse.Namespace) -> int:
 
 
 def cmd_memory_forget(args: argparse.Namespace) -> int:
+    """Forgetting is a state change, not a deletion (H16 requirement 18).
+
+    The printed line says so, because "forgot X" over a row that is still on
+    disk is the kind of half-truth somebody later builds a wrong assumption
+    on. `memory_store.delete_entry` is the purge, and nothing calls it from
+    the CLI yet — H19 is where a purge verb belongs.
+    """
     with stores.open_cli_store() as conn:
-        memory_store.delete_entry(conn, args.account, args.entry_key)
-    print(f"forgot {args.entry_key!r} for {args.account!r}")
+        memory_store.forget_entry(conn, args.account, args.entry_key, now=time.time())
+    print(f"no longer using {args.entry_key!r} for {args.account!r} (kept, not destroyed)")
     return 0
 
 

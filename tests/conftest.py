@@ -250,7 +250,7 @@ EMPTY_PLUGIN_SET = plugin_dispatch.PluginSet(catalog=(), tool_specs=(), by_tool=
 
 
 def make_runtime(
-    conn: sqlite3.Connection, *, plugin_set: plugin_dispatch.PluginSet = EMPTY_PLUGIN_SET
+    connections: stores.Connections, *, plugin_set: plugin_dispatch.PluginSet = EMPTY_PLUGIN_SET
 ) -> client_surface.Runtime:
     """A ``client_surface.Runtime`` over a caller-owned connection — shared by
     ``test_client_surface.py``, ``test_gateway_dispatch.py`` and
@@ -263,17 +263,18 @@ def make_runtime(
     character writes that character's file and selects it for the account,
     the same way a person does.
 
-    Ensures the ``memory_store`` and ``persona_store`` schemas itself: ``take_turn``'s docstring names
-    that as the obligation of whoever builds a ``Runtime`` by hand, the same
-    way ``test_gateway_dispatch.py`` already called ``ensure_schema`` for a
-    direct bridge call."""
-    stores.ensure_schemas(conn)
+    Takes a ``Connections`` rather than a bare connection since H16: the
+    ``Runtime`` holds one writer and a reader per thread, and ``Runtime.conn``
+    is a property over the writer. ``Connections`` ensures every schema in its
+    own constructor, so a hand-built ``Runtime`` no longer has that obligation
+    at all — which is what ``take_turn``'s docstring used to place on the
+    caller."""
     return client_surface.Runtime(
-        conn=conn,
+        connections=connections,
         plugin_set=plugin_set,
         provider="p",
         model="m",
-        recorder=observability.make_recorder(conn),
+        recorder=observability.make_recorder(connections.writer),
     )
 
 
@@ -308,3 +309,9 @@ def open_conn() -> sqlite3.Connection:
     open and close a connection per test rather than across a whole
     module."""
     return open_store(store_path_from_config())
+
+
+def open_connections() -> stores.Connections:
+    """This test's own isolated store, as a ``Connections`` — what
+    ``make_runtime`` now takes. Every schema is ensured by the constructor."""
+    return stores.Connections(store_path_from_config())

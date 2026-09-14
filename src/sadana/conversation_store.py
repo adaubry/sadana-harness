@@ -20,12 +20,15 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import logging
 import sqlite3
+import threading
+import time
 from collections.abc import Awaitable, Callable, Iterator
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
-from sadana import config, context, plugins
+from sadana import config, context, ids, ledger, plugins
 from sadana.conversation import (
     Conversation,
     ConversationKey,
@@ -50,7 +53,19 @@ CREATE TABLE IF NOT EXISTS conversations (
     next_child_seq                 INTEGER NOT NULL,
     stable_prompt_len              INTEGER,
     context_total_prompt_tokens    INTEGER NOT NULL DEFAULT 0,
-    context_total_completion_tokens INTEGER NOT NULL DEFAULT 0
+    context_total_completion_tokens INTEGER NOT NULL DEFAULT 0,
+    -- H16. `key` stays the immutable natural key; `id` is what a ledger entry
+    -- and a foreign key point at; `name` a person reads is `key` for now and
+    -- becomes its own column when a rename verb exists (H19). Nullable on
+    -- purpose: a row written before H16 gets one from `fill_legacy_identity`
+    -- at the next open, not from a backfill migration.
+    id                             TEXT,
+    created_at                     REAL,
+    updated_at                     REAL,
+    version                        INTEGER NOT NULL DEFAULT 1,
+    state                          TEXT NOT NULL DEFAULT 'active',
+    tags_json                      TEXT NOT NULL DEFAULT '{}',
+    agent                          TEXT
 );
 
 CREATE TABLE IF NOT EXISTS messages (
@@ -60,6 +75,14 @@ CREATE TABLE IF NOT EXISTS messages (
     content           TEXT,
     tool_calls_json   TEXT NOT NULL,
     tool_call_id      TEXT,
+    -- H16. No `updated_at` and no `version`: a message row is never edited
+    -- once written (`_insert_messages`' own invariant), so its creation time
+    -- is also its last-changed time. `run_id` is written by H20, which is
+    -- what first has a run id to put in it.
+    id                TEXT,
+    created_at        REAL,
+    state             TEXT NOT NULL DEFAULT 'sent',
+    run_id            TEXT,
     PRIMARY KEY (conversation_key, msg_seq)
 );
 
@@ -100,6 +123,31 @@ CREATE TABLE IF NOT EXISTS conversation_accounts (
 );
 """
 
+#: Indexes on columns H16 added, run **after** ``migrate_columns`` and never
+#: from ``_SCHEMA``.
+#:
+#: ``_SCHEMA`` is executed first and its ``CREATE TABLE IF NOT EXISTS`` is a
+#: no-op on a store that already exists — so on a pre-H16 store the `id` column
+#: does not exist yet at that point, and an index over it fails with *no such
+#: column*. A self-check caught exactly that. The ordering is the contract:
+#: columns, then indexes over them.
+#:
+#: NULLs are distinct to SQLite's UNIQUE, so a unique index is safe on rows
+#: ``fill_legacy_identity`` has not reached yet.
+_INDEXES = """
+CREATE UNIQUE INDEX IF NOT EXISTS idx_conversations_id ON conversations (id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_id ON messages (id);
+"""
+
+#: Every word `conversations.state` may hold, and every word
+#: `messages.state` may hold. Closed sets, one per table, next to the table —
+#: H16's P1 acceptance criterion ("a state from a written closed set"). A
+#: console branches on these words, so a fourteenth reaches it as an unhandled
+#: case rather than as a feature. Nothing can move a conversation off `active`
+#: or a message off `sent` yet: H18 owns waiting, H19 owns closing.
+CONVERSATION_STATES = frozenset({"active"})
+MESSAGE_STATES = frozenset({"sent"})
+
 _CONVERSATION_COLUMNS = (
     "key",
     "template_name",
@@ -118,9 +166,6 @@ _CONVERSATION_COLUMNS = (
 )
 _CONVERSATION_COLUMNS_SQL = ", ".join(_CONVERSATION_COLUMNS)
 _CONVERSATION_PLACEHOLDERS_SQL = ", ".join("?" * len(_CONVERSATION_COLUMNS))
-_INSERT_CONVERSATION_SQL = (
-    f"INSERT INTO conversations ({_CONVERSATION_COLUMNS_SQL}) VALUES ({_CONVERSATION_PLACEHOLDERS_SQL})"
-)
 
 
 class ConversationAlreadyExists(Exception):
@@ -151,17 +196,78 @@ def open_store(path: Path) -> sqlite3.Connection:
     ``check_same_thread=False``: ``bind_persist()``'s callback runs each
     call via ``asyncio.to_thread`` (a thread-pool worker, not necessarily
     the same one twice), so the one connection this function returns must
-    be usable from more than the thread that opened it — sadana-harness's
-    own single-process, single-caller posture (spec.md's Non-goals) means
-    this is still never touched by two threads *at once*, only by one
-    thread at a time, different call to call."""
+    be usable from more than the thread that opened it. Until H16 that was
+    also all it survived: one thread at a time, different call to call. It now
+    survives genuine concurrency, by construction rather than by nobody trying.
+
+    This is the process's one **writer**. H16 made that structural rather than
+    circumstantial: ``write_txn`` serializes every transaction on it, and a
+    caller that only reads takes a thread-local connection from
+    ``stores.Connections.reader()`` instead.
+
+    What this survives: two turns on two conversations in two threads, and a
+    reader listing conversations while a turn runs. What it does not: two turns
+    on one conversation on one event loop; a call node at its approval gate
+    (H18 removes this).
+
+    ``busy_timeout`` is 5 seconds so a reader arriving mid-checkpoint waits
+    rather than failing. The write lock already excludes writer-on-writer
+    contention, so this covers only SQLite's own brief internal exclusions."""
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(path, isolation_level=None, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=5000")
     conn.executescript(_SCHEMA)
-    _migrate_columns(conn)
+    migrate_columns(conn, _MIGRATED_COLUMNS)
+    conn.executescript(_INDEXES)
+    # The one place the ledger's own table is created: every connection that
+    # will ever write comes through here, and `record_change` needs it present
+    # before the first write, not before the first read.
+    ledger.ensure_schema(conn)
+    fill_legacy_identity(conn, "conversations", "conv", time_columns=("created_at", "updated_at"))
+    fill_legacy_identity(conn, "messages", "msg", time_columns=("created_at",))
     return conn
+
+
+def fill_legacy_identity(conn: sqlite3.Connection, table: str, prefix: str, *, time_columns: tuple[str, ...]) -> None:
+    """Give every row of ``table`` written before H16 an ``id`` and a timestamp,
+    once, idempotently.
+
+    **The time it writes is a floor, not a fact.** The row is older — often far
+    older — than the instant recorded here, which is simply the moment somebody
+    first opened the store after this work item landed. Anywhere that timestamp
+    surfaces it means "no later than", never "at". One ``time.time()`` read
+    covers the whole pass, so rows filled together share it and a person reading
+    them can tell they were filled rather than created.
+
+    Not a backfill migration (CLAUDE.md, and `console_fit_plan.md` §5(b)): the
+    guarded ``ALTER TABLE`` in ``migrate_columns`` adds the column, and this
+    fills it in place at the next open. ``WHERE id IS NULL`` is what makes it
+    idempotent, and what makes it free on a fresh store — the common case
+    updates zero rows. Precedent: ``client_surface._adopt_scheduled_memories``,
+    which runs on the open path for the same reason, because a step somebody
+    has to remember to run is a step that does not get run.
+
+    **Writes no ledger rows.** A mirror meeting this box for the first time
+    reads the whole inventory anyway, so thousands of change rows about rows
+    that did not really change would be noise standing in for news.
+
+    Every call site passes literals for ``table``, ``prefix`` and
+    ``time_columns``; none is reachable from outside this package, which is
+    what makes the identifier interpolation safe.
+    """
+    rowids = [r[0] for r in conn.execute(f"SELECT rowid FROM {table} WHERE id IS NULL")]
+    if not rowids:
+        return
+    now = time.time()
+    assignments = ", ".join(["id = ?", *(f"{col} = ?" for col in time_columns)])
+    logger.info("filling identity for %d pre-H16 rows in %s; their timestamps are a floor", len(rowids), table)
+    with write_txn(conn) as c:
+        c.executemany(
+            f"UPDATE {table} SET {assignments} WHERE rowid = ?",
+            [(ids.make_id(prefix), *([now] * len(time_columns)), rowid) for rowid in rowids],
+        )
 
 
 # Columns added after the original schema shipped — ``CREATE TABLE IF NOT
@@ -181,11 +287,32 @@ def open_store(path: Path) -> sqlite3.Connection:
 # (CLAUDE.md: "a column with no safe default falls back to matching pre-fix
 # behavior at read time, so legacy rows keep loading and self-correct only
 # once genuinely rewritten").
+#
+# H16's own additions are the seven on ``conversations`` and the four on
+# ``messages``. ``id``, ``created_at`` and ``updated_at`` are nullable with no
+# default: there is no safe value to invent for a row older than the column, so
+# they read back ``NULL`` until ``fill_legacy_identity`` reaches them, which is
+# CLAUDE.md's own "falls back to matching pre-fix behavior at read time" applied
+# to identity. ``version``/``state``/``tags_json`` carry defaults that *are*
+# safe — a row nobody has edited is at version 1 and active.
 _MIGRATED_COLUMNS: dict[str, tuple[tuple[str, str], ...]] = {
     "conversations": (
         ("stable_prompt_len", "INTEGER"),
         ("context_total_prompt_tokens", "INTEGER NOT NULL DEFAULT 0"),
         ("context_total_completion_tokens", "INTEGER NOT NULL DEFAULT 0"),
+        ("id", "TEXT"),
+        ("created_at", "REAL"),
+        ("updated_at", "REAL"),
+        ("version", "INTEGER NOT NULL DEFAULT 1"),
+        ("state", "TEXT NOT NULL DEFAULT 'active'"),
+        ("tags_json", "TEXT NOT NULL DEFAULT '{}'"),
+        ("agent", "TEXT"),
+    ),
+    "messages": (
+        ("id", "TEXT"),
+        ("created_at", "REAL"),
+        ("state", "TEXT NOT NULL DEFAULT 'sent'"),
+        ("run_id", "TEXT"),
     ),
     "plugin_pauses": (
         ("turn_seq", "INTEGER"),
@@ -193,10 +320,37 @@ _MIGRATED_COLUMNS: dict[str, tuple[tuple[str, str], ...]] = {
     ),
 }
 
+#: Serializes every write transaction in this process against every other.
+#:
+#: H16. One writer connection per process means one lock per process — the
+#: same fact stated once, not a registry of one (CLAUDE.md's rule about a
+#: dispatch seam earning its cost only when a second member exists). It lives
+#: here rather than on ``Connections`` because ``write_txn`` is called from
+#: roughly twenty sites holding a bare connection, and ``sqlite3.Connection``
+#: is a C type that cannot carry an attribute.
+#:
+#: ``RLock``, not ``Lock``. Nothing nests ``write_txn`` today and nothing
+#: should: SQLite answers a nested ``BEGIN IMMEDIATE`` with *cannot start a
+#: transaction within a transaction*, which is a clear error with a stack
+#: trace. Under a plain ``Lock`` the same mistake would deadlock the process
+#: instead, and a hang is the worse of the two failures by a long way. The
+#: reference reached the same conclusion for the same reason
+#: (``plugins/memory/holographic/store.py:112``, one shared connection and one
+#: re-entrant lock, after independent WAL writers raced).
+_WRITE_LOCK = threading.RLock()
 
-def _migrate_columns(conn: sqlite3.Connection) -> None:
-    """Adds every column in ``_MIGRATED_COLUMNS`` missing from the table that
-    owns it.
+logger = logging.getLogger(__name__)
+
+
+def migrate_columns(conn: sqlite3.Connection, columns: dict[str, tuple[tuple[str, str], ...]]) -> None:
+    """Adds every column in ``columns`` missing from the table that owns it.
+
+    Takes the map as a parameter rather than reading a module global, because
+    H16 gave four other store modules the same need and the alternative was
+    four copies of this function. Each of them keeps its own map beside its own
+    ``_SCHEMA``, which is what CLAUDE.md's "the migration maps stay the single
+    source of what was added later" asks for — one map per module, not one map
+    for the database.
 
     The ``PRAGMA table_info`` check is what makes a second ``open_store()``
     call in this same process a no-op: a column already present — in a store
@@ -212,13 +366,14 @@ def _migrate_columns(conn: sqlite3.Connection) -> None:
     separate autocommitted DDL statements — three WAL commits for one logical
     migration, where one does the job.
 
-    ``table`` is never caller-supplied; it is a literal key of the map above.
-    That is what makes the f-string interpolation safe, since SQLite takes no
-    parameter in a DDL identifier position.
+    ``table`` is never caller-supplied; every key comes from a map written as a
+    literal in the module that owns the table. That is what makes the f-string
+    interpolation safe, since SQLite takes no parameter in a DDL identifier
+    position.
     """
-    for table, columns in _MIGRATED_COLUMNS.items():
+    for table, table_columns in columns.items():
         existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
-        missing = [(name, ddl_type) for name, ddl_type in columns if name not in existing]
+        missing = [(name, ddl_type) for name, ddl_type in table_columns if name not in existing]
         if not missing:
             continue
         with write_txn(conn) as c:
@@ -228,22 +383,30 @@ def _migrate_columns(conn: sqlite3.Connection) -> None:
 
 @contextlib.contextmanager
 def write_txn(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
-    """An IMMEDIATE write transaction: adapted from
-    `hermes-agent/hermes_cli/sqlite_util.py:31-49` (audited: stdlib-only,
+    """An IMMEDIATE write transaction, serialized by ``_WRITE_LOCK``: adapted
+    from `hermes-agent/hermes_cli/sqlite_util.py:31-49` (audited: stdlib-only,
     ~19 lines, no hidden dependency on hermes's own state/config
     machinery — safe to adapt rather than reinvent). The explicit
     ``ROLLBACK`` is guarded so a SQLite auto-rollback (no active
     transaction left under lock contention) cannot shadow the original
-    exception with a spurious rollback error."""
-    conn.execute("BEGIN IMMEDIATE")
-    try:
-        yield conn
-    except Exception:
-        with contextlib.suppress(sqlite3.OperationalError):
-            conn.execute("ROLLBACK")
-        raise
-    else:
-        conn.execute("COMMIT")
+    exception with a spurious rollback error.
+
+    H16 added the lock, and *where* it is held is the whole point: inside a
+    transaction, never around a model round trip. A write takes microseconds,
+    so two turns on two conversations contend here for no measurable time —
+    which is what lets them run at once at all (P8). The lock a turn holds for
+    its whole length is a different one, per conversation,
+    ``stores.conversation_lock()``."""
+    with _WRITE_LOCK:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            yield conn
+        except Exception:
+            with contextlib.suppress(sqlite3.OperationalError):
+                conn.execute("ROLLBACK")
+            raise
+        else:
+            conn.execute("COMMIT")
 
 
 def _conversation_row(conversation: Conversation, now: float) -> tuple:
@@ -270,7 +433,35 @@ def _conversation_row(conversation: Conversation, now: float) -> tuple:
     )
 
 
-def _insert_messages(conn: sqlite3.Connection, conversation: Conversation, *, start_seq: int = 0) -> None:
+#: The columns H16 added to ``conversations`` that ``save()`` must set when it
+#: *inserts* and must leave alone when it *updates*. ``version`` and
+#: ``updated_at`` are deliberately not here: they move on every write and are
+#: handled by their own clause.
+_IDENTITY_COLUMNS = ("id", "created_at", "state", "tags_json", "agent")
+
+
+#: The insert both ``create()`` and ``save()`` issue. One constant rather than
+#: two f-strings built at each call site, so the two statements cannot drift
+#: apart — which is what it was before H16 added the identity columns, and the
+#: identity columns did not change the argument.
+_INSERT_CONVERSATION_SQL = (
+    f"INSERT INTO conversations ({_CONVERSATION_COLUMNS_SQL}, {', '.join(_IDENTITY_COLUMNS)}, updated_at, version) "
+    f"VALUES ({_CONVERSATION_PLACEHOLDERS_SQL}, {', '.join('?' * len(_IDENTITY_COLUMNS))}, ?, 1)"
+)
+
+#: ``save()``'s upsert. The identity columns appear on the **insert** branch
+#: only and are absent from ``DO UPDATE``: that asymmetry is the whole of
+#: "``key`` immutable, ``id`` unique" in one statement. Joined once at import
+#: rather than on every call.
+_UPSERT_CONVERSATION_SQL = (
+    _INSERT_CONVERSATION_SQL
+    + " ON CONFLICT(key) DO UPDATE SET "
+    + ", ".join(f"{col}=excluded.{col}" for col in _CONVERSATION_COLUMNS if col != "key")
+    + ", updated_at=excluded.updated_at, version=conversations.version + 1"
+)
+
+
+def _insert_messages(conn: sqlite3.Connection, conversation: Conversation, *, start_seq: int = 0) -> tuple[str, ...]:
     """One ``INSERT OR IGNORE`` per message from ``start_seq`` on. Never
     ``REPLACE``: a message row is never edited once written (``append()``'s
     own invariant — history only grows), so silently skipping an
@@ -281,19 +472,53 @@ def _insert_messages(conn: sqlite3.Connection, conversation: Conversation, *, st
     that idempotent, which is what a caller with no memory of what it last
     flushed needs; ``bind_persist()`` passes its own running offset so a
     turn's repeated persist calls insert only the new tail each time,
-    instead of re-attempting every row already durable."""
+    instead of re-attempting every row already durable.
+
+    Returns the ids of the rows **actually inserted**, which is what the caller
+    writes ledger rows for. H16 made the skip explicit rather than leaving it
+    to ``OR IGNORE``: a minted id is only real if its row landed, and SQLite
+    will not say which of an ``executemany``'s rows it ignored. One indexed
+    ``SELECT`` of the sequence numbers already present answers that before the
+    insert, and ``OR IGNORE`` stays as the backstop it always was."""
+    present = {
+        row[0]
+        for row in conn.execute(
+            "SELECT msg_seq FROM messages WHERE conversation_key = ? AND msg_seq >= ?",
+            (conversation.key, start_seq),
+        )
+    }
+    now_wall = time.time()
+    rows = [
+        (
+            conversation.key,
+            seq,
+            m.role,
+            m.content,
+            json.dumps(list(m.tool_calls)),
+            m.tool_call_id,
+            ids.make_id("msg"),
+            now_wall,
+        )
+        for seq, m in enumerate(conversation.messages[start_seq:], start=start_seq)
+        if seq not in present
+    ]
     conn.executemany(
         "INSERT OR IGNORE INTO messages "
-        "(conversation_key, msg_seq, role, content, tool_calls_json, tool_call_id) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
-        [
-            (conversation.key, seq, m.role, m.content, json.dumps(list(m.tool_calls)), m.tool_call_id)
-            for seq, m in enumerate(conversation.messages[start_seq:], start=start_seq)
-        ],
+        "(conversation_key, msg_seq, role, content, tool_calls_json, tool_call_id, id, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        rows,
     )
+    return tuple(row[6] for row in rows)
 
 
-def create(conn: sqlite3.Connection, conversation: Conversation, *, now: float, account_key: str) -> None:
+def create(
+    conn: sqlite3.Connection,
+    conversation: Conversation,
+    *,
+    now: float,
+    account_key: str,
+    agent: str | None = None,
+) -> None:
     """Inserts one ``conversations`` row, and one ``conversation_accounts``
     row naming whose it is. Raises ``ConversationAlreadyExists`` on a
     primary-key collision, leaving the prior row untouched.
@@ -302,10 +527,25 @@ def create(conn: sqlite3.Connection, conversation: Conversation, *, now: float, 
     belongs to somebody, and the next client to be written should not be able
     to leave that unanswered by omission (PERSONA-02 requirement 6). Both rows
     go in the one transaction this function already opened, so a conversation
-    can never exist without an owner recorded beside it."""
+    can never exist without an owner recorded beside it.
+
+    ``agent`` is the **name** of the character this conversation speaks in,
+    resolved for ``account_key`` at the moment its voice was (H16 requirement
+    6). ``None`` means the account had no selection, which is an answer and not
+    a missing value. A name, never the rendered text and never a live
+    reference: the file it names can change under us and this row must not
+    silently mean something else. Passed in rather than looked up here, because
+    ``persona_store`` imports this module and the reverse would be a cycle —
+    ``client_surface._create`` already has both the account and the connection.
+    """
+    now_wall = time.time()
     with write_txn(conn) as c:
+        conversation_id = ids.make_id("conv")
         try:
-            c.execute(_INSERT_CONVERSATION_SQL, _conversation_row(conversation, now))
+            c.execute(
+                _INSERT_CONVERSATION_SQL,
+                (*_conversation_row(conversation, now), conversation_id, now_wall, "active", "{}", agent, now_wall),
+            )
         except sqlite3.IntegrityError as exc:
             raise ConversationAlreadyExists(conversation.key) from exc
         c.execute(
@@ -313,7 +553,41 @@ def create(conn: sqlite3.Connection, conversation: Conversation, *, now: float, 
             "ON CONFLICT (conversation_key) DO UPDATE SET account_key = excluded.account_key",
             (conversation.key, account_key),
         )
-        _insert_messages(c, conversation)
+        message_ids = _insert_messages(c, conversation)
+        ledger.record_change(
+            c, noun="conversations", id=conversation_id, kind="created", state="active", version=1, at=now_wall
+        )
+        _record_messages(c, message_ids, at=now_wall)
+
+
+def _record_messages(c: sqlite3.Connection, message_ids: tuple[str, ...], *, at: float) -> None:
+    """One ``messages``/``created`` per row that genuinely landed. Version 1
+    always: a message is never edited once written."""
+    for message_id in message_ids:
+        ledger.record_change(c, noun="messages", id=message_id, kind="created", state="sent", version=1, at=at)
+
+
+def _record_conversation_change(c: sqlite3.Connection, key: ConversationKey, *, at: float) -> None:
+    """Bump one conversation's ``updated_at``/``version`` and announce it.
+
+    What every write that changes a conversation without inserting it calls.
+    The bump and the read of its result are both inside the caller's
+    transaction, which is what makes the announced ``version`` the one that
+    actually committed rather than one this function guessed — there is no
+    window in which another writer could have moved it in between.
+
+    A key with no row, or a legacy row the fill has not reached, announces
+    nothing: there is no id to name it by. ``RETURNING`` would fold the update
+    and the read into one statement, and is left alone deliberately — it would
+    be this module's only use of it, to save one indexed primary-key lookup.
+    """
+    c.execute("UPDATE conversations SET updated_at = ?, version = version + 1 WHERE key = ?", (at, key))
+    row = c.execute("SELECT id, state, version FROM conversations WHERE key = ?", (key,)).fetchone()
+    if row is None or row["id"] is None:
+        return
+    ledger.record_change(
+        c, noun="conversations", id=row["id"], kind="changed", state=row["state"], version=row["version"], at=at
+    )
 
 
 def accounts_with_conversations(conn: sqlite3.Connection) -> frozenset[str]:
@@ -327,15 +601,43 @@ def accounts_with_conversations(conn: sqlite3.Connection) -> frozenset[str]:
 def save(conn: sqlite3.Connection, conversation: Conversation, *, now: float, start_seq: int = 0) -> None:
     """Upserts the ``conversations`` row — always succeeds for a key the
     caller already owns (already created or already loaded), never raises
-    for that reason alone. ``start_seq``: see ``_insert_messages``."""
+    for that reason alone. ``start_seq``: see ``_insert_messages``.
+
+    The identity columns are set on the **insert** branch and left alone on the
+    update branch. That asymmetry is the whole of H16's "``key`` immutable,
+    ``id`` unique, ``name`` mutable" in one statement: a save of a key that
+    already exists must not mint a second id for it, and must not move its
+    ``created_at``. ``_CONVERSATION_COLUMNS`` is deliberately still only the
+    columns that carry a ``Conversation``'s own fields, so that ``load()``
+    keeps reconstructing exactly the value ``conversation.py`` defines and that
+    module needs no change.
+
+    Saving a key that does not exist yet does insert one, with a fresh id and
+    no agent — that is upsert behaviour this function already had, and the
+    ledger row it writes says ``created`` rather than ``changed``, because that
+    is what happened.
+    """
+    now_wall = time.time()
     with write_txn(conn) as c:
         c.execute(
-            _INSERT_CONVERSATION_SQL
-            + " ON CONFLICT(key) DO UPDATE SET "
-            + ", ".join(f"{col}=excluded.{col}" for col in _CONVERSATION_COLUMNS if col != "key"),
-            _conversation_row(conversation, now),
+            _UPSERT_CONVERSATION_SQL,
+            (*_conversation_row(conversation, now), ids.make_id("conv"), now_wall, "active", "{}", None, now_wall),
         )
-        _insert_messages(c, conversation, start_seq=start_seq)
+        message_ids = _insert_messages(c, conversation, start_seq=start_seq)
+        row = c.execute("SELECT id, state, version FROM conversations WHERE key = ?", (conversation.key,)).fetchone()
+        ledger.record_change(
+            c,
+            noun="conversations",
+            id=row["id"],
+            # `version` is 1 only on the branch that inserted: the upsert sets
+            # it to 1 on insert and `version + 1` on conflict, so the row just
+            # read answers which branch ran without a second probe before it.
+            kind="created" if row["version"] == 1 else "changed",
+            state=row["state"],
+            version=row["version"],
+            at=now_wall,
+        )
+        _record_messages(c, message_ids, at=now_wall)
 
 
 def exists(conn: sqlite3.Connection, key: ConversationKey) -> bool:
@@ -589,6 +891,11 @@ def save_pause(
                 seq_in_turn,
             ),
         )
+        # The conversation itself moved: something is now waiting on it. H18
+        # gives that a state word and an addressable approval; until then the
+        # honest record is that the row changed, not that it entered a state
+        # this codebase cannot yet leave.
+        _record_conversation_change(c, conversation_key, at=time.time())
 
 
 def save_pause_from_result(
@@ -643,6 +950,14 @@ def load_pause(conn: sqlite3.Connection, *, conversation_key: str) -> Pause | No
 
 
 def delete_pause(conn: sqlite3.Connection, *, conversation_key: str) -> None:
-    """A key with no row is a silent no-op, same as ``delete_scheduled_trigger``."""
+    """A key with no row is a silent no-op, same as ``delete_scheduled_trigger``.
+
+    The ledger row is written against the *conversation*, not the pause: a
+    pause is not one of `ledger.NOUNS` and has no id of its own, and what an
+    observer needs to learn is that the conversation stopped waiting. A key
+    with no pause still bumps the conversation, which is the cost of keeping
+    this a no-op rather than a lookup — it is called once per resume, always
+    for a pause that existed."""
     with write_txn(conn) as c:
         c.execute("DELETE FROM plugin_pauses WHERE conversation_key = ?", (conversation_key,))
+        _record_conversation_change(c, conversation_key, at=time.time())

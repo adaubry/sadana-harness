@@ -4,14 +4,17 @@ write semantics."""
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
 from conftest import dag_result, turn_result
-from sadana import observability
-from sadana.conversation import TurnKey
+from conftest import open_conn as _conn
+from sadana import artifact_store, ids, ledger, observability, plugins
+from sadana.conversation import ExitReason, TurnKey
 from sadana.conversation_store import open_store
+from sadana.observability import _insert_plugin_run, _insert_turn_run, make_recorder
 
 # ── timed ─────────────────────────────────────────────────────────────────
 
@@ -113,3 +116,70 @@ def test_record_plugin_run_swallows_a_write_failure_instead_of_raising(tmp_path:
 
     turn_key = TurnKey(conversation="c1", turn_seq=0)
     asyncio.run(recorder.record_plugin_run(turn_key, 0, dag_result(), 1.0))  # must not raise
+
+
+# ── H16: run identity, and what a run produced ─────────────────────────────
+
+
+@pytest.mark.unit
+def test_a_turn_run_carries_an_id_and_a_state_derived_from_its_exit(tmp_path: Path) -> None:
+    conn = _conn()
+    make_recorder(conn)
+
+    _insert_turn_run(conn, turn_result(), duration_s=2.0, recorded_at=100.0)
+
+    row = conn.execute("SELECT id, state, started_at, ended_at, version FROM turn_runs").fetchone()
+    assert ids.parse_id("run", row["id"]) is not None
+    assert row["state"] == "done"
+    assert (row["started_at"], row["ended_at"]) == (98.0, 100.0)
+    assert [(c.noun, c.kind, c.id) for c in ledger.changes_since(conn, 0, 10)] == [("runs", "created", row["id"])]
+
+
+@pytest.mark.unit
+def test_a_turn_that_did_not_complete_is_recorded_as_failed(tmp_path: Path) -> None:
+    conn = _conn()
+    make_recorder(conn)
+    result = replace(turn_result(), exit_reason=ExitReason.BUDGET_EXHAUSTED)
+
+    _insert_turn_run(conn, result, duration_s=1.0, recorded_at=100.0)
+
+    assert conn.execute("SELECT state FROM turn_runs").fetchone()["state"] == "failed"
+
+
+@pytest.mark.unit
+def test_a_plugin_runs_artifacts_are_indexed_in_the_same_transaction(tmp_path: Path) -> None:
+    conn = _conn()
+    make_recorder(conn)
+    run_dir = artifact_store.for_run("c1", 0, 0)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "report.md").write_text("hello")
+    result = replace(
+        dag_result(),
+        artifacts=(
+            plugins.Artifact(kind="file", name="report", ref="report.md"),
+            plugins.Artifact(kind="link", name="issue", ref="https://example.test/1"),
+        ),
+    )
+
+    _insert_plugin_run(conn, TurnKey(conversation="c1", turn_seq=0), 0, result, duration_s=1.0, recorded_at=100.0)
+
+    rows = conn.execute("SELECT name, kind, mime, size_bytes FROM artifacts ORDER BY name").fetchall()
+    assert [(r["name"], r["kind"]) for r in rows] == [("issue", "link"), ("report", "file")]
+    assert rows[1]["size_bytes"] == 5
+    assert rows[1]["mime"] == "text/markdown"
+    assert rows[0]["size_bytes"] is None
+    assert [c.noun for c in ledger.changes_since(conn, 0, 10)] == ["runs", "artifacts", "artifacts"]
+
+
+@pytest.mark.unit
+def test_an_artifact_whose_file_has_gone_is_still_indexed(tmp_path: Path) -> None:
+    """The size is stored rather than derived precisely because the file may
+    not be there when somebody asks."""
+    conn = _conn()
+    make_recorder(conn)
+    result = replace(dag_result(), artifacts=(plugins.Artifact(kind="file", name="gone", ref="gone.txt"),))
+
+    _insert_plugin_run(conn, TurnKey(conversation="c1", turn_seq=0), 0, result, duration_s=1.0, recorded_at=100.0)
+
+    row = conn.execute("SELECT name, size_bytes, state FROM artifacts").fetchone()
+    assert (row["name"], row["size_bytes"], row["state"]) == ("gone", None, "ready")

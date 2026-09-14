@@ -6,14 +6,20 @@ directory (the autouse `_isolated_state` fixture), never the real store.
 
 from __future__ import annotations
 
+import sqlite3
+from pathlib import Path
+
 import pytest
 
 from conftest import open_conn
+from sadana import ids, ledger
+from sadana.conversation_store import open_store
 from sadana.memory_store import (
     accounts_with_memories,
     adopt_scheduled_memories,
     delete_entry,
     ensure_schema,
+    forget_entry,
     get_rubric_override,
     list_entries,
     set_rubric_override,
@@ -164,3 +170,125 @@ def test_adoption_refuses_to_run_when_the_owner_is_itself_a_schedule(conn) -> No
 @pytest.mark.unit
 def test_accounts_with_memories_is_empty_on_a_fresh_store(conn) -> None:  # type: ignore[no-untyped-def]
     assert accounts_with_memories(conn) == frozenset()
+
+
+# ── H16: identity, the ledger, forget-versus-purge ─────────────────────────
+
+
+@pytest.mark.unit
+def test_writing_an_entry_records_one_change_with_its_id(conn: sqlite3.Connection) -> None:
+    write_entry(conn, "a1", "dog_name", "Buddy", now=1.0)
+
+    row = conn.execute("SELECT id, state, version FROM memory_entries").fetchone()
+    assert ids.parse_id("mem", row["id"]) is not None
+    assert (row["state"], row["version"]) == ("kept", 1)
+    assert [(c.noun, c.kind, c.id) for c in ledger.changes_since(conn, 0, 10)] == [
+        ("memory_entries", "created", row["id"])
+    ]
+
+
+@pytest.mark.unit
+def test_rewriting_an_entry_is_a_change_not_a_second_creation(conn: sqlite3.Connection) -> None:
+    write_entry(conn, "a1", "dog_name", "Buddy", now=1.0)
+
+    write_entry(conn, "a1", "dog_name", "Rex", now=2.0)
+
+    kinds = [c.kind for c in ledger.changes_since(conn, 0, 10)]
+    assert kinds == ["created", "changed"]
+    assert conn.execute("SELECT version FROM memory_entries").fetchone()["version"] == 2
+
+
+@pytest.mark.unit
+def test_forgetting_keeps_the_row_and_stops_recalling_it(conn: sqlite3.Connection) -> None:
+    """The distinction H16 requirement 18 exists for: the assistant stops
+    acting on the fact, and an observer is told, but nothing is destroyed."""
+    write_entry(conn, "a1", "dog_name", "Buddy", now=1.0)
+
+    forget_entry(conn, "a1", "dog_name", now=2.0)
+
+    assert list_entries(conn, "a1") == ()
+    row = conn.execute("SELECT state, version FROM memory_entries").fetchone()
+    assert (row["state"], row["version"]) == ("forgotten", 2)
+    assert [c.kind for c in ledger.changes_since(conn, 0, 10)][-1] == "changed"
+
+
+@pytest.mark.unit
+def test_remembering_a_forgotten_fact_again_brings_it_back(conn: sqlite3.Connection) -> None:
+    """Telling the assistant the same thing again means you want it known. A
+    write that silently did nothing would be the worst possible answer."""
+    write_entry(conn, "a1", "dog_name", "Buddy", now=1.0)
+    forget_entry(conn, "a1", "dog_name", now=2.0)
+
+    write_entry(conn, "a1", "dog_name", "Buddy", now=3.0)
+
+    assert [e.entry_key for e in list_entries(conn, "a1")] == ["dog_name"]
+
+
+@pytest.mark.unit
+def test_deleting_an_entry_leaves_a_tombstone_behind(conn: sqlite3.Connection) -> None:
+    """A row that simply vanished would be indistinguishable from a bug to
+    anything holding a copy — the console's register calls that B10."""
+    write_entry(conn, "a1", "dog_name", "Buddy", now=1.0)
+    entry_id = conn.execute("SELECT id FROM memory_entries").fetchone()["id"]
+
+    delete_entry(conn, "a1", "dog_name")
+
+    assert conn.execute("SELECT COUNT(*) FROM memory_entries").fetchone()[0] == 0
+    last = ledger.changes_since(conn, 0, 10)[-1]
+    assert (last.noun, last.kind, last.id) == ("memory_entries", "deleted", entry_id)
+
+
+@pytest.mark.unit
+def test_a_rubric_override_records_against_the_memory_policies_noun(conn: sqlite3.Connection) -> None:
+    set_rubric_override(conn, "a1", "keep it short", now=1.0)
+    set_rubric_override(conn, "a1", "keep it shorter", now=2.0)
+
+    changes = ledger.changes_since(conn, 0, 10)
+    assert [(c.noun, c.kind, c.version) for c in changes] == [
+        ("memory_policies", "created", 1),
+        ("memory_policies", "changed", 2),
+    ]
+
+
+@pytest.mark.unit
+def test_a_pre_h16_memory_store_gains_its_columns_and_is_filled(tmp_path: Path) -> None:
+    path = tmp_path / "m.db"
+    raw = sqlite3.connect(path)
+    raw.execute(
+        "CREATE TABLE memory_entries (account_key TEXT NOT NULL, entry_key TEXT NOT NULL, "
+        "content TEXT NOT NULL, updated_at REAL NOT NULL, PRIMARY KEY (account_key, entry_key))"
+    )
+    raw.execute("INSERT INTO memory_entries VALUES ('a1', 'dog_name', 'Buddy', 1.0)")
+    raw.commit()
+    raw.close()
+
+    conn = open_store(path)
+    ensure_schema(conn)
+
+    row = conn.execute("SELECT id, created_at, state FROM memory_entries").fetchone()
+    assert ids.parse_id("mem", row["id"]) is not None
+    assert row["state"] == "kept"
+    assert ledger.ledger_head(conn) == 0
+
+
+@pytest.mark.unit
+def test_adoption_carries_a_forgotten_entry_over_as_forgotten(conn: sqlite3.Connection) -> None:
+    """Adoption is a move, and a move carries the decision as well as the
+    content.
+
+    Found in H16's own deploy review. `forget_entry` arrived in the same work
+    item as the `state` column, and `adopt_scheduled_memories` — which runs on
+    every `open_runtime` — selected without a state filter and re-inserted
+    without naming `state`, so the column fell back to its `'kept'` default. A
+    fact somebody had asked the assistant to forget came back into the system
+    message at the next restart. That is the one outcome `forget` exists to
+    prevent.
+    """
+    write_entry(conn, "schedule:nightly", "secret_fact", "forget this", now=1.0)
+    forget_entry(conn, "schedule:nightly", "secret_fact", now=2.0)
+
+    adopt_scheduled_memories(conn, "local")
+
+    assert list_entries(conn, "local") == ()
+    row = conn.execute("SELECT account_key, state FROM memory_entries").fetchone()
+    assert (row["account_key"], row["state"]) == ("local", "forgotten")

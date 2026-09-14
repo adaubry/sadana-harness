@@ -7,8 +7,8 @@ import threading
 
 import pytest
 
-from conftest import make_runtime, open_conn, plain_response, write_character
-from sadana import client_surface, gateway_dispatch, memory, model_access, persona, persona_store, stores
+from conftest import make_runtime, open_connections, plain_response, write_character
+from sadana import conversation_store, gateway_dispatch, memory, model_access, persona, persona_store
 from sadana.conversation_store import due_triggers, load, upsert_scheduled_trigger
 from sadana.gateway import MessageEvent, session_key_for
 from sadana.scheduling import _advance, _is_due, tick
@@ -47,7 +47,8 @@ def _fake_handle_inbound(
 
 @pytest.mark.unit
 def test_tick_fires_only_due_triggers(monkeypatch: pytest.MonkeyPatch) -> None:
-    conn = open_conn()
+    connections = open_connections()
+    conn = connections.writer
     upsert_scheduled_trigger(conn, name="due", trigger_text="go", next_run_at=0.0, interval_seconds=None)
     upsert_scheduled_trigger(
         conn, name="not-due", trigger_text="go", next_run_at=9_999_999_999.0, interval_seconds=None
@@ -55,7 +56,7 @@ def test_tick_fires_only_due_triggers(monkeypatch: pytest.MonkeyPatch) -> None:
     calls: list[MessageEvent] = []
     monkeypatch.setattr(gateway_dispatch, "handle_inbound", _fake_handle_inbound(calls))
 
-    fired = asyncio.run(tick(make_runtime(conn)))
+    fired = asyncio.run(tick(make_runtime(connections)))
 
     assert fired == 1
     assert [c.chat_id for c in calls] == ["due"]
@@ -65,22 +66,24 @@ def test_tick_fires_only_due_triggers(monkeypatch: pytest.MonkeyPatch) -> None:
 
 @pytest.mark.unit
 def test_tick_deletes_a_one_shot_trigger_after_firing(monkeypatch: pytest.MonkeyPatch) -> None:
-    conn = open_conn()
+    connections = open_connections()
+    conn = connections.writer
     upsert_scheduled_trigger(conn, name="once", trigger_text="go", next_run_at=0.0, interval_seconds=None)
     monkeypatch.setattr(gateway_dispatch, "handle_inbound", _fake_handle_inbound([]))
 
-    asyncio.run(tick(make_runtime(conn)))
+    asyncio.run(tick(make_runtime(connections)))
 
     assert due_triggers(conn, now=9_999_999_999.0) == ()
 
 
 @pytest.mark.unit
 def test_tick_advances_a_recurring_trigger_to_now_plus_interval(monkeypatch: pytest.MonkeyPatch) -> None:
-    conn = open_conn()
+    connections = open_connections()
+    conn = connections.writer
     upsert_scheduled_trigger(conn, name="weekly", trigger_text="go", next_run_at=0.0, interval_seconds=604800.0)
     monkeypatch.setattr(gateway_dispatch, "handle_inbound", _fake_handle_inbound([]))
 
-    asyncio.run(tick(make_runtime(conn)))
+    asyncio.run(tick(make_runtime(connections)))
 
     (row,) = due_triggers(conn, now=9_999_999_999.0)
     assert row.next_run_at > 604800.0 - 1  # advanced from *now*, not from the old next_run_at
@@ -90,13 +93,14 @@ def test_tick_advances_a_recurring_trigger_to_now_plus_interval(monkeypatch: pyt
 def test_tick_one_failing_trigger_does_not_stop_the_others_and_stays_due(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    conn = open_conn()
+    connections = open_connections()
+    conn = connections.writer
     upsert_scheduled_trigger(conn, name="broken", trigger_text="go", next_run_at=0.0, interval_seconds=None)
     upsert_scheduled_trigger(conn, name="fine", trigger_text="go", next_run_at=0.0, interval_seconds=None)
     calls: list[MessageEvent] = []
     monkeypatch.setattr(gateway_dispatch, "handle_inbound", _fake_handle_inbound(calls, raise_for="broken"))
 
-    fired = asyncio.run(tick(make_runtime(conn)))
+    fired = asyncio.run(tick(make_runtime(connections)))
 
     assert fired == 1
     assert {c.chat_id for c in calls} == {"broken", "fine"}
@@ -105,15 +109,16 @@ def test_tick_one_failing_trigger_does_not_stop_the_others_and_stays_due(
 
 
 class _RecordingLock:
-    """A real `threading.Lock`, wrapped to record every `with` acquisition
-    — deploy-stage cold review: `tick()`'s own direct `conn` touches raced
-    every webhook request's own thread with no lock at all. This proves
-    the wiring, not real concurrency (that's `client_surface.conn_lock`'s
-    own single, project-wide lock object, already relied on for real by
-    `take_turn`)."""
+    """A real re-entrant lock, wrapped to count every acquisition.
+
+    Deploy-stage cold review, before H16: `tick()`'s own direct `conn` touches
+    raced every webhook request's own thread with no lock at all. The guarantee
+    survived H16; only its mechanism moved, from one process-wide lock held
+    around everything to the writer lock held inside each transaction.
+    """
 
     def __init__(self) -> None:
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self.acquisitions = 0
 
     def __enter__(self) -> None:
@@ -125,20 +130,31 @@ class _RecordingLock:
 
 
 @pytest.mark.unit
-def test_tick_wraps_its_own_conn_access_in_the_shared_conn_lock(monkeypatch: pytest.MonkeyPatch) -> None:
-    conn = open_conn()
+def test_tick_reads_through_a_reader_and_writes_under_the_writer_lock(monkeypatch: pytest.MonkeyPatch) -> None:
+    """What the cold review's finding became after H16.
+
+    The due-triggers query no longer takes any lock at all — it goes through
+    this thread's own read-only connection, so a tick never queues behind
+    somebody's turn. The post-fire delete still takes the writer lock, because
+    it is a write. `handle_inbound` is called outside both, which is what keeps
+    it from deadlocking against the conversation lock `take_turn` acquires.
+    """
+    connections = open_connections()
+    conn = connections.writer
     upsert_scheduled_trigger(conn, name="due", trigger_text="go", next_run_at=0.0, interval_seconds=None)
     monkeypatch.setattr(gateway_dispatch, "handle_inbound", _fake_handle_inbound([]))
     recording_lock = _RecordingLock()
-    monkeypatch.setattr(client_surface, "conn_lock", recording_lock)
+    monkeypatch.setattr(conversation_store, "_WRITE_LOCK", recording_lock)
+    readers: list[int] = []
+    real_reader = connections.reader
+    monkeypatch.setattr(connections, "reader", lambda: (readers.append(1), real_reader())[1])
 
-    asyncio.run(tick(make_runtime(conn)))
+    asyncio.run(tick(make_runtime(connections)))
 
-    # once for the due_triggers() read, once for the post-fire delete —
-    # handle_inbound() is called *outside* both, so this also proves tick()
-    # never nests an acquisition inside its own (which would deadlock the
-    # real, non-reentrant threading.Lock).
-    assert recording_lock.acquisitions == 2
+    assert readers, "the due-triggers query must not run on the writer"
+    # Exactly one: the post-fire delete. Not two, which would mean the read had
+    # taken the writer lock as well.
+    assert recording_lock.acquisitions == 1
 
 
 # ── PERSONA-02: a trigger the owner wrote runs as the owner ──────────────
@@ -150,13 +166,14 @@ def test_a_fired_trigger_runs_as_the_owner_not_as_itself(monkeypatch: pytest.Mon
     questions: the account becomes the owner's while the conversation key
     stays the trigger's own."""
     monkeypatch.setenv("SADANA_MEMORY_ACCOUNT", "adam")
-    conn = open_conn()
+    connections = open_connections()
+    conn = connections.writer
     upsert_scheduled_trigger(conn, name="daily", trigger_text="go", next_run_at=0.0, interval_seconds=None)
     calls: list[MessageEvent] = []
     accounts: list[str | None] = []
     monkeypatch.setattr(gateway_dispatch, "handle_inbound", _fake_handle_inbound(calls, accounts=accounts))
 
-    asyncio.run(tick(make_runtime(conn)))
+    asyncio.run(tick(make_runtime(connections)))
 
     assert accounts == [memory.owner_account()]
     assert session_key_for(calls[0]) == "schedule:daily"
@@ -171,12 +188,12 @@ def test_a_scheduled_conversation_speaks_in_the_owners_chosen_voice(monkeypatch:
     monkeypatch.setenv("SADANA_MEMORY_ACCOUNT", "adam")
     monkeypatch.setattr(model_access, "send", lambda request: plain_response("done"))
     character = write_character("working", body="You read the code first.")
-    conn = open_conn()
-    stores.ensure_schemas(conn)
+    connections = open_connections()
+    conn = connections.writer
     persona_store.set_selection(conn, "adam", "working", now=0.0)
     upsert_scheduled_trigger(conn, name="daily", trigger_text="go", next_run_at=0.0, interval_seconds=None)
 
-    asyncio.run(tick(make_runtime(conn)))
+    asyncio.run(tick(make_runtime(connections)))
 
     convo = load(conn, "schedule:daily", now=0.0)
     assert convo.stable_prompt == persona.render(

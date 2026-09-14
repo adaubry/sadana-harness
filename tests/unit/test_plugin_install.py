@@ -3,6 +3,7 @@ fetch_verified_tag()."""
 
 from __future__ import annotations
 
+import shutil
 import time
 from contextlib import closing
 from pathlib import Path
@@ -12,7 +13,7 @@ import pytest
 from conftest import make_upstream_repo as _make_upstream_repo
 from conftest import open_conn as _conn
 from conftest import run_git as _run_git
-from sadana import plugin_install, plugin_manifest
+from sadana import ledger, plugin_install, plugin_manifest
 
 
 def _retag(repo: Path, *, plugin_name: str, tag: str, content: str) -> None:
@@ -286,3 +287,94 @@ def test_install_never_writes_outside_the_plugins_root(tmp_path: Path) -> None:
 
     assert isinstance(outcome, plugin_install.InvalidName)
     assert (outside / "precious.txt").read_text() == "do not clobber"
+
+
+# ── H16: the registry ledger and the plugin_state index ────────────────────
+
+
+@pytest.mark.unit
+def test_registering_then_installing_records_two_changes(tmp_path: Path) -> None:
+    repo = _make_upstream_repo(tmp_path, plugin_name="greeter", tag="v1.0.0")
+    with closing(_conn()) as conn:
+        plugin_install.register(conn, "greeter", str(repo), now=time.time())
+        plugin_install.install(conn, "greeter", "v1.0.0", plugins_root=tmp_path / "plugins")
+
+        state = conn.execute("SELECT id, state, source_tag FROM plugin_state WHERE name = 'greeter'").fetchone()
+        registry = conn.execute("SELECT id FROM plugin_registry WHERE name = 'greeter'").fetchone()
+        changes = ledger.changes_since(conn, 0, 10)
+
+    assert (state["state"], state["source_tag"]) == ("installed", "v1.0.0")
+    assert [(c.noun, c.kind) for c in changes] == [("plugins", "created"), ("plugins", "created")]
+    assert {c.id for c in changes} == {registry["id"], state["id"]}
+
+
+@pytest.mark.unit
+def test_a_directory_whose_manifest_is_invalid_reconciles_to_error(tmp_path: Path) -> None:
+    """A broken plugin is the one the console most needs to show. Hiding it is
+    what `editor_server._list_plugins` already declined to do."""
+    plugins_root = tmp_path / "plugins"
+    (plugins_root / "broken").mkdir(parents=True)
+    (plugins_root / "broken" / "plugin.toml").write_text("this is not toml [[[")
+
+    with closing(_conn()) as conn:
+        plugin_install._ensure_schema(conn)
+        plugin_install.reconcile_plugin_state(conn, plugins_root)
+
+        row = conn.execute("SELECT name, state FROM plugin_state").fetchone()
+
+    assert (row["name"], row["state"]) == ("broken", "error")
+
+
+@pytest.mark.unit
+def test_reconciling_an_unchanged_root_announces_nothing(tmp_path: Path) -> None:
+    plugins_root = tmp_path / "plugins"
+    (plugins_root / "broken").mkdir(parents=True)
+    (plugins_root / "broken" / "plugin.toml").write_text("this is not toml [[[")
+
+    with closing(_conn()) as conn:
+        plugin_install._ensure_schema(conn)
+        plugin_install.reconcile_plugin_state(conn, plugins_root)
+        head = ledger.ledger_head(conn)
+
+        plugin_install.reconcile_plugin_state(conn, plugins_root)
+
+        assert ledger.ledger_head(conn) == head
+
+
+@pytest.mark.unit
+def test_a_removed_plugin_directory_is_tombstoned(tmp_path: Path) -> None:
+    plugins_root = tmp_path / "plugins"
+    (plugins_root / "gone").mkdir(parents=True)
+    (plugins_root / "gone" / "plugin.toml").write_text("this is not toml [[[")
+
+    with closing(_conn()) as conn:
+        plugin_install._ensure_schema(conn)
+        plugin_install.reconcile_plugin_state(conn, plugins_root)
+        plugin_id = conn.execute("SELECT id FROM plugin_state").fetchone()["id"]
+
+        shutil.rmtree(plugins_root / "gone")
+        plugin_install.reconcile_plugin_state(conn, plugins_root)
+
+        assert conn.execute("SELECT COUNT(*) FROM plugin_state").fetchone()[0] == 0
+        last = ledger.changes_since(conn, 0, 10)[-1]
+
+    assert (last.kind, last.id) == ("deleted", plugin_id)
+
+
+@pytest.mark.unit
+def test_a_disabled_plugin_stays_disabled_across_a_reconciliation(tmp_path: Path) -> None:
+    """Whether a plugin works is a fact about the files; whether it is
+    switched off is a decision somebody made. A reconciliation must not
+    overrule the second with the first. H24 adds the verb that writes it."""
+    plugins_root = tmp_path / "plugins"
+    (plugins_root / "off").mkdir(parents=True)
+    (plugins_root / "off" / "plugin.toml").write_text("this is not toml [[[")
+
+    with closing(_conn()) as conn:
+        plugin_install._ensure_schema(conn)
+        plugin_install.reconcile_plugin_state(conn, plugins_root)
+        conn.execute("UPDATE plugin_state SET state = 'disabled'")
+
+        plugin_install.reconcile_plugin_state(conn, plugins_root)
+
+        assert conn.execute("SELECT state FROM plugin_state").fetchone()["state"] == "disabled"
