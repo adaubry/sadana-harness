@@ -43,6 +43,7 @@ _CLOSED_SETS = {
     "turn_runs": observability.TURN_RUN_STATES,
     "plugin_runs": observability.PLUGIN_RUN_STATES,
     "artifacts": observability.ARTIFACT_STATES,
+    "approvals": conversation_store.APPROVAL_STATES,
 }
 
 

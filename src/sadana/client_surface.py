@@ -377,6 +377,7 @@ async def take_turn(
     conversation: ConversationKey,
     text: str,
     create_as: str | None,
+    approve: plugins.ApproveFn | None = None,
 ) -> TurnOutcome:
     """Run one turn for one person in one conversation, and say what happened.
 
@@ -422,10 +423,30 @@ async def take_turn(
     with stores.conversation_lock(conversation):
         conn = runtime.conn
         now = time.monotonic()
+        # H18. The client's choice, resolved once: an explicit `approve`
+        # (a TTY) is used as-is; no `approve` at all (everything else —
+        # a webhook, a scheduled trigger, anything that never heard of
+        # approval) gets the parking sentinel, never the interactive
+        # default — a non-interactive caller must never block on `input()`.
+        resolved_approve = approve if approve is not None else plugin_manifest.parking_approve
 
         pause = conversation_store.load_pause(runtime.connections.reader(), conversation_key=conversation)
         if pause is not None:
-            resumed = await plugin_dispatch.resume_paused_run(conn, conversation, text)
+            if pause.kind == "call":
+                # A call pause is answered through the door's actions, not
+                # by texting the conversation — the message is stored, and
+                # no run happens.
+                convo = conversation_store.load(runtime.connections.reader(), conversation, now=now)
+                messages, _msg_key = append(conversation, convo.messages, Message(role="user", content=text))
+                await asyncio.to_thread(conversation_store.save, conn, replace(convo, messages=messages), now=now)
+                approval = conversation_store.load_waiting_approval(
+                    runtime.connections.reader(), conversation_key=conversation
+                )
+                assert approval is not None, "a call-kind pause with no waiting approval row"
+                return TurnOutcome(ok=False, answer=None, diagnostic=f"[waiting_for_approval] {approval.id}")
+            resumed = await plugin_dispatch.resume_paused_run(
+                conn, conversation, decision="answer", state="answered", payload=text, approve=resolved_approve
+            )
             convo = conversation_store.load(runtime.connections.reader(), conversation, now=now)
             messages, _msg_key = append(conversation, convo.messages, Message(role="assistant", content=resumed.text))
             await asyncio.to_thread(conversation_store.save, conn, replace(convo, messages=messages), now=now)
@@ -466,6 +487,7 @@ async def take_turn(
             record_plugin_run=runtime.recorder.record_plugin_run,
             memory_context=memory_store.DispatchContext(account_key=account, conn=conn),
             persist_pause=persist_pause,
+            approve=resolved_approve,
         )
         result, convo = await plugin_dispatch.take_turn_and_reconcile(
             convo,

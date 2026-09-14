@@ -302,6 +302,48 @@ async def _default_approve(plugin: str, node: str, value: object) -> bool:
     return answer.strip().lower() in ("y", "yes")
 
 
+# ── H18: parked approvals ────────────────────────────────────────────────
+# Its full contract is `docs/tasks/H18-parked-approvals/spec.md`.
+
+
+def _persistable_paused_value(value: object) -> object:
+    """`paused_value` becomes `conversation_store`'s `plugin_pauses.
+    paused_value_json` — a JSON column, potentially read back by a whole
+    different process (H18's own point). A `_sadana_`-prefixed key
+    (`plugin_dispatch.build_dispatch`'s own dispatch-time injection — a
+    live `DispatchContext`, the conversation key) is metadata about *how*
+    this dispatch call was made, never part of what was parked for
+    approval, and it is what makes `value` unserializable in the first
+    place. Stripped here rather than crashing the park; `_sadana_
+    session_key` is re-injected fresh by `plugin_dispatch.resume_paused_run`
+    when the approved body actually runs, since a conversation's own key
+    never changes. `_sadana_memory_ctx` is not re-injected — a resumed
+    `call` body reading memory context is new work this item did not
+    build. A non-dict `value` has no reserved keys to strip by
+    construction (only `dispatch()`'s own `arguments: dict` ever carries
+    them), so it passes through unchanged."""
+    if isinstance(value, dict):
+        return {k: v for k, v in value.items() if not k.startswith("_sadana_")}
+    return value
+
+
+async def parking_approve(plugin: str, node: str, value: object) -> bool:
+    """Never actually awaited for a real decision. `_run_graph` recognises
+    this exact function object, by identity, before it would call it, and
+    parks the walk instead — the same way `KINDS_NOT_RUNNABLE` is checked
+    before a node kind's body ever runs. Exists as a real `ApproveFn` rather
+    than `None` so `run_graph`/`build_dispatch`/`resume_paused_run` keep one
+    required-with-a-default parameter shape throughout; if this ever *is*
+    awaited (a caller that bypasses `_run_graph`'s own check), the safe
+    answer is still `False` — parking is not the same value as approval.
+
+    Every non-interactive caller — `client_surface.take_turn`'s own default
+    when no `approve` is given, and every door action that resumes a run —
+    passes this instead of a real judgement callable, so a `call` node
+    never blocks a process with nobody at the keyboard."""
+    return False
+
+
 async def run_graph(
     plugin_dir: Path,
     manifest: plugins.Manifest,
@@ -417,6 +459,25 @@ async def _run_graph(
         trace.append(plugins.NodeTrace(node=node.name, kind=node.kind, visit=0, ok=False, port=None, detail=detail))
         return result(f"{manifest.name}'s {node.name!r} step did not complete.", node.name)
 
+    def finish_call_body(node: plugins.Node, body_value: object) -> tuple[object, str | None] | plugins.DagResult:
+        """The `Artifact`-checking step a `call` node's returned value
+        always gets, whether the body just ran live or is finishing a
+        parked approval (H18) — one function so the two paths can't drift
+        apart. Returns `(value, detail)` to fold into the trace on success,
+        or a terminal `DagResult` on a bad artifact reference."""
+        if isinstance(body_value, plugins.Artifact):
+            # Checked on the value crossing back, not at write time: a body
+            # is free to build a `ref` it never wrote to, so what it
+            # *claims* is the thing worth checking — G2's own reason for
+            # inspecting the returned value at all. Nothing is moved or
+            # deleted on the strength of a `ref`, so a bad one costs this
+            # node and nothing else.
+            if body_value.kind == "file" and not artifact_store.contains_active(body_value.ref):
+                return failed(node, "file artifact points outside the run's own output directory")
+            artifacts.append(body_value)
+            return body_value.ref, f"emitted {body_value.kind} artifact {body_value.name!r}"
+        return body_value, None
+
     # Before anything, including a resume: a plugin whose declared settings
     # have no value cannot work, and saying so here is the difference between
     # a message naming the value and a failure inside somebody's HTTP call
@@ -443,6 +504,10 @@ async def _run_graph(
             # resume. Returned exactly as the pause already was, so
             # `save_pause_from_result` rewrites it unchanged and this is
             # idempotent however many answers arrive before the value is set.
+            # `paused_kind`/`paused_value` are carried over from `resume`
+            # itself (H18) for the same reason: a `call`-kind pause that
+            # hits this guard must stay a `call`-kind approvals row, not
+            # silently downgrade to an unmarked one.
             return plugins.DagResult(
                 plugin=manifest.name,
                 entry=entry.tool,
@@ -451,6 +516,8 @@ async def _run_graph(
                 trace=resume.trace,
                 failed_node=None,
                 paused_node=resume.node,
+                paused_kind=resume.kind,
+                paused_value=resume.value if resume.kind == "call" else None,
             )
         return result(text, "entry")
 
@@ -460,16 +527,44 @@ async def _run_graph(
         value = arguments
         current = entry.start
     else:
-        wait_node = by_name[resume.node]
+        parked_node = by_name[resume.node]
         trace = list(resume.trace)
-        trace.append(
-            plugins.NodeTrace(node=wait_node.name, kind=wait_node.kind, visit=0, ok=True, port=None, detail="resumed")
-        )
         artifacts = list(resume.artifacts)
-        value = resume.value
-        if wait_node.next is None:
+        if resume.kind == "call":
+            # H18. A `call` never ran its body when it parked — `resume.value`
+            # is the `paused_value` a live park recorded, the exact input the
+            # body would have received had it run synchronously.
+            assert resume.decision in (
+                "approve",
+                "decline",
+            ), f"a call-kind resume needs decision 'approve' or 'decline', got {resume.decision!r}"
+            if resume.decision == "decline":
+                return failed(parked_node, "declined")
+
+            def run_body(n: plugins.Node = parked_node, v: object = resume.value) -> object:
+                return _resolve_body(plugin_dir, n, modules)(v)
+
+            try:
+                body_value = await asyncio.to_thread(run_body)
+            except Exception as e:
+                return failed(parked_node, f"node raised {type(e).__name__}")
+            outcome = finish_call_body(parked_node, body_value)
+            if isinstance(outcome, plugins.DagResult):
+                return outcome
+            value, call_detail = outcome
+            trace.append(
+                plugins.NodeTrace(node=parked_node.name, kind="call", visit=0, ok=True, port=None, detail=call_detail)
+            )
+        else:
+            value = resume.value
+            trace.append(
+                plugins.NodeTrace(
+                    node=parked_node.name, kind=parked_node.kind, visit=0, ok=True, port=None, detail="resumed"
+                )
+            )
+        if parked_node.next is None:
             return result(_coerce_text(value), None)
-        current = wait_node.next
+        current = parked_node.next
 
     while True:
         node = by_name[current]
@@ -504,6 +599,21 @@ async def _run_graph(
                     return failed(node, "child did not complete")
                 value = output
             elif node.kind == "call":
+                if approve is parking_approve:
+                    # H18. Parked instead of asked — `approve` is never
+                    # called at all. `docs/tasks/H18-parked-approvals/spec.md`
+                    # Design §2 documents this mechanism in full.
+                    return plugins.DagResult(
+                        plugin=manifest.name,
+                        entry=entry.tool,
+                        text=f"{manifest.name}'s {node.name!r} step is waiting for approval.",
+                        artifacts=tuple(artifacts),
+                        trace=tuple(trace),
+                        failed_node=None,
+                        paused_node=node.name,
+                        paused_kind="call",
+                        paused_value=_persistable_paused_value(value),
+                    )
                 approved = await approve(manifest.name, node.name, value)
                 if not approved:
                     return failed(node, "declined")
@@ -511,19 +621,11 @@ async def _run_graph(
                 def run_body(n: plugins.Node = node, v: object = value) -> object:
                     return _resolve_body(plugin_dir, n, modules)(v)
 
-                value = await asyncio.to_thread(run_body)
-                if isinstance(value, plugins.Artifact):
-                    # Checked on the value crossing back, not at write time: a
-                    # body is free to build a `ref` it never wrote to, so what
-                    # it *claims* is the thing worth checking — G2's own reason
-                    # for inspecting the returned value at all. Nothing is moved
-                    # or deleted on the strength of a `ref`, so a bad one costs
-                    # this node and nothing else.
-                    if value.kind == "file" and not artifact_store.contains_active(value.ref):
-                        return failed(node, "file artifact points outside the run's own output directory")
-                    artifacts.append(value)
-                    detail = f"emitted {value.kind} artifact {value.name!r}"
-                    value = value.ref
+                body_value = await asyncio.to_thread(run_body)
+                outcome = finish_call_body(node, body_value)
+                if isinstance(outcome, plugins.DagResult):
+                    return outcome
+                value, detail = outcome
             elif node.kind == "stop":
                 pass
             else:

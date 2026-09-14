@@ -24,6 +24,7 @@ from sadana.door import auth, capabilities
 from sadana.door.nouns import artifacts, harness, runs, spans, traces
 from sadana.door.nouns.conversations import ConversationsNoun
 from sadana.door.nouns.messages import MessagesNoun
+from sadana.door.nouns import approvals, harness
 from sadana.door.operations import resume_on_start
 from sadana.door.router import DoorContext
 from sadana.door.serve import make_server
@@ -111,6 +112,8 @@ def cmd_door_serve(args: argparse.Namespace) -> int:
             "runs": runs,
             "spans": spans,
             "traces": traces,
+            "approvals": approvals,
+            "harness": harness,
         },
         clock=time.time,
     )

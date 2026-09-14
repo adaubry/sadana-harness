@@ -234,6 +234,13 @@ class DagResult:
     trace: tuple[NodeTrace, ...] = ()
     failed_node: str | None = None  # None == the run reached a terminal node
     paused_node: str | None = None  # set only when the run stopped at a `wait` node
+    # H18 (`docs/tasks/H18-parked-approvals/spec.md`). Which kind of node
+    # `paused_node` names, and — for a `call` — the value its body would
+    # have received had it run synchronously. Both trailing and defaulted,
+    # the same shape `paused_node` itself took: every existing construction
+    # of a terminal `DagResult` means exactly what it meant.
+    paused_kind: Literal["wait", "call"] | None = None
+    paused_value: object = None
 
 
 @dataclass(frozen=True)
@@ -252,6 +259,15 @@ class ResumeState:
     value: object  # the resuming event's payload, standing in for a predecessor's output
     trace: tuple[NodeTrace, ...]
     artifacts: tuple[Artifact, ...]
+    # H18. Which kind of node this resumes, and the decision reached for it.
+    # `kind` has no default — deliberately: a resume always knows which kind
+    # of node it is continuing past (`conversation_store.Pause` always
+    # carries it), and a hand-built `ResumeState` predating H18 that leaves
+    # it out should fail to construct, loudly, rather than silently assume
+    # `"wait"`. `decision` does default, to `None`, since not every `wait`
+    # resume needs to state one (only a `call` resume's approve/decline do).
+    kind: Literal["wait", "call"]
+    decision: Literal["approve", "decline", "answer"] | None = None
 
 
 # ── D2: manifest validation ──────────────────────────────────────────────

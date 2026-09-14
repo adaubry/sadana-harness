@@ -13,6 +13,7 @@ import json
 import sqlite3
 from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass, replace
+from typing import Literal
 
 from sadana import artifact_store, conversation_store, memory_store, observability, plugin_manifest, plugins
 from sadana.conversation import (
@@ -307,14 +308,32 @@ async def _unsupported_ask(_skill: plugins.SkillRef, _text: str) -> str | None:
 
 async def resume_paused_run(
     conn: sqlite3.Connection,
-    conversation_key: str,
-    payload_text: str,
+    conversation: str,
     *,
+    decision: Literal["approve", "decline", "answer"],
+    state: Literal["approved", "declined", "answered", "expired"],
+    payload: str | None = None,
+    answered_by: str | None = None,
     approve: plugins.ApproveFn = plugin_manifest._default_approve,
 ) -> plugins.DagResult:
-    """Continues a conversation's own outstanding `plugin_pauses` row with
-    `payload_text` as the resuming answer
-    (`docs/tasks/GATEWAY-DAEMON-02-scheduled-and-resumable-triggers/spec.md`).
+    """Continues a conversation's own outstanding `plugin_pauses` row
+    (`docs/tasks/GATEWAY-DAEMON-02-scheduled-and-resumable-triggers/spec.md`,
+    `docs/tasks/H18-parked-approvals/spec.md`). `decision` must match the
+    pause's own `kind`: `"answer"` (with `payload` the resuming text) for a
+    `wait` pause; `"approve"`/`"decline"` (with `payload` an optional
+    decline reason) for a `call` pause — a mismatch is a caller error,
+    asserted rather than silently accepted. `answered_by` names the acting
+    account for the door's callers, which know one; the TTY and webhook
+    paths pass `None`, honestly, rather than guess one
+    (`docs/tasks/H18-parked-approvals/spec.md` § Rejected alternatives).
+
+    `state` is what the `approvals` row becomes, stated by the caller
+    rather than derived from `decision` — every caller already knows it
+    (an approve action passes `"approved"`, `expire_due` passes
+    `"expired"`), and `decision` alone can't say it: expiry resumes with
+    `decision="decline"` (the run genuinely was not approved) but the row
+    must read `"expired"`, a different fact than a person answering no.
+    See `conversation_store.resolve_pause`'s own docstring.
 
     Caller's obligation: check `conversation_store.load_pause()` first —
     this function trusts a row exists, matching the case
@@ -342,8 +361,12 @@ async def resume_paused_run(
     every later message on that session key repeated the same crash. A run
     that pauses again (a second `wait` node) has its pause row overwritten
     in place, matching `save_pause()`'s own upsert shape."""
-    pause = conversation_store.load_pause(conn, conversation_key=conversation_key)
-    assert pause is not None, f"resume_paused_run called with no pause row for {conversation_key!r}"
+    pause = conversation_store.load_pause(conn, conversation_key=conversation)
+    assert pause is not None, f"resume_paused_run called with no pause row for {conversation!r}"
+    assert (decision == "answer") == (pause.kind == "wait"), (
+        f"a {pause.kind}-kind pause needs decision "
+        f"{'answer' if pause.kind == 'wait' else 'approve or decline'}, got {decision!r}"
+    )
 
     outcome = plugin_manifest.validate(plugins._plugins_root() / pause.plugin)
     entry = (
@@ -353,9 +376,8 @@ async def resume_paused_run(
     )
     node_missing = isinstance(outcome, plugins.Valid) and pause.node not in plugins._node_index(outcome.manifest)
     if not isinstance(outcome, plugins.Valid) or entry is None or node_missing:
-        conversation_store.delete_pause(conn, conversation_key=conversation_key)
         detail = "the plugin's graph no longer has this step" if node_missing else "the plugin no longer resolves"
-        return plugins.DagResult(
+        result = plugins.DagResult(
             plugin=pause.plugin,
             entry=pause.entry,
             text=f"{pause.plugin}'s {pause.node!r} step could not resume: {detail}.",
@@ -363,39 +385,63 @@ async def resume_paused_run(
             trace=pause.trace,
             failed_node=pause.node,
         )
-
-    resume_state = plugins.ResumeState(
-        node=pause.node, value=payload_text, trace=pause.trace, artifacts=pause.artifacts
-    )
-    # The same directory the paused half wrote into — a resume is the same
-    # run continuing, so its files belong beside the ones already there. A
-    # pause row written before those two columns existed has neither, and
-    # this run gets no output directory, exactly as it did before.
-    output_dir = (
-        artifact_store.for_run(conversation_key, pause.turn_seq, pause.seq_in_turn)
-        if pause.turn_seq is not None and pause.seq_in_turn is not None
-        else None
-    )
-    result = await plugin_manifest.run_graph(
-        plugins._plugins_root() / pause.plugin,
-        outcome.manifest,
-        entry,
-        {},
-        ask=_unsupported_ask,
-        approve=approve,
-        resume=resume_state,
-        output_dir=output_dir,
-    )
-    if result.paused_node is None:
-        conversation_store.delete_pause(conn, conversation_key=conversation_key)
     else:
-        conversation_store.save_pause_from_result(
-            conn,
-            conversation_key=conversation_key,
-            result=result,
-            turn_seq=pause.turn_seq,
-            seq_in_turn=pause.seq_in_turn,
+        resume_value: object
+        if pause.kind == "wait":
+            resume_value = payload
+        else:
+            # H18. `pause.paused_value` never carries `_sadana_`-prefixed
+            # keys — `plugin_manifest._persistable_paused_value` strips them
+            # before a `call` pause is persisted, since they are
+            # dispatch-time injection (a live `DispatchContext`, the
+            # conversation key), not part of what was parked, and would
+            # fail to round-trip through JSON. `_sadana_session_key` is
+            # re-injected here, fresh, since a conversation's own key never
+            # changes and an approved body reads it the same way a live one
+            # would (`build_dispatch`'s own docstring on that reserved
+            # key).
+            resume_value = pause.paused_value
+            if isinstance(resume_value, dict):
+                resume_value = {**resume_value, "_sadana_session_key": conversation}
+        resume_state = plugins.ResumeState(
+            node=pause.node,
+            value=resume_value,
+            trace=pause.trace,
+            artifacts=pause.artifacts,
+            kind=pause.kind,
+            decision=decision,
         )
+        # The same directory the paused half wrote into — a resume is the
+        # same run continuing, so its files belong beside the ones already
+        # there. A pause row written before those two columns existed has
+        # neither, and this run gets no output directory, exactly as it did
+        # before.
+        output_dir = (
+            artifact_store.for_run(conversation, pause.turn_seq, pause.seq_in_turn)
+            if pause.turn_seq is not None and pause.seq_in_turn is not None
+            else None
+        )
+        result = await plugin_manifest.run_graph(
+            plugins._plugins_root() / pause.plugin,
+            outcome.manifest,
+            entry,
+            {},
+            ask=_unsupported_ask,
+            approve=approve,
+            resume=resume_state,
+            output_dir=output_dir,
+        )
+
+    conversation_store.resolve_pause(
+        conn,
+        conversation_key=conversation,
+        result=result,
+        state=state,
+        answered_by=answered_by,
+        answer=payload,
+        turn_seq=pause.turn_seq,
+        seq_in_turn=pause.seq_in_turn,
+    )
     return result
 
 

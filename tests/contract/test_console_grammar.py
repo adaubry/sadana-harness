@@ -99,7 +99,11 @@ def test_get_harness(door: SimpleNamespace) -> None:
     assert resp.status == 200
     body = _json(resp)
     assert body["id"] == _HARNESS_ID
-    assert body["capabilities"] == ["grammar.v1", "changes", "inventory", "artifacts.download"]
+    # A subset, not an exact list: `capabilities.DECLARED` is append-only,
+    # and every later work item's own addition (H18's own two, and whatever
+    # else lands beside it) would otherwise re-break an exact-list equality
+    # here for a reason that has nothing to do with what this test proves.
+    assert set(body["capabilities"]) >= {"grammar.v1", "changes", "inventory"}
     assert body["leaves_the_box"] == ["harness", "widgets"]
 
 

@@ -41,6 +41,8 @@ DECLARED: tuple[str, ...] = (
     # H20 (docs/tasks/H20-door-nouns-turn-side/spec.md requirement 27):
     # artifacts.py's one action.
     "artifacts.download",
+    "approvals.wait",
+    "approvals.call",
 )
 
 _unknown = [name for name in DECLARED if name not in ALL]
