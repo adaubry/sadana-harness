@@ -25,3 +25,8 @@ def test_declared_includes_at_least_h19s_own_grammar_changes_inventory() -> None
     # them) grows it further. This proves H19's own contribution is still
     # there, not that nothing has been added since.
     assert set(capabilities.declared()) >= {"grammar.v1", "changes", "inventory"}
+
+
+@pytest.mark.unit
+def test_declared_includes_h21s_own_three() -> None:
+    assert set(capabilities.declared()) >= {"streaming", "runs.live", "runs.stop"}

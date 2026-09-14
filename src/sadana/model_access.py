@@ -36,6 +36,11 @@ if TYPE_CHECKING:
 # server — treated the same as a 5xx by ``classify()``.
 RawResult = tuple[int | None, dict]
 
+#: A fragment of streamed text, as it arrives. H21. The caller decides what
+#: happens to it (forward it, buffer it, ignore it) — this module only
+#: carries it from a provider's `stream_fn` to whoever asked for streaming.
+OnDelta = Callable[[str], None]
+
 
 # ── Request / Outcome ────────────────────────────────────────────────────
 
@@ -56,6 +61,11 @@ class Request:
     model: str
     tools: tuple[dict, ...] = ()
     attempt: int = 0  # 0 on a first attempt; the caller passes back whatever a prior `Retry` returned.
+    # H21. Asks `send()` to use the provider's `stream_fn` when it has one —
+    # never a second `Outcome` shape: `stream_fn` returns exactly what
+    # `request_fn` would, assembled from the stream, so `classify()` never
+    # needs to know which one ran.
+    stream: bool = False
 
 
 @dataclass(frozen=True)
@@ -185,6 +195,10 @@ class ProviderManifest:
     env_vars: tuple[str, ...] = ()
     base_url: str = ""
     request_fn: Callable[[Request], RawResult] | None = field(default=None, repr=False)
+    # H21. Optional: a provider with no `stream_fn` simply cannot stream —
+    # `send()` falls back to `request_fn` rather than raising, since the
+    # caller gets the same `Outcome` either way, only without deltas.
+    stream_fn: Callable[[Request, OnDelta], RawResult] | None = field(default=None, repr=False)
 
 
 _REGISTRY: dict[str, ProviderManifest] = {}
@@ -254,8 +268,14 @@ def list_providers() -> list[ProviderManifest]:
 # ── send() ────────────────────────────────────────────────────────────────
 
 
-def send(request: Request) -> Outcome:
-    """Make exactly one attempt to reach a model. Never retries internally."""
+def send(request: Request, on_delta: OnDelta | None = None) -> Outcome:
+    """Make exactly one attempt to reach a model. Never retries internally.
+
+    Streams when `request.stream` is set and the provider declares a
+    `stream_fn` — otherwise falls back to `request_fn` exactly as before,
+    `on_delta` simply never called. `stream_fn` returns the identical
+    `RawResult` shape `request_fn` does, assembled from the stream, so
+    `classify()` below needs no branch for which one ran."""
     manifest = get_provider(request.provider)
     if manifest.request_fn is None:
         raise ProviderNotWired(request.provider)
@@ -267,12 +287,16 @@ def send(request: Request) -> Outcome:
         return NeedsCredentialOrProviderChange(f"missing env var(s): {', '.join(missing)}")
 
     max_retries = config.env_int("SADANA_MODEL_ACCESS_MAX_RETRIES", 3)
-    status, body = manifest.request_fn(request)
+    if request.stream and manifest.stream_fn is not None:
+        status, body = manifest.stream_fn(request, on_delta or (lambda _text: None))
+    else:
+        status, body = manifest.request_fn(request)
     return classify(status, body, attempt=request.attempt, max_retries=max_retries)
 
 
 async def resolve(
     request: Request,
+    on_delta: OnDelta | None = None,
 ) -> Response | NeedsCredentialOrProviderChange | NeedsContextCompression | Degenerate | Abort:
     """Call `send()` for `request`, looping while it returns `Retry`, and
     return the first non-`Retry` outcome. The shared mechanical retry loop
@@ -304,8 +328,10 @@ async def resolve(
     round trip) before it could be delivered."""
     attempt = request.attempt
     while True:
+        req = replace(request, attempt=attempt)
+        args = (req,) if on_delta is None else (req, on_delta)
         try:
-            outcome = await asyncio.to_thread(send, replace(request, attempt=attempt))
+            outcome = await asyncio.to_thread(send, *args)
         except UnknownProvider as exc:
             return NeedsCredentialOrProviderChange(f"unknown provider: {exc}")
         except ProviderNotWired as exc:

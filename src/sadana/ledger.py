@@ -89,9 +89,12 @@ _NOUNS: dict[str, _Noun] = {
     "messages": _Noun(
         "msg",
         # No `updated_at` and no `version`: a message row is never edited once
-        # written (`conversation_store._insert_messages`' own invariant, which
-        # is why it is `INSERT OR IGNORE` and never `REPLACE`). Its creation
-        # time *is* its last-changed time, and its version is always 1.
+        # its state has settled (`conversation_store._insert_messages`' own
+        # invariant — H21 adds exactly one exception, finalizing a
+        # provisional `state='streaming'` row in place, which is why that
+        # function is a conditional `ON CONFLICT ... WHERE state = 'streaming'`
+        # rather than a bare `INSERT OR IGNORE`). Its creation time *is* its
+        # last-changed time, and its version is always 1.
         ("SELECT id, created_at AS updated_at, 1 AS version FROM messages WHERE id IS NOT NULL",),
     ),
     "memory_entries": _Noun(
@@ -128,6 +131,7 @@ _NOUNS: dict[str, _Noun] = {
         ),
     ),
     "traces": _Noun("trc", ()),
+    "spans": _Noun("spn", ("SELECT id, updated_at, version FROM spans WHERE id IS NOT NULL",)),
     "schedules": _Noun("sch", ()),
     "approvals": _Noun("appr", ()),
     "operations": _Noun("op", ()),

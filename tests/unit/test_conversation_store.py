@@ -996,6 +996,77 @@ def test_saving_records_one_message_change_per_row_that_genuinely_landed(tmp_pat
     assert len({c.id for c in message_changes}) == 2
 
 
+def _insert_streaming_row(conn: sqlite3.Connection, *, conversation_key: str, msg_seq: int, created_at: float) -> str:
+    """H21 test helper — a provisional assistant row, the shape a turn's
+    own observer writes before the model has finished (built directly here
+    since `door/nouns/messages.py` doesn't exist yet in this work item)."""
+    provisional_id = ids.make_id("msg")
+    conn.execute(
+        "INSERT INTO messages "
+        "(conversation_key, msg_seq, role, content, tool_calls_json, tool_call_id, id, created_at, state) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (conversation_key, msg_seq, "assistant", "", "[]", None, provisional_id, created_at, "streaming"),
+    )
+    return provisional_id
+
+
+@pytest.mark.unit
+def test_a_streaming_row_is_finalized_in_place_keeping_its_own_id_and_created_at(tmp_path: Path) -> None:
+    conn = open_store(tmp_path / "c.db")
+    convo = _conversation(key="k1", messages=(Message(role="user", content="hi"),))
+    create(conn, convo, now=0.0, account_key="local")  # pragma: allowlist secret
+    provisional_id = _insert_streaming_row(conn, conversation_key=convo.key, msg_seq=1, created_at=5.0)
+
+    finished = replace(convo, messages=(*convo.messages, Message(role="assistant", content="the real answer")))
+    save(conn, finished, now=0.0)
+
+    row = conn.execute(
+        "SELECT id, content, state, created_at FROM messages WHERE conversation_key = ? AND msg_seq = 1", (convo.key,)
+    ).fetchone()
+    assert row["id"] == provisional_id
+    assert row["content"] == "the real answer"
+    assert row["state"] == "sent"
+    assert row["created_at"] == 5.0
+
+
+@pytest.mark.unit
+def test_an_already_sent_row_resubmitted_with_different_content_is_untouched(tmp_path: Path) -> None:
+    conn = open_store(tmp_path / "c.db")
+    convo = _conversation(
+        key="k1", messages=(Message(role="user", content="hi"), Message(role="assistant", content="original"))
+    )
+    create(conn, convo, now=0.0, account_key="local")  # pragma: allowlist secret
+    before = conn.execute(
+        "SELECT id, content, created_at FROM messages WHERE conversation_key = ? AND msg_seq = 1", (convo.key,)
+    ).fetchone()
+
+    tampered = replace(convo, messages=(convo.messages[0], Message(role="assistant", content="a different answer")))
+    save(conn, tampered, now=0.0)
+
+    after = conn.execute(
+        "SELECT id, content, created_at FROM messages WHERE conversation_key = ? AND msg_seq = 1", (convo.key,)
+    ).fetchone()
+    assert after["id"] == before["id"]
+    assert after["content"] == "original"
+    assert after["created_at"] == before["created_at"]
+
+
+@pytest.mark.unit
+def test_finalizing_a_streaming_row_records_a_changed_ledger_row_not_a_second_created(tmp_path: Path) -> None:
+    conn = open_store(tmp_path / "c.db")
+    convo = _conversation(key="k1", messages=(Message(role="user", content="hi"),))
+    create(conn, convo, now=0.0, account_key="local")  # pragma: allowlist secret
+    head = ledger.ledger_head(conn)
+    provisional_id = _insert_streaming_row(conn, conversation_key=convo.key, msg_seq=1, created_at=5.0)
+
+    finished = replace(convo, messages=(*convo.messages, Message(role="assistant", content="the real answer")))
+    save(conn, finished, now=0.0)
+
+    changes = [c for c in ledger.changes_since(conn, head, 10) if c.noun == "messages" and c.id == provisional_id]
+    assert len(changes) == 1
+    assert changes[0].kind == "changed"
+
+
 @pytest.mark.unit
 def test_a_change_row_cannot_outlive_the_write_it_describes(tmp_path: Path) -> None:
     """`create` raising on a duplicate key must leave nothing behind — not the

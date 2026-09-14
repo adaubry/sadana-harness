@@ -15,6 +15,7 @@ import tomllib
 from collections.abc import Callable
 from pathlib import Path
 from types import ModuleType
+from typing import Protocol
 
 import jsonschema
 
@@ -344,6 +345,29 @@ async def parking_approve(plugin: str, node: str, value: object) -> bool:
     return False
 
 
+# ── H21: live per-node records ───────────────────────────────────────────
+# Its full contract is `docs/tasks/H21-watched-streaming-live-runs-stop/spec.md`.
+
+
+class NodeSink(Protocol):
+    """A pure seam — the walker below reads no clock, so this carries no
+    timing of its own. `plugin_dispatch.py`'s own implementation reads
+    `time.time()` on both sides and turns one `node_started`/
+    `node_finished` pair into one `observability.record_node()` call.
+    Called for every node the walk visits, including a `wait`/pause and a
+    `call` parked for approval — those get `node_started` with no matching
+    `node_finished`, since the walk itself ends there. Every preview this
+    module hands to a sink is built through `_persistable_paused_value`
+    first, the same `_sadana_`-prefixed-key strip H18's parking already
+    uses — `value` always carries `_sadana_session_key` (and, once memory
+    is wired, `_sadana_memory_ctx`, holding a live `sqlite3.Connection`)
+    from `plugin_dispatch.build_dispatch()`'s own injection, neither of
+    which `_coerce_text`'s `json.dumps` can serialize."""
+
+    def node_started(self, node: str, kind: plugins.NodeKind, input_preview: str) -> None: ...
+    def node_finished(self, trace: plugins.NodeTrace, output_preview: str) -> None: ...
+
+
 async def run_graph(
     plugin_dir: Path,
     manifest: plugins.Manifest,
@@ -354,6 +378,7 @@ async def run_graph(
     approve: plugins.ApproveFn = _default_approve,
     resume: plugins.ResumeState | None = None,
     output_dir: Path | None = None,
+    node_sink: NodeSink | None = None,
 ) -> plugins.DagResult:
     """``_run_graph``'s walk, wrapped in the one thing that must surround the
     whole of it.
@@ -378,6 +403,7 @@ async def run_graph(
             ask=ask,
             approve=approve,
             resume=resume,
+            node_sink=node_sink,
         )
 
 
@@ -390,6 +416,7 @@ async def _run_graph(
     ask: plugins.AskFn,
     approve: plugins.ApproveFn,
     resume: plugins.ResumeState | None,
+    node_sink: NodeSink | None = None,
 ) -> plugins.DagResult:
     """Walks ``manifest``'s declared steps from ``entry.start``, exactly as
     ``validate()`` already proved they connect and never loop back on
@@ -455,8 +482,25 @@ async def _run_graph(
             failed_node=failed_node,
         )
 
-    def failed(node: plugins.Node, detail: str) -> plugins.DagResult:
+    def failed(node: plugins.Node, detail: str, *, sink_error: str | None = None) -> plugins.DagResult:
         trace.append(plugins.NodeTrace(node=node.name, kind=node.kind, visit=0, ok=False, port=None, detail=detail))
+        if node_sink is not None:
+            # `sink_error`, when given (the `except Exception` branch
+            # below), is the exception's own message — a person reads it —
+            # kept distinct from `detail` above, which stays the generic
+            # sentence every other failure already writes into the trace
+            # this function returns as part of `DagResult`.
+            node_sink.node_finished(
+                plugins.NodeTrace(
+                    node=node.name,
+                    kind=node.kind,
+                    visit=0,
+                    ok=False,
+                    port=None,
+                    detail=sink_error if sink_error is not None else detail,
+                ),
+                _coerce_text(_persistable_paused_value(value))[:200],
+            )
         return result(f"{manifest.name}'s {node.name!r} step did not complete.", node.name)
 
     def finish_call_body(node: plugins.Node, body_value: object) -> tuple[object, str | None] | plugins.DagResult:
@@ -568,6 +612,8 @@ async def _run_graph(
 
     while True:
         node = by_name[current]
+        if node_sink is not None:
+            node_sink.node_started(node.name, node.kind, _coerce_text(_persistable_paused_value(value))[:200])
 
         if node.kind in plugins.KINDS_NOT_RUNNABLE:
             return failed(node, f"{node.kind} steps are not runnable yet")
@@ -631,9 +677,11 @@ async def _run_graph(
             else:
                 return failed(node, f"unrecognized node kind {node.kind!r}")
         except Exception as e:
-            return failed(node, f"node raised {type(e).__name__}")
+            return failed(node, f"node raised {type(e).__name__}", sink_error=f"{type(e).__name__}: {e}"[:200])
 
         trace.append(plugins.NodeTrace(node=node.name, kind=node.kind, visit=0, ok=True, port=port, detail=detail))
+        if node_sink is not None:
+            node_sink.node_finished(trace[-1], _coerce_text(_persistable_paused_value(value))[:200])
 
         next_name = port if node.kind == "route" else node.next
         if next_name is None:

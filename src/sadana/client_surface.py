@@ -63,6 +63,7 @@ from sadana.conversation import (
     Message,
     TemplateRecipe,
     TurnKey,
+    TurnObserver,
     append,
     create_conversation,
     iteration_budget_from_config,
@@ -378,6 +379,7 @@ async def take_turn(
     text: str,
     create_as: str | None,
     approve: plugins.ApproveFn | None = None,
+    observer: TurnObserver | None = None,
 ) -> TurnOutcome:
     """Run one turn for one person in one conversation, and say what happened.
 
@@ -419,6 +421,19 @@ async def take_turn(
     is already present on `runtime.conn`; `open_runtime()` ensures it once,
     and a caller that hand-builds a `Runtime` (this module's own tests) owns
     that setup itself.
+
+    `observer` (H21, default `None`): a one-line passthrough to
+    `plugin_dispatch.take_turn_and_reconcile`/`conversation.run_turn` — no
+    logic of its own here. Every existing caller (`subcommands/chat.py`,
+    `gateway_dispatch.handle_inbound`, `eval_harness.py`'s indirect path)
+    keeps compiling and passing with no change, since it is a new,
+    defaulted, trailing parameter. `runtime.recorder`'s three H21 fields
+    (`record_turn_started`, `record_plugin_run_started`, `record_node`) are
+    threaded into `build_dispatch` unconditionally, alongside the two
+    OBSERVABILITY-01 already passed — a caller that built its own
+    `Runtime` with `observability.make_recorder`'s real recorder gets live
+    records with no opt-in of its own, the same way it already gets
+    `record_turn`/`record_plugin_run`.
     """
     with stores.conversation_lock(conversation):
         conn = runtime.conn
@@ -485,6 +500,9 @@ async def take_turn(
             now=now,
             record_turn=runtime.recorder.record_turn,
             record_plugin_run=runtime.recorder.record_plugin_run,
+            record_turn_started=runtime.recorder.record_turn_started,
+            record_plugin_run_started=runtime.recorder.record_plugin_run_started,
+            record_node=runtime.recorder.record_node,
             memory_context=memory_store.DispatchContext(account_key=account, conn=conn),
             persist_pause=persist_pause,
             approve=resolved_approve,
@@ -499,6 +517,7 @@ async def take_turn(
             now=now,
             persist=conversation_store.bind_persist(conn, convo, now=now),
             record_turn=runtime.recorder.record_turn,
+            observer=observer,
         )
         await asyncio.to_thread(conversation_store.save, conn, convo, now=now)
         return TurnOutcome(
