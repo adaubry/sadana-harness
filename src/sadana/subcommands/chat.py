@@ -25,7 +25,7 @@ import sys
 import time
 from contextlib import closing
 
-from sadana import client_surface, memory
+from sadana import client_surface, memory, plugin_manifest
 from sadana.conversation import ConversationKey
 
 
@@ -67,6 +67,10 @@ async def _chat_loop(
             conversation=conversation,
             text=user_input,
             create_as=None,  # started before the first prompt, below
+            # H18. A real keyboard is here to answer a `call` node's
+            # approval prompt right now — `take_turn`'s own default
+            # (parking, never blocking) is for every caller that isn't.
+            approve=plugin_manifest._default_approve if sys.stdin.isatty() else None,
         )
 
         if outcome.answer:

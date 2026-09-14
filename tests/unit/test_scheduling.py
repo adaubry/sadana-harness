@@ -8,8 +8,9 @@ import threading
 import pytest
 
 from conftest import make_runtime, open_connections, plain_response, write_character
-from sadana import conversation_store, gateway_dispatch, memory, model_access, persona, persona_store
+from sadana import conversation_store, gateway_dispatch, memory, model_access, persona, persona_store, plugin_dispatch
 from sadana.conversation_store import due_triggers, load, upsert_scheduled_trigger
+from sadana.door.nouns import approvals as door_approvals
 from sadana.gateway import MessageEvent, session_key_for
 from sadana.scheduling import _advance, _is_due, tick
 
@@ -106,6 +107,54 @@ def test_tick_one_failing_trigger_does_not_stop_the_others_and_stays_due(
     assert {c.chat_id for c in calls} == {"broken", "fine"}
     remaining = due_triggers(conn, now=0.0)
     assert [t.name for t in remaining] == ["broken"]
+
+
+# ── H18: expiry runs on the same tick ────────────────────────────────────
+
+
+@pytest.mark.unit
+def test_tick_calls_expire_due_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    connections = open_connections()
+    monkeypatch.setattr(gateway_dispatch, "handle_inbound", _fake_handle_inbound([]))
+    calls: list[float] = []
+
+    async def fake_expire_due(_conns: object, now: float) -> int:
+        calls.append(now)
+        return 0
+
+    monkeypatch.setattr(door_approvals, "expire_due", fake_expire_due)
+
+    asyncio.run(tick(make_runtime(connections)))
+
+    assert len(calls) == 1
+
+
+@pytest.mark.unit
+def test_tick_one_failing_approval_expiry_does_not_stop_trigger_firing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The same per-item posture `test_tick_one_failing_trigger_does_not_stop_the_others_and_stays_due`
+    already proves for triggers, now for `expire_due`'s own rows: a row
+    whose resume raises is logged and skipped, and neither stops another
+    due trigger from firing nor gets marked `expired` itself."""
+    connections = open_connections()
+    conn = connections.writer
+    conversation_store.save_pause(
+        conn, conversation_key="k-expire", plugin="p", entry="e", node="n", trace=(), artifacts=(), kind="wait"
+    )
+    conn.execute("UPDATE approvals SET expires_at = 0 WHERE conversation_key = 'k-expire'")
+    conn.commit()
+    upsert_scheduled_trigger(conn, name="due", trigger_text="go", next_run_at=0.0, interval_seconds=None)
+    monkeypatch.setattr(gateway_dispatch, "handle_inbound", _fake_handle_inbound([]))
+
+    async def _raising_resume(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(plugin_dispatch, "resume_paused_run", _raising_resume)
+
+    fired = asyncio.run(tick(make_runtime(connections)))
+
+    assert fired == 1  # the trigger still fired despite the failed expiry
+    row = conn.execute("SELECT state FROM approvals WHERE conversation_key = 'k-expire'").fetchone()
+    assert row["state"] == "waiting"  # never marked expired, since the resume raised
 
 
 class _RecordingLock:

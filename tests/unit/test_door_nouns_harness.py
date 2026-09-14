@@ -45,7 +45,10 @@ def test_get_harness_shape(tmp_path: Path) -> None:
     assert result["id"] == "hrn_box"
     assert result["tether"] == "disconnected"
     assert result["org"] == "org_a"
-    assert result["capabilities"] == ("grammar.v1", "changes", "inventory")
+    # A subset, not an exact tuple: `DECLARED` is append-only across work
+    # items (H18's own two capabilities among them), so an exact-list
+    # equality here would re-break at every later addition.
+    assert set(result["capabilities"]) >= {"grammar.v1", "changes", "inventory"}
     assert result["ledger_head"] == 0
     assert result["leaves_the_box"] == ("harness",)
 

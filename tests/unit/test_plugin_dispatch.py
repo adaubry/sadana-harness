@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sqlite3
 from dataclasses import replace
 from pathlib import Path
 
@@ -571,7 +572,9 @@ def test_resume_paused_run_continues_the_walk_and_clears_the_pause_row(
         conn, conversation_key="k1", plugin="p", entry="do_it", node="future", trace=(), artifacts=()
     )
 
-    result = asyncio.run(plugin_dispatch.resume_paused_run(conn, "k1", "the-answer"))
+    result = asyncio.run(
+        plugin_dispatch.resume_paused_run(conn, "k1", decision="answer", state="answered", payload="the-answer")
+    )
 
     assert result.failed_node is None
     assert result.paused_node is None
@@ -589,7 +592,9 @@ def test_resume_paused_run_clears_the_pause_row_and_fails_closed_when_the_plugin
         conn, conversation_key="k1", plugin="gone", entry="do_it", node="future", trace=(), artifacts=()
     )
 
-    result = asyncio.run(plugin_dispatch.resume_paused_run(conn, "k1", "the-answer"))
+    result = asyncio.run(
+        plugin_dispatch.resume_paused_run(conn, "k1", decision="answer", state="answered", payload="the-answer")
+    )
 
     assert result.failed_node == "future"
     assert result.paused_node is None
@@ -607,7 +612,9 @@ def test_resume_paused_run_clears_the_pause_row_and_fails_closed_when_the_entry_
         conn, conversation_key="k1", plugin="p", entry="a-renamed-tool", node="future", trace=(), artifacts=()
     )
 
-    result = asyncio.run(plugin_dispatch.resume_paused_run(conn, "k1", "the-answer"))
+    result = asyncio.run(
+        plugin_dispatch.resume_paused_run(conn, "k1", decision="answer", state="answered", payload="the-answer")
+    )
 
     assert result.failed_node == "future"
     assert conversation_store.load_pause(conn, conversation_key="k1") is None
@@ -631,7 +638,9 @@ def test_resume_paused_run_clears_the_pause_row_and_fails_closed_when_the_node_w
         conn, conversation_key="k1", plugin="p", entry="do_it", node="a-renamed-node", trace=(), artifacts=()
     )
 
-    result = asyncio.run(plugin_dispatch.resume_paused_run(conn, "k1", "the-answer"))
+    result = asyncio.run(
+        plugin_dispatch.resume_paused_run(conn, "k1", decision="answer", state="answered", payload="the-answer")
+    )
 
     assert result.failed_node == "a-renamed-node"
     assert conversation_store.load_pause(conn, conversation_key="k1") is None
@@ -656,12 +665,202 @@ def test_resume_paused_run_hitting_a_second_wait_node_overwrites_the_pause_row(
         conn, conversation_key="k1", plugin="p", entry="do_it", node="future1", trace=(), artifacts=()
     )
 
-    result = asyncio.run(plugin_dispatch.resume_paused_run(conn, "k1", "first-answer"))
+    result = asyncio.run(
+        plugin_dispatch.resume_paused_run(conn, "k1", decision="answer", state="answered", payload="first-answer")
+    )
 
     assert result.paused_node == "future2"
     pause = conversation_store.load_pause(conn, conversation_key="k1")
     assert pause is not None
     assert pause.node == "future2"
+
+
+# ── H18: resume_paused_run's three decisions ─────────────────────────────
+
+
+def _call_then_stop_installed(
+    tmp_path: Path, *, body: str = "def do_call(value):\n    return {'called': value}\n"
+) -> None:
+    """A minimal single-`call`-node plugin, on a real `tmp_path` directory,
+    matching `wait_then_summarize_installed`'s own on-disk-fixture reasoning
+    (`plugin_manifest.validate()` parses a real `plugin.toml`)."""
+    plugin_dir = tmp_path / "p"
+    plugin_dir.mkdir()
+    plugin_dir.joinpath("init.py").write_text(body)
+    plugin_dir.joinpath("s.json").write_text('{"type": "object"}')
+    plugin_dir.joinpath("plugin.toml").write_text(
+        '[plugin]\nname = "p"\nversion = "0.1.0"\ndescription = "d"\n\n'
+        '[[entry]]\ntool = "do_it"\npurpose = "p"\nparameters = "s.json"\nstart = "reach_out"\n\n'
+        '[[node]]\nname = "reach_out"\nkind = "call"\nbody = "init:do_call"\n'
+    )
+
+
+def _approval_row(conn: sqlite3.Connection, *, conversation_key: str = "k1") -> sqlite3.Row:
+    row = conn.execute(
+        "SELECT state, answered_by, answer FROM approvals WHERE conversation_key = ?", (conversation_key,)
+    ).fetchone()
+    assert row is not None, f"no approvals row for {conversation_key!r}"
+    return row
+
+
+@pytest.mark.unit
+def test_resume_paused_run_approve_runs_the_body_and_marks_the_approval(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _call_then_stop_installed(tmp_path)
+    monkeypatch.setattr(plugins, "_plugins_root", lambda: tmp_path)
+    conn = open_conn()
+    conversation_store.save_pause(
+        conn,
+        conversation_key="k1",
+        plugin="p",
+        entry="do_it",
+        node="reach_out",
+        trace=(),
+        artifacts=(),
+        kind="call",
+        paused_value={"a": 1},
+    )
+
+    result = asyncio.run(
+        plugin_dispatch.resume_paused_run(conn, "k1", decision="approve", state="approved", answered_by="console:adam")
+    )
+
+    assert result.failed_node is None
+    # `_sadana_session_key` is re-injected fresh at resume time (H18) — the
+    # body sees it the same way it would on a live, unparked call.
+    assert result.text == json.dumps({"called": {"a": 1, "_sadana_session_key": "k1"}})
+    assert conversation_store.load_pause(conn, conversation_key="k1") is None
+    row = _approval_row(conn)
+    assert (row["state"], row["answered_by"]) == ("approved", "console:adam")
+
+
+@pytest.mark.unit
+def test_resume_paused_run_decline_fails_the_node_without_running_the_body_and_marks_the_approval(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _call_then_stop_installed(
+        tmp_path, body="def do_call(value):\n    raise AssertionError('must not run on decline')\n"
+    )
+    monkeypatch.setattr(plugins, "_plugins_root", lambda: tmp_path)
+    conn = open_conn()
+    conversation_store.save_pause(
+        conn,
+        conversation_key="k1",
+        plugin="p",
+        entry="do_it",
+        node="reach_out",
+        trace=(),
+        artifacts=(),
+        kind="call",
+        paused_value={"a": 1},
+    )
+
+    result = asyncio.run(
+        plugin_dispatch.resume_paused_run(
+            conn, "k1", decision="decline", state="declined", payload="not today", answered_by="console:adam"
+        )
+    )
+
+    assert result.failed_node == "reach_out"
+    assert conversation_store.load_pause(conn, conversation_key="k1") is None
+    row = _approval_row(conn)
+    assert (row["state"], row["answered_by"], row["answer"]) == ("declined", "console:adam", "not today")
+
+
+@pytest.mark.unit
+def test_resume_paused_run_answer_marks_the_approval_answered(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _wait_then_summarize_installed(tmp_path)
+    monkeypatch.setattr(plugins, "_plugins_root", lambda: tmp_path)
+    conn = open_conn()
+    conversation_store.save_pause(
+        conn, conversation_key="k1", plugin="p", entry="do_it", node="future", trace=(), artifacts=()
+    )
+
+    asyncio.run(
+        plugin_dispatch.resume_paused_run(conn, "k1", decision="answer", state="answered", payload="the-answer")
+    )
+
+    row = _approval_row(conn)
+    assert (row["state"], row["answer"]) == ("answered", "the-answer")
+
+
+@pytest.mark.unit
+def test_resume_paused_run_marks_the_approval_even_when_the_plugin_no_longer_resolves(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The not-found branch (plugin/entry/node no longer resolves) still
+    reaches the same `resolve_pause` call the happy path does — a resumed
+    decision is recorded whether or not the run itself could continue."""
+    monkeypatch.setattr(plugins, "_plugins_root", lambda: tmp_path)  # empty: no tmp_path/gone/plugin.toml
+    conn = open_conn()
+    conversation_store.save_pause(
+        conn, conversation_key="k1", plugin="gone", entry="do_it", node="future", trace=(), artifacts=()
+    )
+
+    result = asyncio.run(
+        plugin_dispatch.resume_paused_run(conn, "k1", decision="answer", state="answered", payload="the-answer")
+    )
+
+    assert result.failed_node == "future"
+    row = _approval_row(conn)
+    assert row["state"] == "answered"
+
+
+@pytest.mark.unit
+def test_a_call_node_parks_cleanly_with_a_real_memory_context_in_its_arguments(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression: `build_dispatch`'s own `_sadana_memory_ctx`/
+    `_sadana_session_key` injection put a live `DispatchContext` (holding a
+    raw `sqlite3.Connection`) straight into the value a parked `call` node
+    remembers — `json.dumps`-ing it inside `save_pause_from_result` raised
+    `TypeError: Object of type DispatchContext is not JSON serializable`,
+    caught by `conversation.py`'s own tool-call handler and surfaced as a
+    silently-wrong `tool_error:` result instead of a real park. Fixed by
+    stripping every `_sadana_`-prefixed key from `paused_value` before it is
+    persisted (`plugin_manifest._persistable_paused_value`)."""
+    _call_then_stop_installed(tmp_path)
+    monkeypatch.setattr(plugins, "_plugins_root", lambda: tmp_path)
+    conn = open_conn()
+    plugin_set = plugin_dispatch.build_plugin_set((_installed_p(tmp_path),))
+
+    async def persist_pause(turn_key: TurnKey, seq_in_turn: int, result: plugins.DagResult) -> None:
+        conversation_store.save_pause_from_result(
+            conn, conversation_key="c1", result=result, turn_seq=turn_key.turn_seq, seq_in_turn=seq_in_turn
+        )
+
+    dispatch, _tracker = build_dispatch(
+        _conversation(),
+        plugin_set,
+        provider="p",
+        model="m",
+        now=0.0,
+        approve=plugin_manifest.parking_approve,
+        memory_context=DispatchContext(account_key="a", conn=conn),
+        persist_pause=persist_pause,
+    )
+
+    result = asyncio.run(dispatch("do_it", {"a": 1}))  # must not raise
+
+    assert result.paused_node == "reach_out"
+    pause = conversation_store.load_pause(conn, conversation_key="c1")
+    assert pause is not None
+    # Stripped before persisting (`_sadana_session_key`/`_sadana_memory_ctx`
+    # are dispatch-time injection, not part of what was parked); re-injected
+    # fresh only at resume time (see the approve-runs-the-body test above).
+    assert pause.paused_value == {"a": 1}
+
+
+def _installed_p(tmp_path: Path) -> plugins.InstalledPlugin:
+    manifest = plugins.Manifest(
+        name="p",
+        version="0.1.0",
+        description="d",
+        entries=(plugins.Entry(tool="do_it", purpose="p", parameters="s.json", start="reach_out"),),
+        nodes=(plugins.Node(name="reach_out", kind="call", body="init:do_call"),),
+    )
+    return plugins.InstalledPlugin(name="p", directory=tmp_path / "p", manifest=manifest)
 
 
 # ── a dispatched run's output directory ──────────────────────────────────
@@ -753,7 +952,9 @@ def test_a_resumed_run_writes_into_the_directory_its_paused_half_used(
         seq_in_turn=3,
     )
 
-    asyncio.run(plugin_dispatch.resume_paused_run(conn, "k1", "the-answer"))
+    asyncio.run(
+        plugin_dispatch.resume_paused_run(conn, "k1", decision="answer", state="answered", payload="the-answer")
+    )
 
     assert seen[0] == artifact_store.for_run("k1", 7, 3)
 
@@ -774,7 +975,9 @@ def test_a_run_resumed_from_a_legacy_pause_row_gets_no_output_directory(
         conn, conversation_key="k1", plugin="p", entry="do_it", node="future", trace=(), artifacts=()
     )
 
-    asyncio.run(plugin_dispatch.resume_paused_run(conn, "k1", "the-answer"))
+    asyncio.run(
+        plugin_dispatch.resume_paused_run(conn, "k1", decision="answer", state="answered", payload="the-answer")
+    )
 
     assert seen == [None]
 

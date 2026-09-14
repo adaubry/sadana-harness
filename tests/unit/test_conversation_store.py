@@ -36,6 +36,7 @@ from sadana.conversation_store import (
     due_triggers,
     load,
     load_pause,
+    load_waiting_approval,
     open_store,
     save,
     save_pause,
@@ -710,6 +711,122 @@ def test_a_store_whose_plugin_pauses_predates_these_columns_migrates_and_still_l
     assert load_pause(reopened, conversation_key="k1") is not None
 
 
+@pytest.mark.unit
+def test_a_plugin_pauses_row_with_no_paused_kind_reads_back_as_wait(tmp_path: Path) -> None:
+    """The same legacy shape as the migration test above, one column
+    further: a pre-H18 row has no `paused_kind`/`paused_value_json` at all.
+    Every pre-H18 pause *was* a wait pause — nothing else could park before
+    H18 existed — so `load_pause` must default it to exactly that."""
+    path = tmp_path / "c.db"
+    raw = sqlite3.connect(path)
+    raw.execute(
+        """CREATE TABLE plugin_pauses (
+            conversation_key  TEXT PRIMARY KEY,
+            plugin            TEXT NOT NULL,
+            entry             TEXT NOT NULL,
+            node              TEXT NOT NULL,
+            trace_json        TEXT NOT NULL,
+            artifacts_json    TEXT NOT NULL,
+            turn_seq          INTEGER,
+            seq_in_turn       INTEGER
+        )"""
+    )
+    raw.execute(
+        "INSERT INTO plugin_pauses (conversation_key, plugin, entry, node, trace_json, artifacts_json) "
+        "VALUES ('k1', 'plugin-d', 'plugin_d_entry', 'await_answer', '[]', '[]')"
+    )
+    raw.commit()
+    raw.close()
+
+    conn = open_store(path)
+    pause = load_pause(conn, conversation_key="k1")
+
+    assert pause is not None
+    assert pause.kind == "wait"
+    assert pause.paused_value is None
+
+
+# ── H18: parked approvals ────────────────────────────────────────────────
+
+
+@pytest.mark.unit
+def test_save_pause_writes_a_matching_waiting_approval(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SADANA_APPROVALS_TTL_S", "100")
+    conn = open_store(tmp_path / "c.db")
+    before = 1_000.0
+    monkeypatch.setattr("time.time", lambda: before)
+
+    save_pause(
+        conn,
+        conversation_key="k1",
+        plugin="plugin-d",
+        entry="e",
+        node="reach_out",
+        trace=(),
+        artifacts=(),
+        kind="call",
+        paused_value={"a": 1},
+        question="plugin-d's 'reach_out' step is waiting for approval.",
+    )
+
+    approval = load_waiting_approval(conn, conversation_key="k1")
+    assert approval is not None
+    assert approval.conversation_key == "k1"
+    assert approval.plugin == "plugin-d"
+    assert approval.node == "reach_out"
+    assert approval.kind == "call"
+    assert approval.question == "plugin-d's 'reach_out' step is waiting for approval."
+    assert approval.state == "waiting"
+    assert approval.requested_at == before
+    assert approval.expires_at == before + 100
+    assert approval.version == 1
+
+
+@pytest.mark.unit
+def test_save_pause_upserts_the_waiting_approval_by_conversation(tmp_path: Path) -> None:
+    conn = open_store(tmp_path / "c.db")
+    save_pause(conn, conversation_key="k1", plugin="p", entry="e", node="first", trace=(), artifacts=())
+    first = load_waiting_approval(conn, conversation_key="k1")
+    assert first is not None
+
+    save_pause(conn, conversation_key="k1", plugin="p", entry="e", node="second", trace=(), artifacts=())
+    second = load_waiting_approval(conn, conversation_key="k1")
+
+    assert second is not None
+    assert second.node == "second"
+    assert second.id == first.id  # the same row, not a second one
+    assert second.version == first.version + 1
+
+
+@pytest.mark.unit
+def test_mark_approval_decided_transitions_state_and_ledgers(tmp_path: Path) -> None:
+    conn = open_store(tmp_path / "c.db")
+    save_pause(conn, conversation_key="k1", plugin="p", entry="e", node="n", trace=(), artifacts=())
+    head = ledger.ledger_head(conn)
+
+    with write_txn(conn) as c:
+        conversation_store.mark_approval_decided(
+            c, conversation_key="k1", state="approved", answered_by="console:adam", answer=None, at=42.0
+        )
+
+    assert load_waiting_approval(conn, conversation_key="k1") is None  # no longer waiting
+    row = conn.execute("SELECT state, answered_by, decided_at, version FROM approvals").fetchone()
+    assert (row["state"], row["answered_by"], row["decided_at"]) == ("approved", "console:adam", 42.0)
+    assert row["version"] == 2
+
+    changes = ledger.changes_since(conn, head, 10)
+    assert [(c.noun, c.kind, c.state) for c in changes] == [("approvals", "changed", "approved")]
+
+
+@pytest.mark.unit
+def test_mark_approval_decided_with_no_waiting_row_is_a_silent_no_op(tmp_path: Path) -> None:
+    conn = open_store(tmp_path / "c.db")
+    with write_txn(conn) as c:
+        conversation_store.mark_approval_decided(
+            c, conversation_key="never-existed", state="declined", answered_by=None, answer=None, at=1.0
+        )  # must not raise
+
+
 # ── H16: identity, the ledger, and the legacy fill ─────────────────────────
 
 
@@ -895,8 +1012,10 @@ def test_a_change_row_cannot_outlive_the_write_it_describes(tmp_path: Path) -> N
 
 @pytest.mark.unit
 def test_pausing_and_resuming_each_record_a_change_on_the_conversation(tmp_path: Path) -> None:
-    """A pause is not one of `ledger.NOUNS` and has no id; what an observer
-    needs to learn is that the conversation started and stopped waiting."""
+    """A pause itself is not one of `ledger.NOUNS` and has no id, but H18's
+    `approvals` row (written beside it) is — so what an observer sees is the
+    new approval, then the conversation moving twice: once as something
+    started waiting on it, once as the pause was cleared."""
     conn = open_store(tmp_path / "c.db")
     create(conn, _conversation(key="k1"), now=0.0, account_key="local")  # pragma: allowlist secret
     head = ledger.ledger_head(conn)
@@ -905,8 +1024,12 @@ def test_pausing_and_resuming_each_record_a_change_on_the_conversation(tmp_path:
     delete_pause(conn, conversation_key="k1")
 
     after = ledger.changes_since(conn, head, 10)
-    assert [(c.noun, c.kind) for c in after] == [("conversations", "changed"), ("conversations", "changed")]
-    assert [c.version for c in after] == [2, 3]
+    assert [(c.noun, c.kind) for c in after] == [
+        ("approvals", "created"),
+        ("conversations", "changed"),
+        ("conversations", "changed"),
+    ]
+    assert [c.version for c in after] == [1, 2, 3]
 
 
 @pytest.mark.unit

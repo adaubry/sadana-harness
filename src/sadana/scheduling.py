@@ -23,6 +23,7 @@ import logging
 import time
 
 from sadana import client_surface, conversation_store, gateway_dispatch, memory
+from sadana.door.nouns import approvals as door_approvals
 from sadana.gateway import MessageEvent
 
 logger = logging.getLogger(__name__)
@@ -68,6 +69,10 @@ async def tick(runtime: client_surface.Runtime) -> int:
     taking it here first would deadlock against it."""
     conn = runtime.conn
     now = time.time()
+    # H18. Expiry first: it touches no `scheduled_triggers` row, so its own
+    # ordering relative to trigger firing has no observable interaction —
+    # placed first as the simpler, cheaper-to-reason-about check.
+    await door_approvals.expire_due(runtime.connections, now)
     due = conversation_store.due_triggers(runtime.connections.reader(), now=now)
     fired = 0
     for trigger in due:
