@@ -62,6 +62,19 @@ class _Route:
     since: int = 0
     limit: int = 100
     operation_id: str | None = None
+    # H20. Set only for a child-nested path (`{plural}/{id}/{child_plural}
+    # [/{cid}]`) — the *parent's* id. `plural`/`id` above already carry the
+    # child's own plural/id in that case, so every existing lookup, gate and
+    # dispatch keeps working unchanged; this is the one new fact a child
+    # route adds.
+    parent_id: str | None = None
+    # H20. The URL's own parent plural (`conversations` in
+    # `/v1/conversations/{id}/messages`) — kept alongside `parent_id` so
+    # `_handle` can check it against the resolved child noun's own declared
+    # `spec.parent` before dispatching. Without this, `/v1/harness/x/messages`
+    # would resolve exactly like `/v1/conversations/x/messages` — the route
+    # alone can't currently tell a wrong parent plural from a right one.
+    parent_plural: str | None = None
 
 
 def _not_found(method: str, path: str) -> problems.Problem:
@@ -123,11 +136,27 @@ def _route(method: str, path: str, query: str) -> _Route | problems.Problem:
             return _Route(kind="act", plural=plural, id=segments[1], action_name=segments[3])
         return _not_found(method, path)
 
-    # One level of child nesting is in the grammar (requirement 1) for a
-    # later noun to use; nothing registered in H19 declares a `parent`, and
-    # the noun protocol itself carries only one `parent_id`, so a path
-    # shaped deeper than that (a grandchild segment) has no dispatch target
-    # yet. Reserved, not implemented: a real 404 today, not a guess.
+    # One level of child nesting (H20): `{plural}/{id}/{child_plural}` is the
+    # child's own `list`/`create` — `route.plural` becomes the *child's*
+    # plural, so `ctx.nouns.get(route.plural)` resolves the child noun with
+    # no new lookup logic, and `parent_id` carries the parent's id alongside.
+    if len(segments) == 3:
+        if method == "GET":
+            return _Route(kind="list", plural=segments[2], parent_id=segments[1], parent_plural=plural)
+        if method == "POST":
+            return _Route(kind="create", plural=segments[2], parent_id=segments[1], parent_plural=plural)
+        return _not_found(method, path)
+    # `{plural}/{id}/{child_plural}/{cid}` is the child's own `get`.
+    # `PATCH`/`DELETE`/an action on a nested child path has no dispatch
+    # target yet — no noun in this work item needs one, and `NounModule`'s
+    # `update`/`remove`/`act` have no `parent_id` parameter to receive it;
+    # a grandchild segment (five or more) is the same still-unimplemented
+    # case H19's own comment already named.
+    if len(segments) == 4 and segments[2] != "actions":
+        if method == "GET":
+            return _Route(kind="get", plural=segments[2], id=segments[3], parent_id=segments[1], parent_plural=plural)
+        return _not_found(method, path)
+
     return _not_found(method, path)
 
 
@@ -156,11 +185,11 @@ def _dispatch(ctx: DoorContext, principal: Principal, route: _Route, noun: NounM
         )
         if isinstance(params, problems.Problem):
             return params
-        return noun.list(ctx, principal, params)
+        return noun.list(ctx, principal, params, parent_id=route.parent_id)
     if route.kind == "get":
-        return noun.get(ctx, principal, route.id)  # type: ignore[arg-type]
+        return noun.get(ctx, principal, route.id, parent_id=route.parent_id)  # type: ignore[arg-type]
     if route.kind == "create":
-        return noun.create(ctx, principal, _json_body(request.body))
+        return noun.create(ctx, principal, _json_body(request.body), parent_id=route.parent_id)
     if route.kind == "update":
         return noun.update(ctx, principal, route.id, _json_body(request.body), if_match)  # type: ignore[arg-type]
     if route.kind == "remove":
@@ -207,6 +236,13 @@ def _handle(request: DoorRequest, *, ctx: DoorContext) -> DoorResponse:
 
     noun = ctx.nouns.get(route.plural or "")
     if noun is None:
+        return problem_response(_not_found(request.method, request.path))
+    # H20. A child route's own URL parent plural must match the noun it
+    # resolved to — otherwise `/v1/harness/x/messages` would dispatch to
+    # `messages` exactly like `/v1/conversations/x/messages` does, since
+    # `route.plural` is already the child's own plural by this point and
+    # nothing else here reads the URL's first segment again.
+    if route.parent_plural is not None and noun.spec.parent != route.parent_plural:
         return problem_response(_not_found(request.method, request.path))
 
     action: ActionSpec | None = None
@@ -296,6 +332,13 @@ def _handle(request: DoorRequest, *, ctx: DoorContext) -> DoorResponse:
             response = DoorResponse(status=204, headers={}, body=b"")
         elif route.kind == "list":
             response = json_response(200, _render_list(result))
+        elif isinstance(result, DoorResponse):
+            # `artifacts.download` (H20) is the one action whose result is
+            # already a full response — the bytes it streams, not a JSON
+            # resource `json_response` could serialize. Passed through
+            # unmodified; every other noun's `act()`/`create`/`update`
+            # still falls through to the generic branch below unchanged.
+            response = result
         else:
             status = 201 if route.kind == "create" else 200
             etag = str(result.get("version")) if route.kind in _ETAG_KINDS and isinstance(result, Mapping) else None

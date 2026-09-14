@@ -307,6 +307,12 @@ _MIGRATED_COLUMNS: dict[str, tuple[tuple[str, str], ...]] = {
         ("state", "TEXT NOT NULL DEFAULT 'active'"),
         ("tags_json", "TEXT NOT NULL DEFAULT '{}'"),
         ("agent", "TEXT"),
+        # H20 (docs/tasks/H20-door-nouns-turn-side/spec.md). Nullable, no
+        # default: there is no safe name to invent for a row older than this
+        # column, so it reads back `NULL` and `door/nouns/conversations.py`
+        # renders `name or key` at read time — CLAUDE.md's own rule for a
+        # column with no safe default.
+        ("name", "TEXT"),
     ),
     "messages": (
         ("id", "TEXT"),
@@ -518,6 +524,7 @@ def create(
     now: float,
     account_key: str,
     agent: str | None = None,
+    id: str | None = None,
 ) -> None:
     """Inserts one ``conversations`` row, and one ``conversation_accounts``
     row naming whose it is. Raises ``ConversationAlreadyExists`` on a
@@ -537,10 +544,16 @@ def create(
     silently mean something else. Passed in rather than looked up here, because
     ``persona_store`` imports this module and the reverse would be a cycle —
     ``client_surface._create`` already has both the account and the connection.
+
+    ``id`` defaults to a freshly minted one (every existing caller). H20's
+    door passes its own pre-minted value so a console-created conversation's
+    ``id`` equals its ``key`` (spec.md's "Decisions already made" — a
+    terminal-created conversation keeps its own auto-minted, key-independent
+    ``id``, unaffected by this parameter existing).
     """
     now_wall = time.time()
     with write_txn(conn) as c:
-        conversation_id = ids.make_id("conv")
+        conversation_id = id if id is not None else ids.make_id("conv")
         try:
             c.execute(
                 _INSERT_CONVERSATION_SQL,

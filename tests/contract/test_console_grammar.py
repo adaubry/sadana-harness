@@ -99,7 +99,7 @@ def test_get_harness(door: SimpleNamespace) -> None:
     assert resp.status == 200
     body = _json(resp)
     assert body["id"] == _HARNESS_ID
-    assert body["capabilities"] == ["grammar.v1", "changes", "inventory"]
+    assert body["capabilities"] == ["grammar.v1", "changes", "inventory", "artifacts.download"]
     assert body["leaves_the_box"] == ["harness", "widgets"]
 
 

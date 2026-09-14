@@ -45,7 +45,7 @@ def test_get_harness_shape(tmp_path: Path) -> None:
     assert result["id"] == "hrn_box"
     assert result["tether"] == "disconnected"
     assert result["org"] == "org_a"
-    assert result["capabilities"] == ("grammar.v1", "changes", "inventory")
+    assert result["capabilities"] == ("grammar.v1", "changes", "inventory", "artifacts.download")
     assert result["ledger_head"] == 0
     assert result["leaves_the_box"] == ("harness",)
 

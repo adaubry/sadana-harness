@@ -251,6 +251,7 @@ def _create(
     conversation: ConversationKey,
     template_name: str,
     now: float,
+    id: str | None = None,
 ) -> Conversation:
     """Build and insert one new conversation. Lock-free: both callers already
     hold the conversation's own lock, which is non-reentrant.
@@ -268,7 +269,13 @@ def _create(
 
     Raises `conversation_store.ConversationAlreadyExists` if the name is
     taken; callers that mean get-or-create reach here only after a failed
-    load."""
+    load.
+
+    `id` defaults to `None` (a freshly minted one, every existing caller).
+    The door (H20) is the only caller that ever passes one — its own
+    pre-minted `conversation`, so the created row's `id` equals its `key`
+    (spec.md's "Decisions already made": "key == id for console-created
+    conversations")."""
     # Every read here goes through this thread's own read-only connection, not
     # the writer. Sharing the writer for reads was H16's own defect, caught by
     # its deploy review: a SQLite transaction belongs to a *connection*, so a
@@ -307,6 +314,7 @@ def _create(
         now=now,
         account_key=account,
         agent=persona_store.get_selection(reader, account),
+        id=id,
     )
     return convo
 
@@ -317,6 +325,7 @@ def open_conversation(
     account: memory.AccountKey,
     conversation: ConversationKey,
     template_name: str | None,
+    id: str | None = None,
 ) -> None:
     """Open one conversation before anybody has said anything, and settle
     whether it is allowed to exist yet.
@@ -342,6 +351,9 @@ def open_conversation(
     first cut of this work item left it in `subcommands/chat.py`, which
     probed the store directly — a client reaching around the door, outside
     any lock, for the next client to copy.
+
+    `id`, like `_create`'s own, defaults to `None` and is passed straight
+    through — see `_create`'s docstring.
     """
     with stores.conversation_lock(conversation):
         if template_name is None:
@@ -354,6 +366,7 @@ def open_conversation(
             conversation=conversation,
             template_name=template_name,
             now=time.monotonic(),
+            id=id,
         )
 
 
