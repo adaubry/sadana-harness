@@ -199,6 +199,10 @@ def test_cmd_chat_declined_approval_stops_the_call_node_safely(monkeypatch: pyte
     responses = iter([tool_call_response("plugin_a_entry"), plain_response("ok, noted")])
     monkeypatch.setattr(model_access, "send", lambda request: next(responses))
     _feed(monkeypatch, "please call plugin_a_entry", "n")  # 2nd input() is the approval prompt
+    # H18: `cmd_chat` now only reaches for the interactive approver on a
+    # real TTY (`sys.stdin.isatty()`) — pytest's own stdin is never one, so
+    # this test states it explicitly, the same way it already fakes `input()`.
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
 
     assert cmd_chat(_args(key="approval-test")) == 0
 

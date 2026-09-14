@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 
 from conftest import write_skill as _write_skill
-from sadana import execution
+from sadana import execution, plugin_manifest
 from sadana.plugin_manifest import _default_approve, discover_plugins, load_skill, run_graph, validate
 from sadana.plugins import (
     Artifact,
@@ -648,6 +648,67 @@ def test_run_graph_call_node_records_what_was_asked(tmp_path: Path) -> None:
 
 
 @pytest.mark.unit
+def test_call_node_parks_under_parking_approve(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """H18. `parking_approve` is recognised by identity before it would ever
+    be called — proven by monkeypatching its body to raise, so a test that
+    reaches the body at all fails loudly rather than silently passing on
+    parking_approve's own `False`. The node's body must not run either."""
+    plugin_dir = _write_init_py(
+        tmp_path, "def do_call(value):\n    raise AssertionError('body must not run while parked')\n"
+    )
+    manifest = _manifest(Node(name="reach_out", kind="call", body="init:do_call"), name="my-plugin")
+
+    async def _raising_parking_approve(_plugin: str, _node: str, _value: object) -> bool:
+        raise AssertionError("parking_approve must never actually be awaited")
+
+    monkeypatch.setattr(plugin_manifest, "parking_approve", _raising_parking_approve)
+    result = asyncio.run(
+        run_graph(
+            plugin_dir,
+            manifest,
+            _entry("reach_out"),
+            {"a": 1},
+            ask=_stub_ask_ok,
+            approve=plugin_manifest.parking_approve,
+        )
+    )
+    assert result.failed_node is None
+    assert result.paused_node == "reach_out"
+    assert result.paused_kind == "call"
+    assert result.paused_value == {"a": 1}
+    assert result.text == "my-plugin's 'reach_out' step is waiting for approval."
+    assert result.trace == ()
+
+
+@pytest.mark.unit
+def test_resume_call_approve_runs_body_and_continues(tmp_path: Path) -> None:
+    plugin_dir = _write_init_py(tmp_path, "def do_call(value):\n    return {'called': value}\n")
+    nodes = (
+        Node(name="reach_out", kind="call", body="init:do_call", next="done"),
+        Node(name="done", kind="stop"),
+    )
+    manifest = _manifest(*nodes)
+    resume = ResumeState(node="reach_out", value={"a": 1}, trace=(), artifacts=(), kind="call", decision="approve")
+    result = asyncio.run(run_graph(plugin_dir, manifest, _entry("reach_out"), {}, ask=_stub_ask_ok, resume=resume))
+    assert result.failed_node is None
+    assert result.paused_node is None
+    assert result.text == json.dumps({"called": {"a": 1}})
+    assert [t.node for t in result.trace] == ["reach_out", "done"]
+
+
+@pytest.mark.unit
+def test_resume_call_decline_fails_without_running_body(tmp_path: Path) -> None:
+    plugin_dir = _write_init_py(
+        tmp_path, "def do_call(value):\n    raise AssertionError('body must not run on decline')\n"
+    )
+    manifest = _manifest(Node(name="reach_out", kind="call", body="init:do_call"))
+    resume = ResumeState(node="reach_out", value={"a": 1}, trace=(), artifacts=(), kind="call", decision="decline")
+    result = asyncio.run(run_graph(plugin_dir, manifest, _entry("reach_out"), {}, ask=_stub_ask_ok, resume=resume))
+    assert result.failed_node == "reach_out"
+    assert result.trace[-1].detail == "declined"
+
+
+@pytest.mark.unit
 def test_run_graph_refuses_each_nodes(tmp_path: Path) -> None:
     plugin_dir = _write_init_py(tmp_path, "")
     manifest = _manifest(Node(name="future", kind="each"))
@@ -679,7 +740,7 @@ def test_run_graph_resume_continues_past_the_wait_node_with_the_resumed_value(tm
         Node(name="after", kind="compute", body="init:step"),
     )
     manifest = _manifest(*nodes)
-    resume = ResumeState(node="future", value="answer", trace=(), artifacts=())
+    resume = ResumeState(node="future", value="answer", trace=(), artifacts=(), kind="wait")
     result = asyncio.run(run_graph(plugin_dir, manifest, _entry("future"), {}, ask=_stub_ask_ok, resume=resume))
     assert result.failed_node is None
     assert result.paused_node is None
@@ -698,7 +759,7 @@ def test_run_graph_resume_carries_the_prior_trace_and_artifacts_forward(tmp_path
     manifest = _manifest(*nodes)
     prior_trace = (NodeTrace(node="before", kind="compute", visit=0, ok=True, port=None, detail=None),)
     prior_artifacts = (Artifact(kind="link", name="n", ref="r"),)
-    resume = ResumeState(node="future", value="done", trace=prior_trace, artifacts=prior_artifacts)
+    resume = ResumeState(node="future", value="done", trace=prior_trace, artifacts=prior_artifacts, kind="wait")
     result = asyncio.run(run_graph(plugin_dir, manifest, _entry("before"), {}, ask=_stub_ask_ok, resume=resume))
     assert result.failed_node is None
     assert result.text == "done"
@@ -712,7 +773,7 @@ def test_run_graph_resume_at_a_wait_node_with_no_successor_returns_the_answer_as
 ) -> None:
     plugin_dir = _write_init_py(tmp_path, "")
     manifest = _manifest(Node(name="future", kind="wait"))
-    resume = ResumeState(node="future", value="answer", trace=(), artifacts=())
+    resume = ResumeState(node="future", value="answer", trace=(), artifacts=(), kind="wait")
     result = asyncio.run(run_graph(plugin_dir, manifest, _entry("future"), {}, ask=_stub_ask_ok, resume=resume))
     assert result.failed_node is None
     assert result.paused_node is None
@@ -724,7 +785,7 @@ def test_run_graph_resume_hitting_a_second_wait_node_pauses_again(tmp_path: Path
     plugin_dir = _write_init_py(tmp_path, "")
     nodes = (Node(name="future1", kind="wait", next="future2"), Node(name="future2", kind="wait"))
     manifest = _manifest(*nodes)
-    resume = ResumeState(node="future1", value="first-answer", trace=(), artifacts=())
+    resume = ResumeState(node="future1", value="first-answer", trace=(), artifacts=(), kind="wait")
     result = asyncio.run(run_graph(plugin_dir, manifest, _entry("future1"), {}, ask=_stub_ask_ok, resume=resume))
     assert result.failed_node is None
     assert result.paused_node == "future2"
@@ -922,7 +983,7 @@ def test_real_plugin_d_pauses_then_resumes_end_to_end() -> None:
     assert first.paused_node == "await_answer"
     assert [t.node for t in first.trace] == ["start_job"]
 
-    resume = ResumeState(node="await_answer", value="42", trace=first.trace, artifacts=first.artifacts)
+    resume = ResumeState(node="await_answer", value="42", trace=first.trace, artifacts=first.artifacts, kind="wait")
     second = asyncio.run(run_graph(installed.directory, installed.manifest, entry, {}, ask=_stub_ask_ok, resume=resume))
     assert second.failed_node is None
     assert second.paused_node is None
@@ -1107,7 +1168,7 @@ def test_a_resume_missing_a_setting_keeps_its_pause_and_its_history(
         nodes=(Node(name="await_answer", kind="wait", next="done"), Node(name="done", kind="stop")),
     )
     already = (NodeTrace(node="start_job", kind="call", visit=0, ok=True, port=None, detail=None),)
-    resume = ResumeState(node="await_answer", value={"reply": "ok"}, trace=already, artifacts=())
+    resume = ResumeState(node="await_answer", value={"reply": "ok"}, trace=already, artifacts=(), kind="wait")
 
     result = asyncio.run(run_graph(plugin_dir, manifest, _entry("await_answer"), {}, ask=_stub_ask_ok, resume=resume))
 

@@ -38,6 +38,8 @@ DECLARED: tuple[str, ...] = (
     "grammar.v1",
     "changes",
     "inventory",
+    "approvals.wait",
+    "approvals.call",
 )
 
 _unknown = [name for name in DECLARED if name not in ALL]

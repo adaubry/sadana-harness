@@ -27,6 +27,7 @@ import time
 from collections.abc import Awaitable, Callable, Iterator
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
+from typing import Literal
 
 from sadana import config, context, ids, ledger, plugins
 from sadana.conversation import (
@@ -121,6 +122,44 @@ CREATE TABLE IF NOT EXISTS conversation_accounts (
     conversation_key  TEXT PRIMARY KEY REFERENCES conversations(key),
     account_key       TEXT NOT NULL
 );
+
+-- H18 (docs/tasks/H18-parked-approvals/spec.md). Every wait on a person —
+-- a `wait` node's question or a `call` node's permission request — as one
+-- durable row, written before anyone is asked. `conversation_key` is a
+-- name, not `plugin_pauses(conversation_key)` itself, on purpose: this row
+-- outlives its pause (a decided or expired approval stays after
+-- `plugin_pauses` is cleared), so it cannot be a foreign key to a row that
+-- may already be gone by the time somebody reads the approval back.
+
+CREATE TABLE IF NOT EXISTS approvals (
+    id                TEXT PRIMARY KEY,
+    conversation_key  TEXT NOT NULL,
+    turn_seq          INTEGER,
+    seq_in_turn       INTEGER,
+    run_id            TEXT,
+    plugin            TEXT NOT NULL,
+    entry             TEXT NOT NULL,
+    node              TEXT NOT NULL,
+    kind              TEXT NOT NULL,
+    question          TEXT NOT NULL,
+    requested_at      REAL NOT NULL,
+    expires_at        REAL NOT NULL,
+    state             TEXT NOT NULL DEFAULT 'waiting',
+    answered_by       TEXT,
+    answer            TEXT,
+    decided_at        REAL,
+    created_at        REAL NOT NULL,
+    updated_at        REAL NOT NULL,
+    version           INTEGER NOT NULL DEFAULT 1
+);
+
+-- At most one *waiting* approval per conversation, the same invariant
+-- `plugin_pauses`' own `PRIMARY KEY (conversation_key)` gives its own
+-- table — expressed as a partial unique index here because a conversation
+-- keeps every one of its decided/expired approvals as history, so
+-- `conversation_key` alone cannot be the table's primary key.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_approvals_one_waiting_per_conversation
+    ON approvals (conversation_key) WHERE state = 'waiting';
 """
 
 #: Indexes on columns H16 added, run **after** ``migrate_columns`` and never
@@ -144,9 +183,16 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_id ON messages (id);
 #: H16's P1 acceptance criterion ("a state from a written closed set"). A
 #: console branches on these words, so a fourteenth reaches it as an unhandled
 #: case rather than as a feature. Nothing can move a conversation off `active`
-#: or a message off `sent` yet: H18 owns waiting, H19 owns closing.
+#: or a message off `sent` yet — H18 gives *waiting* its own closed set on
+#: `approvals` instead (`APPROVAL_STATES`, below): a conversation with an
+#: outstanding pause stays `active` (`save_pause`'s own comment on why), so
+#: this pair is still exactly what H16 left it. H19 owns closing.
 CONVERSATION_STATES = frozenset({"active"})
 MESSAGE_STATES = frozenset({"sent"})
+
+#: H18. Every word `approvals.state` may hold — the same closed-set
+#: contract as the pair above.
+APPROVAL_STATES = frozenset({"waiting", "approved", "declined", "answered", "expired"})
 
 _CONVERSATION_COLUMNS = (
     "key",
@@ -317,6 +363,13 @@ _MIGRATED_COLUMNS: dict[str, tuple[tuple[str, str], ...]] = {
     "plugin_pauses": (
         ("turn_seq", "INTEGER"),
         ("seq_in_turn", "INTEGER"),
+        # H18. Nullable, no default: a row written before this item has no
+        # idea which kind it paused as. `load_pause` reads a `NULL` back as
+        # `kind="wait"` — every pre-H18 pause *was* a wait pause, nothing
+        # else could park before this item existed — matching CLAUDE.md's
+        # "falls back to matching pre-fix behavior at read time."
+        ("paused_kind", "TEXT"),
+        ("paused_value_json", "TEXT"),
     ),
 }
 
@@ -839,10 +892,10 @@ def delete_scheduled_trigger(conn: sqlite3.Connection, *, name: str) -> None:
 @dataclass(frozen=True)
 class Pause:
     """One row of ``plugin_pauses`` — everything ``plugin_dispatch.
-    resume_paused_run()`` needs to continue a `wait`-paused
-    ``run_graph()`` walk later. Never the plugin's directory or ``Manifest``
-    object, only its name — re-resolved fresh at resume time (see
-    ``plugins.ResumeState``'s own docstring)."""
+    resume_paused_run()`` needs to continue a paused ``run_graph()`` walk
+    later. Never the plugin's directory or ``Manifest`` object, only its
+    name — re-resolved fresh at resume time (see ``plugins.ResumeState``'s
+    own docstring)."""
 
     plugin: str
     entry: str
@@ -854,6 +907,135 @@ class Pause:
     # what it meant; `None` is a row written before they existed.
     turn_seq: int | None = None
     seq_in_turn: int | None = None
+    # H18. Which kind of node this is, and — for a `call` — the value its
+    # body would have received. `kind` defaults to `"wait"`: a row written
+    # before this item, or by a test that never set it, was always a
+    # `wait` pause (nothing else could park before H18 existed).
+    kind: Literal["wait", "call"] = "wait"
+    paused_value: object = None
+
+
+@dataclass(frozen=True)
+class ApprovalRow:
+    """One row of ``approvals`` (H18) — the console's own shape for a
+    parked wait or call, read back exactly as stored. Never constructed by
+    hand outside this module; `door/nouns/approvals.py` renders it onto the
+    wire, never the other way around."""
+
+    id: str
+    conversation_key: str
+    turn_seq: int | None
+    seq_in_turn: int | None
+    run_id: str | None
+    plugin: str
+    entry: str
+    node: str
+    kind: Literal["wait", "call"]
+    question: str
+    requested_at: float
+    expires_at: float
+    state: Literal["waiting", "approved", "declined", "answered", "expired"]
+    answered_by: str | None
+    answer: str | None
+    decided_at: float | None
+    created_at: float
+    updated_at: float
+    version: int
+
+
+def _write_pause_c(
+    c: sqlite3.Connection,
+    *,
+    conversation_key: str,
+    plugin: str,
+    entry: str,
+    node: str,
+    trace: tuple[plugins.NodeTrace, ...],
+    artifacts: tuple[plugins.Artifact, ...],
+    turn_seq: int | None,
+    seq_in_turn: int | None,
+    kind: Literal["wait", "call"],
+    paused_value: object,
+    question: str | None,
+    now: float,
+) -> None:
+    """The body of ``save_pause()``, on a connection already inside a
+    ``write_txn`` — factored out so ``resolve_pause()`` can fold a re-pause
+    into the same transaction as the approval that produced it, rather than
+    opening a second one. ``question`` defaults to a generic sentence naming
+    the plugin and node when the caller doesn't have the real
+    ``DagResult.text`` on hand (most direct callers besides
+    ``save_pause_from_result`` are tests exercising ``plugin_pauses`` alone)."""
+    resolved_question = question or (
+        f"{plugin}'s {node!r} step is waiting for {'approval' if kind == 'call' else 'an external answer'}."
+    )
+    c.execute(
+        "INSERT INTO plugin_pauses (conversation_key, plugin, entry, node, trace_json, artifacts_json, "
+        "turn_seq, seq_in_turn, paused_kind, paused_value_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+        "ON CONFLICT(conversation_key) DO UPDATE SET "
+        "plugin=excluded.plugin, entry=excluded.entry, node=excluded.node, "
+        "trace_json=excluded.trace_json, artifacts_json=excluded.artifacts_json, "
+        "turn_seq=excluded.turn_seq, seq_in_turn=excluded.seq_in_turn, "
+        "paused_kind=excluded.paused_kind, paused_value_json=excluded.paused_value_json",
+        (
+            conversation_key,
+            plugin,
+            entry,
+            node,
+            json.dumps([asdict(t) for t in trace]),
+            json.dumps([asdict(a) for a in artifacts]),
+            turn_seq,
+            seq_in_turn,
+            kind,
+            json.dumps(paused_value),
+        ),
+    )
+    expires_at = now + config.env_int("SADANA_APPROVALS_TTL_S", 86400)
+    c.execute(
+        "INSERT INTO approvals (id, conversation_key, turn_seq, seq_in_turn, run_id, plugin, entry, node, "
+        "kind, question, requested_at, expires_at, state, created_at, updated_at, version) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'waiting', ?, ?, 1) "
+        "ON CONFLICT (conversation_key) WHERE state = 'waiting' DO UPDATE SET "
+        "turn_seq=excluded.turn_seq, seq_in_turn=excluded.seq_in_turn, run_id=excluded.run_id, "
+        "plugin=excluded.plugin, entry=excluded.entry, node=excluded.node, kind=excluded.kind, "
+        "question=excluded.question, requested_at=excluded.requested_at, expires_at=excluded.expires_at, "
+        "updated_at=excluded.updated_at, version=approvals.version + 1",
+        (
+            ids.make_id("appr"),
+            conversation_key,
+            turn_seq,
+            seq_in_turn,
+            None,  # run_id: OBSERVABILITY-01's own run identity isn't threaded here yet
+            plugin,
+            entry,
+            node,
+            kind,
+            resolved_question,
+            now,
+            expires_at,
+            now,
+            now,
+        ),
+    )
+    row = c.execute(
+        "SELECT id, state, version FROM approvals WHERE conversation_key = ? AND state = 'waiting'",
+        (conversation_key,),
+    ).fetchone()
+    if row is not None:
+        # `version == 1` only on the branch that inserted a fresh row —
+        # matching `save()`'s own "the row just read answers which branch
+        # ran without a second probe" convention.
+        ledger.record_change(
+            c,
+            noun="approvals",
+            id=row["id"],
+            kind="created" if row["version"] == 1 else "changed",
+            state=row["state"],
+            version=row["version"],
+            at=now,
+        )
+    # The conversation itself moved: something is now waiting on it.
+    _record_conversation_change(c, conversation_key, at=now)
 
 
 def save_pause(
@@ -867,35 +1049,34 @@ def save_pause(
     artifacts: tuple[plugins.Artifact, ...],
     turn_seq: int | None = None,
     seq_in_turn: int | None = None,
+    kind: Literal["wait", "call"] = "wait",
+    paused_value: object = None,
+    question: str | None = None,
 ) -> None:
     """Upserts by ``conversation_key`` — a run that pauses a second time
-    (at a second `wait` node) overwrites its own prior pause row cleanly
-    rather than leaving two, matching ``PRIMARY KEY``'s own "at most one
-    outstanding pause per conversation" constraint."""
+    overwrites its own prior pause row cleanly rather than leaving two,
+    matching ``PRIMARY KEY``'s own "at most one outstanding pause per
+    conversation" constraint. Also writes (H18) the matching ``approvals``
+    row in the same transaction: the same one-at-a-time invariant, enforced
+    there by the partial unique index on ``state = 'waiting'`` rather than a
+    literal primary key, since a decided or expired approval outlives its
+    pause and stays as history."""
     with write_txn(conn) as c:
-        c.execute(
-            "INSERT INTO plugin_pauses (conversation_key, plugin, entry, node, trace_json, artifacts_json, "
-            "turn_seq, seq_in_turn) VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
-            "ON CONFLICT(conversation_key) DO UPDATE SET "
-            "plugin=excluded.plugin, entry=excluded.entry, node=excluded.node, "
-            "trace_json=excluded.trace_json, artifacts_json=excluded.artifacts_json, "
-            "turn_seq=excluded.turn_seq, seq_in_turn=excluded.seq_in_turn",
-            (
-                conversation_key,
-                plugin,
-                entry,
-                node,
-                json.dumps([asdict(t) for t in trace]),
-                json.dumps([asdict(a) for a in artifacts]),
-                turn_seq,
-                seq_in_turn,
-            ),
+        _write_pause_c(
+            c,
+            conversation_key=conversation_key,
+            plugin=plugin,
+            entry=entry,
+            node=node,
+            trace=trace,
+            artifacts=artifacts,
+            turn_seq=turn_seq,
+            seq_in_turn=seq_in_turn,
+            kind=kind,
+            paused_value=paused_value,
+            question=question,
+            now=time.time(),
         )
-        # The conversation itself moved: something is now waiting on it. H18
-        # gives that a state word and an addressable approval; until then the
-        # honest record is that the row changed, not that it entered a state
-        # this codebase cannot yet leave.
-        _record_conversation_change(c, conversation_key, at=time.time())
 
 
 def save_pause_from_result(
@@ -908,12 +1089,14 @@ def save_pause_from_result(
 ) -> None:
     """`save_pause()`, unpacking a `paused_node`-bearing `DagResult` — the
     one place that knows how a paused run's fields map onto a
-    `plugin_pauses` row, called from both of this project's two paths that
-    can produce one (`plugin_dispatch.build_dispatch()`'s own `dispatch`
-    closure, for a run's first pause; `plugin_dispatch.resume_paused_run()`,
-    for a second). `result.paused_node is None` is the caller's own error —
-    this function trusts it was already checked, the same posture
-    `save_pause()` itself takes toward its own arguments."""
+    `plugin_pauses` row and its matching `approvals` row (H18), called from
+    both of this project's two paths that can produce one
+    (`plugin_dispatch.build_dispatch()`'s own `dispatch` closure, for a
+    run's first pause; `plugin_dispatch.resume_paused_run()`, for a second).
+    `result.paused_node is None` is the caller's own error — this function
+    trusts it was already checked, the same posture `save_pause()` itself
+    takes toward its own arguments. `result.paused_kind` defaults to
+    `"wait"` for a `DagResult` built before H18's fields existed."""
     assert result.paused_node is not None, "save_pause_from_result called with a non-paused DagResult"
     save_pause(
         conn,
@@ -925,6 +1108,9 @@ def save_pause_from_result(
         artifacts=result.artifacts,
         turn_seq=turn_seq,
         seq_in_turn=seq_in_turn,
+        kind=result.paused_kind or "wait",
+        paused_value=result.paused_value,
+        question=result.text,
     )
 
 
@@ -932,8 +1118,8 @@ def load_pause(conn: sqlite3.Connection, *, conversation_key: str) -> Pause | No
     """``None`` when the conversation has no outstanding pause — the normal
     case every inbound message not resuming something checks first."""
     row = conn.execute(
-        "SELECT plugin, entry, node, trace_json, artifacts_json, turn_seq, seq_in_turn "
-        "FROM plugin_pauses WHERE conversation_key = ?",
+        "SELECT plugin, entry, node, trace_json, artifacts_json, turn_seq, seq_in_turn, "
+        "paused_kind, paused_value_json FROM plugin_pauses WHERE conversation_key = ?",
         (conversation_key,),
     ).fetchone()
     if row is None:
@@ -946,18 +1132,183 @@ def load_pause(conn: sqlite3.Connection, *, conversation_key: str) -> Pause | No
         artifacts=tuple(plugins.Artifact(**a) for a in json.loads(row["artifacts_json"])),
         turn_seq=row["turn_seq"],
         seq_in_turn=row["seq_in_turn"],
+        kind=row["paused_kind"] or "wait",
+        paused_value=json.loads(row["paused_value_json"]) if row["paused_value_json"] is not None else None,
     )
+
+
+def _clear_pause_c(c: sqlite3.Connection, *, conversation_key: str, now: float) -> None:
+    """The body of ``delete_pause()``, on a connection already inside a
+    ``write_txn`` — factored out for the same reason as ``_write_pause_c``."""
+    c.execute("DELETE FROM plugin_pauses WHERE conversation_key = ?", (conversation_key,))
+    _record_conversation_change(c, conversation_key, at=now)
 
 
 def delete_pause(conn: sqlite3.Connection, *, conversation_key: str) -> None:
     """A key with no row is a silent no-op, same as ``delete_scheduled_trigger``.
 
     The ledger row is written against the *conversation*, not the pause: a
-    pause is not one of `ledger.NOUNS` and has no id of its own, and what an
-    observer needs to learn is that the conversation stopped waiting. A key
-    with no pause still bumps the conversation, which is the cost of keeping
-    this a no-op rather than a lookup — it is called once per resume, always
-    for a pause that existed."""
+    pause is not one of `ledger.NOUNS` and has no id of its own (H18's
+    matching `approvals` row is, and outlives this delete as history — see
+    `resolve_pause`). A key with no pause still bumps the conversation,
+    which is the cost of keeping this a no-op rather than a lookup — it is
+    called once per resume, always for a pause that existed."""
     with write_txn(conn) as c:
-        c.execute("DELETE FROM plugin_pauses WHERE conversation_key = ?", (conversation_key,))
-        _record_conversation_change(c, conversation_key, at=time.time())
+        _clear_pause_c(c, conversation_key=conversation_key, now=time.time())
+
+
+def resolve_pause(
+    conn: sqlite3.Connection,
+    *,
+    conversation_key: str,
+    result: plugins.DagResult,
+    state: Literal["approved", "declined", "answered", "expired"],
+    answered_by: str | None,
+    answer: str | None,
+    turn_seq: int | None,
+    seq_in_turn: int | None,
+) -> None:
+    """What a resume's own decision does to the store, in one transaction
+    (H18): marks the conversation's *waiting* ``approvals`` row ``state``,
+    then either clears ``plugin_pauses`` (``result`` reached a terminal
+    node) or rewrites it for a fresh pause (the walk parked again further
+    down the same graph) — the same two branches
+    ``plugin_dispatch.resume_paused_run`` had before this function existed,
+    now atomic with the decision that produced them. The old row leaves
+    ``state = 'waiting'`` before any new one is written, so the partial
+    unique index never sees two waiting rows for this conversation at once.
+
+    ``state`` is the caller's own to state, not derived from anything here —
+    every caller already knows it trivially (an `approve` action passes
+    `"approved"`, `expire_due` passes `"expired"`, and so on), and deriving
+    it from `resume_paused_run`'s `decision` would need a carve-out the
+    moment one `decision` value could mean two different facts (expiry
+    resumes with `decision="decline"` but the row must read `"expired"`,
+    not `"declined"` — a person never answered, which is a different fact
+    than a person answering no)."""
+    now_wall = time.time()
+    with write_txn(conn) as c:
+        mark_approval_decided(
+            c, conversation_key=conversation_key, state=state, answered_by=answered_by, answer=answer, at=now_wall
+        )
+        if result.paused_node is None:
+            _clear_pause_c(c, conversation_key=conversation_key, now=now_wall)
+        else:
+            _write_pause_c(
+                c,
+                conversation_key=conversation_key,
+                plugin=result.plugin,
+                entry=result.entry,
+                node=result.paused_node,
+                trace=result.trace,
+                artifacts=result.artifacts,
+                turn_seq=turn_seq,
+                seq_in_turn=seq_in_turn,
+                kind=result.paused_kind or "wait",
+                paused_value=result.paused_value,
+                question=result.text,
+                now=now_wall,
+            )
+
+
+_APPROVAL_COLUMNS_SQL = (
+    "id, conversation_key, turn_seq, seq_in_turn, run_id, plugin, entry, node, kind, question, "
+    "requested_at, expires_at, state, answered_by, answer, decided_at, created_at, updated_at, version"
+)
+
+
+def load_waiting_approval(conn: sqlite3.Connection, *, conversation_key: str) -> ApprovalRow | None:
+    """The one `waiting` approval for a conversation, or `None` — the row
+    `client_surface.take_turn` names in its diagnostic when a message
+    arrives for a conversation parked on a `call`, and the row
+    `door/nouns/approvals.py` reads for `get`/`search_doc` without
+    duplicating this query."""
+    row = conn.execute(
+        f"SELECT {_APPROVAL_COLUMNS_SQL} FROM approvals WHERE conversation_key = ? AND state = 'waiting'",
+        (conversation_key,),
+    ).fetchone()
+    return _approval_row(row) if row is not None else None
+
+
+def get_approval(conn: sqlite3.Connection, *, id: str) -> ApprovalRow | None:
+    """One approval by its own id — `door/nouns/approvals.py`'s `get`/`act`,
+    the only two verbs that address a single row by id rather than by the
+    conversation it belongs to."""
+    row = conn.execute(f"SELECT {_APPROVAL_COLUMNS_SQL} FROM approvals WHERE id = ?", (id,)).fetchone()
+    return _approval_row(row) if row is not None else None
+
+
+def list_approvals(conn: sqlite3.Connection) -> tuple[ApprovalRow, ...]:
+    """Every approval, in no particular order — `door/nouns/approvals.list`
+    renders and pages this the same way `fixture_noun.WidgetsNoun.list`
+    pages an in-memory list, via `grammar.page`."""
+    rows = conn.execute(f"SELECT {_APPROVAL_COLUMNS_SQL} FROM approvals").fetchall()
+    return tuple(_approval_row(r) for r in rows)
+
+
+def due_approvals(conn: sqlite3.Connection, *, now: float) -> tuple[ApprovalRow, ...]:
+    """Every `waiting` approval past its own `expires_at` — what
+    `door/nouns/approvals.expire_due` fires on."""
+    rows = conn.execute(
+        f"SELECT {_APPROVAL_COLUMNS_SQL} FROM approvals WHERE state = 'waiting' AND expires_at <= ?", (now,)
+    ).fetchall()
+    return tuple(_approval_row(r) for r in rows)
+
+
+def _approval_row(row: sqlite3.Row) -> ApprovalRow:
+    return ApprovalRow(
+        id=row["id"],
+        conversation_key=row["conversation_key"],
+        turn_seq=row["turn_seq"],
+        seq_in_turn=row["seq_in_turn"],
+        run_id=row["run_id"],
+        plugin=row["plugin"],
+        entry=row["entry"],
+        node=row["node"],
+        kind=row["kind"],
+        question=row["question"],
+        requested_at=row["requested_at"],
+        expires_at=row["expires_at"],
+        state=row["state"],
+        answered_by=row["answered_by"],
+        answer=row["answer"],
+        decided_at=row["decided_at"],
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+        version=row["version"],
+    )
+
+
+def mark_approval_decided(
+    c: sqlite3.Connection,
+    *,
+    conversation_key: str,
+    state: Literal["approved", "declined", "answered", "expired"],
+    answered_by: str | None,
+    answer: str | None,
+    at: float,
+) -> None:
+    """Marks the conversation's one `waiting` approval decided, on a
+    connection **already inside a `write_txn`** — the same posture
+    `_record_conversation_change` takes, so a caller (`resume_paused_run`,
+    `door/nouns/approvals.expire_due`) folds this into the same transaction
+    that clears or rewrites `plugin_pauses`. A conversation with no waiting
+    approval is a silent no-op, matching `delete_pause`'s own posture: it
+    happens when a `DagResult`'s `paused_node` was never actually a `call`/
+    `wait` H18 knows about (a pre-H18 pause resuming for the first time
+    under new code, still marked `"wait"` by `load_pause`'s own fallback —
+    this function still finds and marks it, since that row's `state` is
+    `'waiting'` regardless of when it was written)."""
+    row = c.execute(
+        "SELECT id, version FROM approvals WHERE conversation_key = ? AND state = 'waiting'", (conversation_key,)
+    ).fetchone()
+    if row is None:
+        return
+    c.execute(
+        "UPDATE approvals SET state = ?, answered_by = ?, answer = ?, decided_at = ?, updated_at = ?, "
+        "version = version + 1 WHERE id = ?",
+        (state, answered_by, answer, at, at, row["id"]),
+    )
+    ledger.record_change(
+        c, noun="approvals", id=row["id"], kind="changed", state=state, version=row["version"] + 1, at=at
+    )

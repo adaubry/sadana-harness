@@ -275,6 +275,90 @@ def test_a_paused_run_is_persisted_and_the_next_turn_resumes_it_without_the_mode
     assert (last.role, last.content) == ("assistant", "answered: 42")
 
 
+# ── H18: a call-parked conversation ──────────────────────────────────────
+
+
+def _call_then_stop_installed(tmp_path: Path) -> plugins.InstalledPlugin:
+    """A single-`call`-node plugin, reachable as tool `do_it` — the same
+    on-disk-fixture shape `wait_then_summarize_installed` uses, with a
+    `call` node instead of a `wait` one."""
+    plugin_dir = tmp_path / "p"
+    plugin_dir.mkdir()
+    plugin_dir.joinpath("init.py").write_text("def do_call(value):\n    return f'called: {value}'\n")
+    plugin_dir.joinpath("s.json").write_text('{"type": "object"}')
+    plugin_dir.joinpath("plugin.toml").write_text(
+        '[plugin]\nname = "p"\nversion = "0.1.0"\ndescription = "d"\n\n'
+        '[[entry]]\ntool = "do_it"\npurpose = "p"\nparameters = "s.json"\nstart = "reach_out"\n\n'
+        '[[node]]\nname = "reach_out"\nkind = "call"\nbody = "init:do_call"\n'
+    )
+    manifest = plugins.Manifest(
+        name="p",
+        version="0.1.0",
+        description="d",
+        entries=(plugins.Entry(tool="do_it", purpose="p", parameters="s.json", start="reach_out"),),
+        nodes=(plugins.Node(name="reach_out", kind="call", body="init:do_call"),),
+    )
+    return plugins.InstalledPlugin(name="p", directory=plugin_dir, manifest=manifest)
+
+
+@pytest.mark.unit
+def test_a_call_parked_conversation_stores_the_message_and_never_runs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`take_turn`'s own default (no `approve` given, the webhook/scheduler
+    shape) parks a `call` node instead of blocking — and a later text
+    message to that conversation is stored, not run."""
+    installed = _call_then_stop_installed(tmp_path)
+    monkeypatch.setattr(plugins, "_plugins_root", lambda: tmp_path)
+    connections = open_connections()
+    conn = connections.writer
+    runtime = make_runtime(connections, plugin_set=plugin_dispatch.build_plugin_set((installed,)))
+
+    monkeypatch.setattr(model_access, "send", tool_then_text("do_it", "okay, I'll ask."))
+    first = asyncio.run(take_turn(runtime, account="a", conversation="k-call", text="go", create_as="chat"))
+    assert first.answer == "okay, I'll ask."
+
+    pause = load_pause(conn, conversation_key="k-call")
+    assert pause is not None
+    assert pause.kind == "call"
+
+    monkeypatch.setattr(model_access, "send", never_send)
+    second = asyncio.run(take_turn(runtime, account="a", conversation="k-call", text="hello?", create_as=None))
+
+    assert second.ok is False
+    assert second.answer is None
+    assert second.diagnostic.startswith("[waiting_for_approval] ")
+    last = load(conn, "k-call", now=0.0).messages[-1]
+    assert (last.role, last.content) == ("user", "hello?")
+
+
+@pytest.mark.unit
+def test_take_turn_with_an_explicit_approve_reaches_the_call_gate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The interactive path stays reachable: an `approve` a caller actually
+    passes (what `subcommands/chat.py` does for a TTY) is awaited for real,
+    not parked."""
+    installed = _call_then_stop_installed(tmp_path)
+    monkeypatch.setattr(plugins, "_plugins_root", lambda: tmp_path)
+    connections = open_connections()
+    runtime = make_runtime(connections, plugin_set=plugin_dispatch.build_plugin_set((installed,)))
+
+    seen: list[tuple[str, str, object]] = []
+
+    async def _fake_approve(plugin: str, node: str, value: object) -> bool:
+        seen.append((plugin, node, value))
+        return True
+
+    monkeypatch.setattr(model_access, "send", tool_then_text("do_it", "called and done."))
+    asyncio.run(
+        take_turn(runtime, account="a", conversation="k-tty", text="go", create_as="chat", approve=_fake_approve)
+    )
+
+    assert seen and seen[0][0] == "p" and seen[0][1] == "reach_out"
+    assert load_pause(connections.writer, conversation_key="k-tty") is None
+
+
 # ── the connection lock ────────────────────────────────────────────────────
 
 
