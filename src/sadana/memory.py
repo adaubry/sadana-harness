@@ -26,6 +26,19 @@ AccountKey = str
 
 _DEFAULT_RUBRIC = "whatever helps you know this person better"
 
+#: The closed three-word label H26 hangs on what the rubric already
+#: distinguishes in prose. Cosmetic: it describes what the model wrote, it
+#: never steers what the model decides to write — MEMORY-01's own rejected
+#: alternative #4 (a fixed taxonomy) stays rejected.
+MEMORY_KINDS = frozenset({"decision", "preference", "fact"})
+
+
+def normalize_kind(kind: object) -> str:
+    """`kind` if it's one of the three known words, else `"fact"` — the
+    same silent-default posture `owner_account`/`default_rubric` take for a
+    config value nobody set, applied here to a per-call one instead."""
+    return kind if kind in MEMORY_KINDS else "fact"
+
 
 @dataclass(frozen=True)
 class MemoryEntry:

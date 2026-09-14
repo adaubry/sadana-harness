@@ -86,10 +86,15 @@ class DispatchContext:
     parameter carries into the memory plugin's own `call` node — the
     trusted account identity plus the already-open connection to write
     through, never a model-suppliable value (spec.md's identity-channel
-    design)."""
+    design).
+
+    `conversation_key` (H26) defaults to `""` rather than being required:
+    `eval_harness.py` and any other caller that predates it construct this
+    with no turn to name."""
 
     account_key: memory.AccountKey
     conn: sqlite3.Connection
+    conversation_key: str = ""
 
 
 def ensure_schema(conn: sqlite3.Connection) -> None:
@@ -103,7 +108,15 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
 
 
 def write_entry(
-    conn: sqlite3.Connection, account_key: memory.AccountKey, entry_key: str, content: str, *, now: float
+    conn: sqlite3.Connection,
+    account_key: memory.AccountKey,
+    entry_key: str,
+    content: str,
+    *,
+    now: float,
+    kind: str = "fact",
+    source: str = "conversation",
+    conversation_key: str | None = None,
 ) -> None:
     """Writing the same `(account_key, entry_key)` again updates the row in
     place — the primary key enforces this at the database level, not by any
@@ -112,6 +125,13 @@ def write_entry(
     Rewriting a forgotten entry brings it back: `state` returns to 'kept'.
     Somebody telling the assistant the same fact again means they want it
     known, and leaving it forgotten would make the write silently do nothing.
+
+    `kind`/`source`/`conversation_key` (H26) default to the one real write
+    path's own values — a caller that predates them (there are none in
+    `src/`, but a test may still call this with the original four positional
+    arguments) gets the same defaults `door/nouns/memory_entries.py` renders
+    for a legacy row with `NULL` columns, so a write and a read of an
+    untouched row agree.
     """
     at = time.time()
     with write_txn(conn) as c:
@@ -119,12 +139,14 @@ def write_entry(
             "SELECT id FROM memory_entries WHERE account_key = ? AND entry_key = ?", (account_key, entry_key)
         ).fetchone()
         c.execute(
-            "INSERT INTO memory_entries (account_key, entry_key, content, updated_at, id, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?) "
+            "INSERT INTO memory_entries "
+            "(account_key, entry_key, content, updated_at, id, created_at, kind, source, conversation_key) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
             "ON CONFLICT (account_key, entry_key) "
             "DO UPDATE SET content = excluded.content, updated_at = excluded.updated_at, "
-            "state = 'kept', version = memory_entries.version + 1",
-            (account_key, entry_key, content, now, ids.make_id("mem"), at),
+            "state = 'kept', version = memory_entries.version + 1, "
+            "kind = excluded.kind, source = excluded.source, conversation_key = excluded.conversation_key",
+            (account_key, entry_key, content, now, ids.make_id("mem"), at, kind, source, conversation_key),
         )
         _record(c, account_key, entry_key, kind="changed" if existed else "created", at=at)
 
@@ -216,6 +238,78 @@ def list_entries(conn: sqlite3.Connection, account_key: memory.AccountKey) -> tu
     )
 
 
+@dataclass(frozen=True)
+class MemoryEntryRow:
+    """One `memory_entries` row, in full — every column the door renders.
+
+    Kept separate from `memory.MemoryEntry` (H26): that dataclass is exactly
+    what `render_recall` needs and no more, and growing it for a door concern
+    would make the pure recall module carry fields recall never reads.
+    `kind`/`source` are `None` for a legacy row (`write_entry` didn't set them
+    before this item); a caller renders the default the same way
+    `door/nouns/memory_entries.py` does, not by storing one here.
+    """
+
+    id: str
+    account_key: memory.AccountKey
+    entry_key: str
+    content: str
+    kind: str | None
+    source: str | None
+    conversation_key: str | None
+    state: str
+    created_at: float
+    updated_at: float
+    version: int
+
+
+_ENTRY_ROW_COLUMNS = (
+    "id, account_key, entry_key, content, kind, source, conversation_key, state, created_at, updated_at, version"
+)
+
+
+def _entry_row(row: sqlite3.Row) -> MemoryEntryRow:
+    return MemoryEntryRow(
+        id=row["id"],
+        account_key=row["account_key"],
+        entry_key=row["entry_key"],
+        content=row["content"],
+        kind=row["kind"],
+        source=row["source"],
+        conversation_key=row["conversation_key"],
+        state=row["state"],
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+        version=row["version"],
+    )
+
+
+def list_entries_full(conn: sqlite3.Connection, account_key: memory.AccountKey) -> tuple[MemoryEntryRow, ...]:
+    """Every entry for `account_key`, `forgotten` included — what
+    `door/nouns/memory_entries.py` lists. `list_entries` above stays the
+    model-recall/CLI read (forgotten excluded); this is the one place a
+    person can see whether `forget` actually took, which requires seeing
+    the forgotten row, not hiding it the way recall must (H26 spec.md,
+    "a second read path, because the model's is not the console's")."""
+    rows = conn.execute(
+        f"SELECT {_ENTRY_ROW_COLUMNS} FROM memory_entries WHERE account_key = ? ORDER BY entry_key",
+        (account_key,),
+    ).fetchall()
+    return tuple(_entry_row(row) for row in rows)
+
+
+def get_entry_by_id(conn: sqlite3.Connection, account_key: memory.AccountKey, entry_id: str) -> MemoryEntryRow | None:
+    """One entry by its door-facing id, scoped to `account_key` in the same
+    query — a row that exists under a *different* account is `None`, which
+    is what makes a cross-account request a plain `404` rather than a check
+    the door has to remember to run (H26 spec.md requirement 7)."""
+    row = conn.execute(
+        f"SELECT {_ENTRY_ROW_COLUMNS} FROM memory_entries WHERE account_key = ? AND id = ?",
+        (account_key, entry_id),
+    ).fetchone()
+    return _entry_row(row) if row is not None else None
+
+
 def get_rubric_override(conn: sqlite3.Connection, account_key: memory.AccountKey) -> str:
     """`""` when the account has never set one — the deployer's default
     (`memory.default_rubric()`) is what fills that gap, not this function."""
@@ -250,6 +344,44 @@ def set_rubric_override(conn: sqlite3.Connection, account_key: memory.AccountKey
             version=row["version"],
             at=at,
         )
+
+
+@dataclass(frozen=True)
+class RubricRow:
+    """One `memory_rubric_overrides` row, in full — `get_rubric_override`
+    returns just the text, which is enough for composing a system message
+    but not enough for the door to render `id`/`version` (needed for its
+    `ETag`/`If-Match`) or `updated_by`."""
+
+    id: str
+    account_key: memory.AccountKey
+    rubric_text: str
+    updated_by: str | None
+    created_at: float
+    updated_at: float
+    version: int
+
+
+def get_rubric_override_row(conn: sqlite3.Connection, account_key: memory.AccountKey) -> RubricRow | None:
+    """The account's override row, or `None` when it has never set one —
+    `door/nouns/memory_policies.py` renders the synthetic default row for
+    that case itself, since there is no row here to derive one from."""
+    row = conn.execute(
+        "SELECT id, account_key, rubric_text, updated_by, created_at, updated_at, version "
+        "FROM memory_rubric_overrides WHERE account_key = ?",
+        (account_key,),
+    ).fetchone()
+    if row is None:
+        return None
+    return RubricRow(
+        id=row["id"],
+        account_key=row["account_key"],
+        rubric_text=row["rubric_text"],
+        updated_by=row["updated_by"],
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+        version=row["version"],
+    )
 
 
 #: The account-key prefix a scheduled trigger used to run under, before

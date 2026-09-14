@@ -8,6 +8,11 @@
     "content": {
       "type": "string",
       "description": "The fact or decision to remember, in plain prose."
+    },
+    "kind": {
+      "type": "string",
+      "enum": ["decision", "preference", "fact"],
+      "description": "What kind of thing this is, if you know: a decision, a preference, or a plain fact. Defaults to fact."
     }
   },
   "required": ["entry_key", "content"],

@@ -20,8 +20,11 @@ from sadana.memory_store import (
     delete_entry,
     ensure_schema,
     forget_entry,
+    get_entry_by_id,
     get_rubric_override,
+    get_rubric_override_row,
     list_entries,
+    list_entries_full,
     set_rubric_override,
     write_entry,
 )
@@ -292,3 +295,64 @@ def test_adoption_carries_a_forgotten_entry_over_as_forgotten(conn: sqlite3.Conn
     assert list_entries(conn, "local") == ()
     row = conn.execute("SELECT account_key, state FROM memory_entries").fetchone()
     assert (row["account_key"], row["state"]) == ("local", "forgotten")
+
+
+# ── H26: kind/source provenance, and the door's own read paths ──────────
+
+
+@pytest.mark.unit
+def test_write_entry_defaults_kind_and_source_with_no_new_kwargs(conn: sqlite3.Connection) -> None:
+    """The pre-H26 call shape — four positional args, `now=` — still works,
+    and now lands real values instead of `NULL`."""
+    write_entry(conn, "a1", "dog_name", "Buddy", now=1.0)
+
+    row = conn.execute("SELECT kind, source, conversation_key FROM memory_entries").fetchone()
+    assert (row["kind"], row["source"], row["conversation_key"]) == ("fact", "conversation", None)
+
+
+@pytest.mark.unit
+def test_write_entry_records_the_given_kind_and_conversation(conn: sqlite3.Connection) -> None:
+    write_entry(conn, "a1", "dog_name", "Buddy", now=1.0, kind="preference", conversation_key="conv_1")
+
+    row = conn.execute("SELECT kind, source, conversation_key FROM memory_entries").fetchone()
+    assert (row["kind"], row["source"], row["conversation_key"]) == ("preference", "conversation", "conv_1")
+
+
+@pytest.mark.unit
+def test_list_entries_full_includes_forgotten_where_list_entries_does_not(conn: sqlite3.Connection) -> None:
+    write_entry(conn, "a1", "dog_name", "Buddy", now=1.0)
+    forget_entry(conn, "a1", "dog_name", now=2.0)
+
+    assert list_entries(conn, "a1") == ()
+    full = list_entries_full(conn, "a1")
+    assert len(full) == 1
+    assert full[0].state == "forgotten"
+    assert full[0].content == "Buddy"
+
+
+@pytest.mark.unit
+def test_get_entry_by_id_scopes_to_the_account(conn: sqlite3.Connection) -> None:
+    write_entry(conn, "a1", "dog_name", "Buddy", now=1.0)
+    entry_id = conn.execute("SELECT id FROM memory_entries").fetchone()["id"]
+
+    assert get_entry_by_id(conn, "a1", entry_id).content == "Buddy"  # type: ignore[union-attr]
+    assert get_entry_by_id(conn, "a2", entry_id) is None
+    assert get_entry_by_id(conn, "a1", "mem_" + "0" * 32) is None
+
+
+@pytest.mark.unit
+def test_get_rubric_override_row_is_none_with_no_override(conn: sqlite3.Connection) -> None:
+    assert get_rubric_override_row(conn, "a1") is None
+
+
+@pytest.mark.unit
+def test_get_rubric_override_row_versions_bump_on_update(conn: sqlite3.Connection) -> None:
+    set_rubric_override(conn, "a1", "first", now=1.0)
+    first = get_rubric_override_row(conn, "a1")
+    assert first is not None
+    assert (first.rubric_text, first.version) == ("first", 1)
+
+    set_rubric_override(conn, "a1", "second", now=2.0)
+    second = get_rubric_override_row(conn, "a1")
+    assert second is not None
+    assert (second.rubric_text, second.version, second.id) == ("second", 2, first.id)

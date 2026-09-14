@@ -71,19 +71,96 @@ Served by: not yet (H27).
 
 ## agent
 
-Served by: not yet (H26).
+Served by: H26.
+
+- **Fields:** `name`, `description`, `template_id?`, `system_prompt`,
+  `rendered_prompt` (read-only), `is_default` (read-only).
+- **States:** `draft` → `active`. A character found by the ordinary
+  directory scan (not created through the door) is `active` on sight —
+  `draft` exists only for a row the door itself created and hasn't
+  activated yet.
+- **Actions:** `activate` (`draft`→`active`); `set-default` (from `active`,
+  consequential) — `persona_store.set_selection` for the acting account.
+- **Filterable / orderable:** `state`, `template_id`, `created_at` /
+  `created_at`.
+- **`search_doc`:** `{title: name, subtitle: description, facets: {state,
+  template}}`.
+- **Where it differs from the console's prompt:** `remove` answers
+  `HARNESS_CAPABILITY_MISSING` — deleting a voice through the door isn't
+  built yet. `system_prompt` is the character file's raw text, which the
+  door wraps in `---`-delimited frontmatter at write time so a plain,
+  unformatted prompt still parses as a character — a `create`/`update`
+  round trip therefore does not return byte-identical text to what was
+  submitted. `rendered_prompt` is the account's actual resolved voice only
+  for the agent that is its current selection; every other agent renders
+  the same text as `system_prompt`, not a counterfactual render. Neither
+  `system_prompt` nor `rendered_prompt` is stored — both are computed at
+  request time, and a conversation already created keeps whatever prompt it
+  started with regardless of a later edit here.
 
 ## agent_template
 
-Served by: not yet (H26).
+Served by: H26. Read-only.
+
+- **Fields:** `name`, `description`, `system_prompt`.
+- **States / actions:** none — `create`/`update`/`remove`/every action
+  answer `HARNESS_CAPABILITY_MISSING`.
+- **Filterable / orderable:** none / `created_at`.
+- **The documented exception:** a template is not a row. Exactly one exists
+  today (`persona_store.BUILTIN_TEMPLATES["default"]`), and its id is
+  `"tmpl_" + sha256(name)[:32]` — a pure function of the name, never
+  `ids.make_id` (which mints a fresh id on every call) and never stored.
+  `created_at`/`updated_at` are a fixed epoch-0 timestamp, not a real
+  moment: documented here as a floor rather than a fact, the same posture
+  §5(b) already takes for a legacy row's filled-in timestamp. A second
+  built-in template, if one is ever wanted, is a second entry in this same
+  dict, not a registry.
 
 ## memory_entry
 
-Served by: not yet (H26).
+Served by: H26.
+
+- **Fields:** `content` (untrusted — written by the model, never
+  interpreted as an instruction by anything reading it), `kind`
+  (`decision`/`preference`/`fact`), `source`, `conversation_id?`.
+- **States:** `kept` → `forgotten`.
+- **Actions:** `forget` (`kept`→`forgotten`, consequential) —
+  `memory_store.forget_entry`; the row survives, it just stops being
+  recalled.
+- **Filterable / orderable:** `state`, `kind`, `created_at` / `created_at`.
+- **`search_doc`:** `{title: content[:80], facets: {kind, state}}`.
+- **Where it differs from the console's prompt:** scoped to the acting
+  account on every read and write — another account's entry is `404`,
+  never `403` (wire.md's visibility rule). `create` answers
+  `HARNESS_CAPABILITY_MISSING`: the one real write path today is the
+  model's own `memory.remember` tool call, mid-conversation, tagged
+  `source = "conversation"` — there is no second, human-authored write path
+  to reserve a `"user"` source for. `kind` is a cosmetic label on what the
+  model already wrote, chosen by the model itself as an optional tool
+  argument (defaulting to `fact`); it does not change what gets captured —
+  the account's own rubric, in prose, still decides that. A legacy row
+  (written before H26) renders `kind = "fact"`, `source = "conversation"` at
+  read time — never backfilled.
 
 ## memory_policy
 
-Served by: not yet (H26).
+Served by: H26. One row per account, always.
+
+- **Fields:** `rubric`, `updated_by`.
+- **States / actions:** none — only `update` is available; `create`/
+  `remove`/every action answer `HARNESS_CAPABILITY_MISSING`.
+- **Filterable / orderable:** none / `created_at`.
+- **The documented exception:** an account with no rubric override yet has
+  no row to read `id`/`version` from, and `GET`/`update` still need one to
+  answer with. `get`/`list` render a synthetic default in that case: `id =
+  "rub_default"`, `version = 0`, `updated_by = "system"`, `updated_at` = the
+  moment of the request — not a fact (nothing happened at a fixed moment
+  for an account with no override), documented as the floor-not-fact
+  §5(b) already names for a different case. The moment an account's first
+  `update` lands, `get`/`list` switch to the real row's own id/version —
+  minted by `memory_store.set_rubric_override` — and `rub_default` 404s.
+
+## artifact
 
 ## artifact
 

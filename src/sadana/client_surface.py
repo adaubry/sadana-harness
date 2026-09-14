@@ -472,7 +472,7 @@ async def take_turn(
             now=now,
             record_turn=runtime.recorder.record_turn,
             record_plugin_run=runtime.recorder.record_plugin_run,
-            memory_context=memory_store.DispatchContext(account_key=account, conn=conn),
+            memory_context=memory_store.DispatchContext(account_key=account, conn=conn, conversation_key=conversation),
             persist_pause=persist_pause,
             approve=resolved_approve,
         )
