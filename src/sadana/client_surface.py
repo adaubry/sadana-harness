@@ -165,6 +165,7 @@ def open_runtime(*, provider: str | None = None, model: str | None = None) -> Ru
     # `_enabled_plugin_set` reads that table to know what is switched off.
     connections = stores.Connections(conversation_store.store_path_from_config())
     _adopt_scheduled_memories(connections.writer)
+    _adopt_scheduled_triggers(connections.writer)
     return Runtime(
         connections=connections,
         plugin_set=_enabled_plugin_set(connections.writer),
@@ -209,6 +210,22 @@ def _adopt_scheduled_memories(conn: sqlite3.Connection) -> None:
         return
     if moved:
         logger.info("adopted %d remembered entries from scheduled runs into the owner's account", moved)
+
+
+def _adopt_scheduled_triggers(conn: sqlite3.Connection) -> None:
+    """H27's own `_adopt_scheduled_memories`: move every legacy
+    `scheduled_triggers` row into `schedules`, once, under the owner's
+    account. Idempotent (a second call finds nothing left to move) and
+    best-effort — a store this can't migrate still opens, on the same
+    reasoning `_adopt_scheduled_memories` already gives: a data-shape
+    surprise here should not turn into an outage on every surface at once."""
+    try:
+        moved = conversation_store.adopt_scheduled_triggers(conn, owner=memory.owner_account(), now=time.time())
+    except sqlite3.Error:
+        logger.warning("could not adopt scheduled triggers into the owner's account", exc_info=True)
+        return
+    if moved:
+        logger.info("adopted %d scheduled trigger(s) into the schedules table", moved)
 
 
 @dataclass(frozen=True)

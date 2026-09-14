@@ -67,7 +67,36 @@ Served by: not yet (H18).
 
 ## schedule
 
-Served by: not yet (H27).
+Served by: H27.
+
+- **Fields:** `name`, `cron`, `timezone`, `interval_seconds` (read-only —
+  never set through the door; carried over only from a migrated legacy
+  `scheduled_triggers` row), `trigger_text`, `plugin_id?`, `conversation_id?`,
+  `next_run_at`, `last_run_at?`, `last_state?`.
+- **States:** `active` ⇄ `paused`.
+- **Actions:** `pause` (`active`→`paused`, capability `schedules.write`);
+  `resume` (`paused`→`active`, capability `schedules.write`) — recomputes
+  `next_run_at` from the moment of resume, never from whatever it showed
+  while paused.
+- **Filterable / orderable:** `state`, `plugin_id`, `created_at` /
+  `created_at`.
+- **`search_doc`:** `{title: name, subtitle: cron ?? "every {interval_seconds}s",
+  facets: {state, plugin}}`.
+- **Where it differs from the console's prompt:** `create`/`update` accept
+  only `cron` for recurrence — there is no way to create or convert a
+  schedule to interval-based timing through the door; `interval_seconds`
+  exists solely so a schedule migrated from the pre-H27
+  `scheduled_triggers` table keeps firing exactly as it did before, and it
+  stops being consulted the moment that row is given a `cron` through an
+  `update`. `plugin_id`/`conversation_id` are not resolved ledger ids —
+  no `plugins` noun exists yet to mint one — they are the plugin's own
+  registered `name` and the conversation's own `key`, validated for
+  existence and rendered back unchanged (the same convention
+  `memory_entries`'s own `conversation_id` field already uses). `remove` is
+  a real, permanent delete (ledger-tombstoned, not a third wire-visible
+  state) and, like `create`/`update`, requires `schedules.write`. Scoped to
+  the acting account on every verb: another account's schedule is `404`,
+  never `403`.
 
 ## agent
 

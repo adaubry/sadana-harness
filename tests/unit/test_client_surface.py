@@ -23,6 +23,7 @@ from conftest import wait_then_summarize_installed as _wait_then_summarize_insta
 from sadana import (
     client_surface,
     conversation_store,
+    memory,
     memory_store,
     model_access,
     persona,
@@ -81,6 +82,24 @@ def test_open_runtime_lets_an_explicit_override_win_over_config(monkeypatch: pyt
     runtime = open_runtime(provider="flag-provider", model="flag-model")
 
     assert (runtime.provider, runtime.model) == ("flag-provider", "flag-model")
+
+
+@pytest.mark.unit
+def test_open_runtime_migrates_legacy_scheduled_triggers_into_schedules() -> None:
+    """H27: a `scheduled_triggers` row already on disk before `open_runtime`
+    is ever called is copied into `schedules` under the owner's account, the
+    same "adopt on open" shape `_adopt_scheduled_memories` already proves
+    for memory entries."""
+    path = conversation_store.store_path_from_config()
+    seed_conn = conversation_store.open_store(path)
+    conversation_store.upsert_scheduled_trigger(
+        seed_conn, name="legacy", trigger_text="go", next_run_at=42.0, interval_seconds=30.0
+    )
+
+    runtime = open_runtime(provider="p", model="m")
+
+    rows = conversation_store.list_schedules(runtime.connections.reader(), account_key=memory.owner_account())
+    assert [r.name for r in rows] == ["legacy"]
 
 
 # ── create_as: the one thing the two clients disagreed about ────────────────

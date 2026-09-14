@@ -21,7 +21,7 @@ from pathlib import Path
 
 from sadana import config, conversation_store, gateway_daemon, stores
 from sadana.door import auth, capabilities
-from sadana.door.nouns import agent_templates, agents, approvals, harness, memory_entries, memory_policies
+from sadana.door.nouns import agent_templates, agents, approvals, harness, memory_entries, memory_policies, schedules
 from sadana.door.operations import resume_on_start
 from sadana.door.router import DoorContext
 from sadana.door.serve import make_server
@@ -102,6 +102,7 @@ def cmd_door_serve(args: argparse.Namespace) -> int:
             "agent_templates": agent_templates,
             "memory_entries": memory_entries,
             "memory_policies": memory_policies,
+            "schedules": schedules,
         },
         clock=time.time,
     )

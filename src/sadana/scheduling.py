@@ -22,7 +22,7 @@ import asyncio
 import logging
 import time
 
-from sadana import client_surface, conversation_store, gateway_dispatch, memory
+from sadana import client_surface, conversation_store, cron, gateway_dispatch, memory
 from sadana.door.nouns import approvals as door_approvals
 from sadana.gateway import MessageEvent
 
@@ -42,7 +42,24 @@ def _advance(now: float, interval_seconds: float) -> float:
     return now + interval_seconds
 
 
-async def tick(runtime: client_surface.Runtime) -> int:
+def next_schedule_run(row: conversation_store.ScheduleRow, *, now: float) -> float:
+    """`cron` wins whenever it's set — including on a migrated legacy row
+    that has since been given a `cron` through the door, which is what
+    makes updating one of those rows quietly convert it from then on
+    (spec.md § Design: "`cron` vs `interval_seconds`"). A schedule with
+    neither (malformed data no validated write could have produced) is a
+    bug this raises on rather than silently never firing again."""
+    if row.cron is not None:
+        parsed = cron.parse(row.cron)
+        if isinstance(parsed, cron.CronError):
+            raise ValueError(f"schedule {row.id} has an unparseable cron expression: {parsed.message}")
+        return cron.next_after(parsed, row.timezone, now)
+    if row.interval_seconds is not None:
+        return _advance(now, row.interval_seconds)
+    raise ValueError(f"schedule {row.id} has neither cron nor interval_seconds set")
+
+
+async def tick(runtime: client_surface.Runtime, *, now: float | None = None) -> int:
     """Fires every trigger whose `next_run_at` has arrived, returning how
     many fired. A trigger's own failure is caught, logged, and skipped —
     never raised out of this function, so one bad trigger can't stop the
@@ -66,9 +83,20 @@ async def tick(runtime: client_surface.Runtime) -> int:
 
     `handle_inbound()` is still called holding no lock of ours. It reaches
     `take_turn`, which takes that conversation's own lock internally, and
-    taking it here first would deadlock against it."""
+    taking it here first would deadlock against it.
+
+    `now` is `None` in every real caller (`run_tick_loop` never passes it) —
+    reading the clock is the default, not the norm being overridden. A test
+    passes a fixed value instead of monkeypatching `time.time`, the same
+    "environment as data" shape `door/router.py`'s own `ctx.clock` already
+    uses (testing-conventions bans faking the clock at the module level).
+
+    H27's `schedules` loop runs after the legacy `due_triggers` loop, in the
+    same per-item try/except isolation: one schedule's failure is logged and
+    skipped, never advanced (so it stays due and is retried), and never lets
+    a broken schedule stop any other trigger or schedule in this tick."""
     conn = runtime.conn
-    now = time.time()
+    now = now if now is not None else time.time()
     # H18. Expiry first: it touches no `scheduled_triggers` row, so its own
     # ordering relative to trigger firing has no observable interaction —
     # placed first as the simpler, cheaper-to-reason-about check.
@@ -93,6 +121,47 @@ async def tick(runtime: client_surface.Runtime) -> int:
             conversation_store.advance_scheduled_trigger(
                 conn, name=trigger.name, next_run_at=_advance(now, trigger.interval_seconds)
             )
+        fired += 1
+
+    for schedule in conversation_store.due_schedules(runtime.connections.reader(), now=now):
+        try:
+            # Computed before firing, not after: a schedule whose cadence
+            # can't be computed (a cron gone unparseable somehow, though
+            # `door/nouns/schedules.py` validates every write) must not fire
+            # and then have nothing to advance to — that would fire it again
+            # every tick forever instead of just staying due and logging,
+            # the same self-healing shape the trigger loop above already has.
+            next_run_at = next_schedule_run(schedule, now=now)
+        except ValueError:
+            # The only two failure modes `next_schedule_run` documents —
+            # an unparseable cron, or neither cron nor interval_seconds set
+            # — both raise exactly this. A bare `Exception` here would also
+            # swallow a real bug in `cron.next_after` as a silent skip.
+            logger.warning("scheduled %r has an unfireable cadence, skipping", schedule.name, exc_info=True)
+            continue
+        event = MessageEvent(
+            platform="schedule",
+            chat_id=schedule.name,
+            thread_id=schedule.conversation_key,
+            text=schedule.trigger_text,
+        )
+        try:
+            ok, _text = await gateway_dispatch.handle_inbound(runtime, event, account=schedule.account_key)
+        except Exception:
+            logger.warning("scheduled %r failed to fire", schedule.name, exc_info=True)
+            continue
+        # `handle_inbound` exposes only `(ok, text)` — H20's own mapping from
+        # the harness's eight `exit_reason` values down to the console's five
+        # (wire.md § 6) does not exist yet to reuse, and reaching further
+        # into the turn than `handle_inbound` already goes would reopen the
+        # "one door onto a turn" rule this file's own module docstring
+        # already commits to. `last_state` is the one bit that bridge
+        # actually promises, until H20 lands a real mapping this can switch
+        # to.
+        last_state = "completed" if ok else "failed"
+        conversation_store.advance_schedule(
+            conn, id=schedule.id, next_run_at=next_run_at, last_run_at=now, last_state=last_state, now=now
+        )
         fired += 1
     return fired
 
