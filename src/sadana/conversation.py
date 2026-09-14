@@ -20,7 +20,7 @@ import re
 from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass, replace
 from enum import Enum
-from typing import Literal
+from typing import Literal, Protocol
 
 from sadana import config, context, model_access, plugin_manifest, plugins
 
@@ -536,6 +536,7 @@ async def complete(
     provider: str,
     model: str,
     cache_hint: context.CacheHint | None = None,
+    on_delta: model_access.OnDelta | None = None,
 ) -> Completion:
     """Ask a model for a response. Retries a transient failure
     transparently — the caller never sees ``model_access.Retry`` — and
@@ -549,12 +550,20 @@ async def complete(
 
     ``cache_hint``, when given, is applied to the wire messages via
     ``model_access.mark_cache_boundary`` before the request is built —
-    including a retry, so a retried attempt still carries the marker."""
+    including a retry, so a retried attempt still carries the marker.
+
+    ``on_delta`` (H21), when given, asks the request to stream and is
+    forwarded to whichever provider serves it; a provider with no
+    ``stream_fn`` simply never calls it, and this call still returns the
+    same `Completion` either way — streaming changes nothing about what a
+    caller gets back, only whether anything arrives before it does."""
     request_messages = ({"role": "system", "content": system},) + messages
     if cache_hint is not None:
         request_messages = model_access.mark_cache_boundary(request_messages, cache_hint)
-    request = model_access.Request(messages=request_messages, provider=provider, model=model, tools=tools)
-    outcome = await model_access.resolve(request)
+    request = model_access.Request(
+        messages=request_messages, provider=provider, model=model, tools=tools, stream=on_delta is not None
+    )
+    outcome = await model_access.resolve(request, on_delta)
 
     if isinstance(outcome, model_access.NeedsContextCompression):
         raise ContextOverflow(outcome.detail)
@@ -650,6 +659,42 @@ async def _noop_persist(messages: tuple[Message, ...]) -> None:
     """The default ``persist``: durability doesn't exist yet (CONV-08's
     job) so this does nothing and always succeeds."""
     return None
+
+
+class TurnObserver(Protocol):
+    """H21. A pure seam — no I/O, no clock — a caller of `run_turn` gives
+    to watch a turn while it runs and to ask it to stop. `should_stop` is
+    polled, never pushed: the loop decides when it is safe to check, at the
+    two points named in `run_turn`'s own docstring, which is what keeps a
+    `call` node's own off-loop body from ever being interrupted mid-effect
+    (CLAUDE.md: a stoppable loop with off-loop work stops only at named
+    loop-boundary checkpoints)."""
+
+    def turn_started(self, turn_key: TurnKey, user_message_seq: int) -> None: ...
+    def text_delta(self, seq: int, text: str) -> None: ...
+    def turn_finished(self, result: TurnResult) -> None: ...
+    def should_stop(self) -> bool: ...
+
+
+class _NoopObserver:
+    """The default `observer`: a caller that hasn't opted into H21 keeps
+    behaving exactly as before — same posture `_noop_persist` already
+    takes for `persist`."""
+
+    def turn_started(self, turn_key: TurnKey, user_message_seq: int) -> None:
+        return None
+
+    def text_delta(self, seq: int, text: str) -> None:
+        return None
+
+    def turn_finished(self, result: TurnResult) -> None:
+        return None
+
+    def should_stop(self) -> bool:
+        return False
+
+
+_noop_observer = _NoopObserver()
 
 
 def _message_to_wire(message: Message) -> dict:
@@ -751,6 +796,7 @@ async def run_turn(
     context_state: context.ContextState,
     stable_prompt_len: int,
     persist: Callable[[tuple[Message, ...]], Awaitable[None]] = _noop_persist,
+    observer: TurnObserver | None = None,
 ) -> tuple[TurnResult, tuple[Message, ...], IterationBudget, str]:
     """Run one turn: ask the model, carry out whatever it asks for, ask
     again if needed, until one of ``ExitReason``'s eight members ends it.
@@ -764,7 +810,33 @@ async def run_turn(
     CONTEXT's own checkpoints are called directly instead of through a
     caller-supplied seam. The turn's final ``context_state`` rides on the
     returned ``TurnResult``, not as a fifth value here — see plan.md's own
-    refinement note."""
+    refinement note.
+
+    ``observer`` (H21, default a no-op): ``turn_started`` fires once, right
+    here in PROLOGUE; every model call in this turn streams, forwarding
+    each fragment to ``text_delta`` with a per-turn ``seq`` starting at 1;
+    ``should_stop()`` is polled before each model call and after each tool
+    round — the two points at which nothing off-loop is running — and a
+    ``True`` answer ends the turn with ``ExitReason.INTERRUPTED, detail=
+    "stopped"``, the same member ``asyncio.CancelledError`` already maps
+    to; ``turn_finished`` fires once, with the same ``TurnResult`` this
+    call is about to return."""
+    obs: TurnObserver = observer if observer is not None else _noop_observer
+    next_delta_seq = 1
+
+    def on_delta(text: str) -> None:
+        nonlocal next_delta_seq
+        obs.text_delta(next_delta_seq, text)
+        next_delta_seq += 1
+
+    # Only a real observer opts a turn into streaming — the fallback
+    # `_noop_observer` above exists so `obs.*` calls elsewhere in this
+    # function need no `if observer` branch, but `complete()` must still
+    # see `on_delta=None` when no observer was given, matching every
+    # pre-H21 caller's request shape exactly (`stream=False`, `send()`
+    # called with its old single-argument signature).
+    complete_on_delta = on_delta if observer is not None else None
+
     # REPAIR — the only mutation allowed before PROLOGUE.
     messages = repair(messages)
 
@@ -773,6 +845,7 @@ async def run_turn(
         raise PromptDriftError(f"system_prompt/tool_surface hash does not match prompt_sha256={prompt_sha256!r}")
     messages, _ = append(conversation, messages, Message(role="user", content=user_input))
     turn_start_seq = len(messages) - 1
+    obs.turn_started(TurnKey(conversation=conversation, turn_seq=turn_seq), turn_start_seq)
 
     model_calls = 0
     usage_total = model_access.Usage()
@@ -802,6 +875,11 @@ async def run_turn(
                 detail = "wall clock budget exhausted"
                 break
 
+            if obs.should_stop():
+                exit_reason = ExitReason.INTERRUPTED
+                detail = "stopped"
+                break
+
             cache_hint = context.before_send(history=messages, stable_prompt_len=stable_prompt_len)
             try:
                 completion = await complete(
@@ -811,6 +889,7 @@ async def run_turn(
                     provider=provider,
                     model=model,
                     cache_hint=cache_hint,
+                    on_delta=complete_on_delta,
                 )
             except ContextOverflow as e:
                 model_calls += 1
@@ -902,6 +981,11 @@ async def run_turn(
                     tool_result.content or "", turn_chars_used, result_cap, turn_cap
                 )
                 messages, _ = append(conversation, messages, replace(tool_result, content=capped_text))
+
+            if obs.should_stop():
+                exit_reason = ExitReason.INTERRUPTED
+                detail = "stopped"
+                break
             # loop back to MODEL_CALL
     except asyncio.CancelledError:
         exit_reason = ExitReason.INTERRUPTED
@@ -921,6 +1005,7 @@ async def run_turn(
                 provider=provider,
                 model=model,
                 cache_hint=cache_hint,
+                on_delta=complete_on_delta,
             )
             model_calls += 1
             usage_total = _add_usage(usage_total, completion.usage)
@@ -947,6 +1032,7 @@ async def run_turn(
         appended=range(turn_start_seq, len(messages)),
         context_state=context_state,
     )
+    obs.turn_finished(result)
     return result, messages, iteration_budget, system_prompt
 
 
@@ -1151,6 +1237,7 @@ async def take_turn(
     dispatch: Callable[[str, dict], Awaitable[plugins.DagResult]],
     persist: Callable[[tuple[Message, ...]], Awaitable[None]] = _noop_persist,
     now: float,
+    observer: TurnObserver | None = None,
 ) -> tuple[TurnResult, Conversation]:
     """Calls C7's ``run_turn`` with every value it needs, read off
     ``conversation``. If the returned ``system_prompt`` differs from
@@ -1158,7 +1245,11 @@ async def take_turn(
     result goes through ``rotate_prompt`` first, so epoch and hash always
     move together through the one sanctioned path; ``messages``,
     ``iteration_budget``, ``context_state``, and ``next_turn_seq + 1`` are
-    then folded in. Never mutates ``conversation`` — returns a new value."""
+    then folded in. Never mutates ``conversation`` — returns a new value.
+
+    ``observer`` (H21, default ``None``) passes straight through to
+    ``run_turn`` — nothing here needs to know it exists beyond forwarding
+    it."""
     result, messages, iteration_budget, new_system_prompt = await run_turn(
         conversation=conversation.key,
         turn_seq=conversation.next_turn_seq,
@@ -1176,6 +1267,7 @@ async def take_turn(
         context_state=conversation.context_state,
         stable_prompt_len=conversation.stable_prompt_len,
         persist=persist,
+        observer=observer,
     )
 
     updated = conversation

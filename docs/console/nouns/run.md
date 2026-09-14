@@ -1,6 +1,6 @@
 ## run
 
-Served by: H20.
+Served by: H20, live states and `stop` by H21.
 
 - **Fields:** `conversation_id`, `message_id` (the user message that opened
   the turn), `agent_id`, `plugin_id?`, `exit_reason?`, `duration_ms`,
@@ -10,12 +10,20 @@ Served by: H20.
   `null` in this work item: nothing records which `plugin_runs` row, if any,
   spawned this turn as a child conversation, and deriving it needs a change
   outside this artifact's file set — a known, named gap, not a guess.
-- **States:** `running`, `waiting`, `done`, `failed`, `stopped`. Every row
-  this work item can produce is `done`/`failed` — the other three arrive
-  with H21, when a run is observed live rather than recorded post-hoc.
+- **States:** `running`, `waiting`, `done`, `failed`, `stopped`. A run's own
+  row starts `running` (or `waiting`, for a turn with an outstanding pause)
+  the moment its turn begins, via `observability.record_turn_started` —
+  H21 turns this from a five-word closed set with only two live members
+  into one where every word is real. `stopped` is `interrupted`'s own
+  render, whether a person asked for it (`runs.stop`) or the process itself
+  cancelled the turn.
 - **Actions:** `stop` (`running`/`waiting → stopped`, capability
-  `runs.stop`) — declared, not turned on; `501 HARNESS_CAPABILITY_MISSING`
-  until H21 or later.
+  `runs.stop`) — cooperative, not forced: it signals the turn's own
+  `threading.Event` (`door/run_control.py`) and returns immediately with
+  the run's current rendering; the run settles to `stopped` only once the
+  turn itself notices, at its next safe point. `409 CONFLICT` when this
+  process is not holding the run right now — already finished, or the
+  process restarted since the run started.
 - **Filterable / orderable:** `state`, `exit_reason`, `agent_id`,
   `conversation_id`, `created_at` filterable; `created_at`, `duration_ms`
   orderable.

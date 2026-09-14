@@ -79,7 +79,11 @@ CREATE TABLE IF NOT EXISTS messages (
     -- H16. No `updated_at` and no `version`: a message row is never edited
     -- once written (`_insert_messages`' own invariant), so its creation time
     -- is also its last-changed time. `run_id` is written by H20, which is
-    -- what first has a run id to put in it.
+    -- what first has a run id to put in it. H21's one exception: a row
+    -- written `state='streaming'` (the provisional assistant row a turn's
+    -- own observer inserts before the model has finished) is finalized
+    -- exactly once, in place, keeping this same `id`/`created_at` — see
+    -- `_insert_messages`' own docstring.
     id                TEXT,
     created_at        REAL,
     state             TEXT NOT NULL DEFAULT 'sent',
@@ -188,7 +192,12 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_id ON messages (id);
 #: outstanding pause stays `active` (`save_pause`'s own comment on why), so
 #: this pair is still exactly what H16 left it. H19 owns closing.
 CONVERSATION_STATES = frozenset({"active"})
-MESSAGE_STATES = frozenset({"sent"})
+#: H21 adds `"streaming"` (a provisional assistant row, not yet finalized)
+#: and `"failed"` (a turn that ended badly, mirroring `messages.md`'s own
+#: existing failure branch) — both written by `door/nouns/messages.py`'s
+#: real `TurnObserver`, not by this module, but declared here beside the
+#: table per H16's "one closed set per state column, next to the table."
+MESSAGE_STATES = frozenset({"sent", "streaming", "failed"})
 
 #: H18. Every word `approvals.state` may hold — the same closed-set
 #: contract as the pair above.
@@ -520,32 +529,48 @@ _UPSERT_CONVERSATION_SQL = (
 )
 
 
-def _insert_messages(conn: sqlite3.Connection, conversation: Conversation, *, start_seq: int = 0) -> tuple[str, ...]:
-    """One ``INSERT OR IGNORE`` per message from ``start_seq`` on. Never
-    ``REPLACE``: a message row is never edited once written (``append()``'s
-    own invariant — history only grows), so silently skipping an
-    already-present ``msg_seq`` is the correct idempotent behaviour;
-    ``REPLACE`` would instead accept silently rewriting a historical row.
-    ``start_seq`` is an efficiency knob, not a correctness one — the
-    default (0) re-inserts the whole history and ``OR IGNORE`` alone keeps
-    that idempotent, which is what a caller with no memory of what it last
-    flushed needs; ``bind_persist()`` passes its own running offset so a
-    turn's repeated persist calls insert only the new tail each time,
-    instead of re-attempting every row already durable.
+def _insert_messages(
+    conn: sqlite3.Connection, conversation: Conversation, *, start_seq: int = 0
+) -> tuple[tuple[str, bool], ...]:
+    """One row upserted per message from ``start_seq`` on. Never overwrites a
+    **finished** row: a message row is never edited once ``state`` has
+    settled (``append()``'s own invariant — history only grows), so an
+    already-``sent``/``failed`` ``msg_seq`` is left untouched exactly as the
+    old ``INSERT OR IGNORE`` left it. H21's one exception, narrowed as
+    tightly as the invariant allows: a still-``state='streaming'`` row (a
+    turn's own observer wrote it provisional, before the model finished) is
+    not "already present" — it is resubmitted, and lands as an ``UPDATE``
+    that finalizes its ``content``/``tool_calls_json``/``tool_call_id``/
+    ``state`` in place, never touching its own ``id``/``created_at`` (the
+    same asymmetry ``_UPSERT_CONVERSATION_SQL`` already uses for identity
+    columns). Two guards, not one: the Python-side ``present`` filter below
+    decides what gets resubmitted at all; the SQL-side
+    ``WHERE messages.state = 'streaming'`` means even a resubmission of an
+    already-settled row (a scenario ``present`` is not expected to allow)
+    can never overwrite a finished row's content.
 
-    Returns the ids of the rows **actually inserted**, which is what the caller
-    writes ledger rows for. H16 made the skip explicit rather than leaving it
-    to ``OR IGNORE``: a minted id is only real if its row landed, and SQLite
-    will not say which of an ``executemany``'s rows it ignored. One indexed
-    ``SELECT`` of the sequence numbers already present answers that before the
-    insert, and ``OR IGNORE`` stays as the backstop it always was."""
-    present = {
-        row[0]
+    ``start_seq`` is an efficiency knob, not a correctness one — the
+    default (0) re-inserts the whole history and stays idempotent, which is
+    what a caller with no memory of what it last flushed needs;
+    ``bind_persist()`` passes its own running offset so a turn's repeated
+    persist calls insert only the new tail each time, instead of
+    re-attempting every row already durable.
+
+    Returns ``(id, promoted)`` for every row this call actually landed —
+    ``promoted=True`` for a row finalized from ``streaming``, ``False`` for
+    a genuinely new one — which is what ``_record_messages`` uses to write
+    a ``created`` or ``changed`` ledger row accordingly (H21). ``id`` is
+    always the row's own **surviving** id: a promoted row keeps the id
+    minted when it was first written provisional, never the one this call
+    would have minted for it and discards on conflict."""
+    existing = {
+        row[0]: row[1]
         for row in conn.execute(
-            "SELECT msg_seq FROM messages WHERE conversation_key = ? AND msg_seq >= ?",
+            "SELECT msg_seq, state FROM messages WHERE conversation_key = ? AND msg_seq >= ?",
             (conversation.key, start_seq),
         )
     }
+    present = {seq for seq, state in existing.items() if state != "streaming"}
     now_wall = time.time()
     rows = [
         (
@@ -561,13 +586,34 @@ def _insert_messages(conn: sqlite3.Connection, conversation: Conversation, *, st
         for seq, m in enumerate(conversation.messages[start_seq:], start=start_seq)
         if seq not in present
     ]
+    if not rows:
+        return ()
     conn.executemany(
-        "INSERT OR IGNORE INTO messages "
+        "INSERT INTO messages "
         "(conversation_key, msg_seq, role, content, tool_calls_json, tool_call_id, id, created_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+        "ON CONFLICT(conversation_key, msg_seq) DO UPDATE SET "
+        "content=excluded.content, tool_calls_json=excluded.tool_calls_json, "
+        "tool_call_id=excluded.tool_call_id, state=excluded.state "
+        "WHERE messages.state = 'streaming'",
         rows,
     )
-    return tuple(row[6] for row in rows)
+    # A freshly-inserted row's id is already known — `rows[i][6]`, the same
+    # value just minted for it above. Only a *promoted* row (`seq in
+    # existing`) needs a read back: its surviving id is the one the
+    # `streaming` placeholder already had, not the one this call minted and
+    # the conflict just discarded.
+    promoted_seqs = [row[1] for row in rows if row[1] in existing]
+    surviving_ids: dict[int, str] = {}
+    if promoted_seqs:
+        placeholders = ",".join("?" * len(promoted_seqs))
+        surviving_ids = dict(
+            conn.execute(
+                f"SELECT msg_seq, id FROM messages WHERE conversation_key = ? AND msg_seq IN ({placeholders})",
+                (conversation.key, *promoted_seqs),
+            )
+        )
+    return tuple((surviving_ids[row[1]] if row[1] in existing else row[6], row[1] in existing) for row in rows)
 
 
 def create(
@@ -626,11 +672,28 @@ def create(
         _record_messages(c, message_ids, at=now_wall)
 
 
-def _record_messages(c: sqlite3.Connection, message_ids: tuple[str, ...], *, at: float) -> None:
-    """One ``messages``/``created`` per row that genuinely landed. Version 1
-    always: a message is never edited once written."""
-    for message_id in message_ids:
-        ledger.record_change(c, noun="messages", id=message_id, kind="created", state="sent", version=1, at=at)
+def _record_messages(c: sqlite3.Connection, message_ids: tuple[tuple[str, bool], ...], *, at: float) -> None:
+    """One ``messages`` ledger row per row ``_insert_messages`` actually
+    landed: ``created`` for a genuinely new row, ``changed`` for one
+    finalized from a ``streaming`` placeholder (H21) —
+    ``harness.get_changes()`` already folds both into the wire's single
+    ``changed`` kind (CLAUDE.md's ledger-kind rule), so this adds no new
+    console-visible vocabulary. ``state="sent"`` unconditionally: that is
+    every row's real state after this call, whether it just landed fresh
+    or was just finalized — the same value ``_insert_messages``'s own
+    ``INSERT``'s implicit default (and the promoted row's own
+    ``state=excluded.state``) already settles it to. Version 1 always: a
+    message is never edited once its state has settled."""
+    for message_id, promoted in message_ids:
+        ledger.record_change(
+            c,
+            noun="messages",
+            id=message_id,
+            kind="changed" if promoted else "created",
+            state="sent",
+            version=1,
+            at=at,
+        )
 
 
 def _record_conversation_change(c: sqlite3.Connection, key: ConversationKey, *, at: float) -> None:

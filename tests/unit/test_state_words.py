@@ -69,7 +69,7 @@ def _exercise_every_write_site(conn: sqlite3.Connection, tmp_path: Path) -> None
     (plugins_root / "broken" / "plugin.toml").write_text("this is not toml [[[")
     plugin_install.reconcile_plugin_state(conn, plugins_root)
 
-    observability._insert_turn_run(conn, turn_result(), duration_s=1.0, recorded_at=100.0)
+    observability.insert_turn_run(conn, turn_result(), duration_s=1.0, recorded_at=100.0)
     observability._insert_plugin_run(
         conn,
         TurnKey(conversation="k1", turn_seq=0),

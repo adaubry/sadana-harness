@@ -60,7 +60,7 @@ def _full_ctx(keys, tmp_path: Path):
 
 
 def test_golden_journey(keys, tmp_path: Path, monkeypatch, schema: dict) -> None:
-    def _slow_reply(request: object) -> model_access.Response:
+    def _slow_reply(request: object, on_delta=None) -> model_access.Response:  # type: ignore[no-untyped-def]
         time.sleep(0.05)
         return plain_response("hi there")
 
@@ -255,7 +255,7 @@ def test_golden_journey_failed_turn_carries_the_diagnostic(keys, tmp_path: Path,
     seed_conversation(runtime, account="console:u1", id=conversation_key)
     token = mint(keys, sub="u1", scope=["messages:write", "messages:read"])
 
-    monkeypatch.setattr(model_access, "send", lambda request: model_access.Abort("bad request"))
+    monkeypatch.setattr(model_access, "send", lambda request, on_delta=None: model_access.Abort("bad request"))
     resp = handle(
         req(
             "POST",

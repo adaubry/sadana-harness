@@ -1,7 +1,7 @@
 ## message
 
-Served by: H20. Child of `conversation` — `/v1/conversations/{id}/messages
-[/{message_id}]`.
+Served by: H20, streaming and live rows by H21. Child of `conversation` —
+`/v1/conversations/{id}/messages[/{message_id}]`.
 
 - **Fields:** `role` (`user`/`assistant`/`tool`), `content`, `run_id?`,
   `turn_seq`. `turn_seq` is derived at read time (`run_id → turn_runs.
@@ -10,33 +10,38 @@ Served by: H20. Child of `conversation` — `/v1/conversations/{id}/messages
   (no `turn_runs` row is ever written for a resume) and for any legacy
   pre-H20 row — a real, honest gap, not the brief's originally-assumed
   always-present field.
-- **States:** `streaming`, `sent`, `failed`. Every row this work item
-  produces is `sent` (a successful turn's rows are never touched) or
-  `failed` (the assistant row of a failed turn, and only that row — nothing
-  else about it changes). `streaming` is declared for schema uniformity with
-  H21's live rows; nothing here ever renders it.
+- **States:** `streaming`, `sent`, `failed`. The assistant row exists from
+  the very start of every turn, always (H21) — inserted `streaming`, empty
+  content, the moment the turn begins, and finalized once it ends: `sent`
+  with the turn's own final text, or `failed` (empty content) if the turn
+  never produced one. A live console watching `text_delta` frames sees the
+  same row fill in as the reply streams; nothing durable records a
+  fragment that arrived while nobody was watching (a delta is never
+  ledgered).
 - **Actions:** none.
 - **`create({content})` is the turn.** `src/sadana/door/turn_client.py`
-  calls `client_surface.take_turn` and nothing deeper. On success, the
-  user message row (written by `take_turn`'s own persistence) is returned;
-  the assistant's reply is read back the same way any message is — see
-  "Where it differs from the console's prompt" below for why. Every
-  newly-appended row from the turn (user, assistant, and any intermediate
-  tool rows) is tagged with the run's own `id` as `run_id` once the turn's
-  `turn_runs` row exists. On failure, the assistant row (if one exists —
-  see below) is set to `state: "failed"` and nothing else; the diagnostic
+  calls `client_surface.take_turn` and nothing deeper, forwarding one more
+  argument through unchanged: the door's own `TurnObserver`
+  (`door/nouns/messages.py`'s own `_DoorTurnObserver`), which is what
+  writes the user's row and the assistant's provisional row the moment the
+  turn starts, streams `message.delta` ephemeral frames while it runs, and
+  finalizes the assistant row once it ends. `create()` itself reads the
+  result back by the turn's own `run_id` — never a `msg_seq` range
+  computed before and after the call — and backfills `run_id` onto
+  whatever else the turn produced (intermediate tool rows; the real final
+  reply, if a tool call meant it landed somewhere other than the
+  placeholder's own first guess). On failure, the assistant row already
+  carries `state: "failed"` by the time `create()` returns; the diagnostic
   itself is never duplicated onto the message (see the run's own
   `exit_reason`/`detail`, and the failed operation's own `error.detail` at
   the moment of the call).
-- **A failed turn does not always produce an assistant row.**
-  `conversation.py`'s own turn loop only appends one once a model completion
-  actually returns — a turn that fails before any completion (e.g.
-  `provider_failed` on the very first call) leaves no new assistant row at
-  all. This create still fails the same way (`INTERNAL`, the diagnostic in
-  `error.detail`); there is simply no row to mark.
 - **A conversation with an outstanding pause** takes `take_turn`'s existing
-  resume path — the model is never called, and the resumed reply is
-  appended with no `run_id` at all.
+  resume path — no `_DoorTurnObserver` ever runs for one (`client_surface.
+  take_turn`'s resume branch never calls `run_turn`), the model is never
+  called, and the resumed reply is appended with no `run_id` at all;
+  `create()` falls back to its pre-H21 before/after read for this one path,
+  and to the pre-H21 "find the last assistant row, mark it failed" behavior
+  when a resume itself fails.
 - **Filterable / orderable:** `role`, `created_at`, `run_id` filterable;
   `created_at` orderable. Default order is `created_at desc` (the
   framework's own default — `grammar.parse_list_params` has no per-noun

@@ -1,21 +1,22 @@
 ## span
 
-Served by: H20. Child of `trace`.
+Served by: H20 (schema), real rows and reads by H21. Child of `trace` —
+reached as `/v1/traces/{trace_id}/spans[/{span_id}]`; a bare `/v1/spans`
+(no parent) answers an empty list / `404`, the same posture every other
+child noun in this block already takes for an unparented call.
 
 - **Fields:** `node_id`, `kind`, `status` (`ok`/`error`/`skipped`),
   `started_at`, `ended_at?`, `input_preview?`, `output_preview?`, `error?`.
-- **States:** `ok`, `error`, `skipped`.
+  One row per node a plugin run actually visits, written live as the walk
+  reaches each one — never edited afterward, unlike `run`/`trace`'s own
+  started-then-completed rows.
+- **States:** `ok`, `error`, `skipped` (`skipped` declared for schema
+  uniformity with a future `each` node kind; nothing produces it yet).
 - **Actions:** none.
 - **Filterable / orderable:** `status`, `kind`, `node_id` filterable;
-  `created_at` orderable (present so the framework's own default `order_by`
-  doesn't reject a bare `GET /v1/spans` — no row is ever produced to sort by
-  it).
-- **`search_doc`:** `{"title": id}` — present for protocol uniformity;
-  nothing ever writes a `span`-noun ledger row for it to render from.
-- **Where it differs from the console's prompt:** `list` always returns an
-  empty page and `get` always answers `404 NOT_FOUND` — the underlying table
-  doesn't exist until H21. This is a deliberate, honest gap, not an
-  implementation shortcut: the console's own prompt lists a five-value `kind`
-  enum; this runtime's node kinds are seven (`compute`, `ask`, `route`,
-  `stop`, `call`, `each`, `wait` — `docs/console/wire.md` §6), which will
-  matter once H21 starts producing real rows.
+  `created_at` orderable.
+- **`search_doc`:** `{"title": node_id, "facets": {"kind", "status"}}`.
+- **Where it differs from the console's prompt:** the console's own prompt
+  lists a five-value `kind` enum; this runtime's node kinds are seven
+  (`compute`, `ask`, `route`, `stop`, `call`, `each`, `wait` —
+  `docs/console/wire.md` §6).

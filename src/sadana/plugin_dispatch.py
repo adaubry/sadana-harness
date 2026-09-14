@@ -9,8 +9,10 @@ plugin_manifest.py never import conversation.py"), and an `ask` node needs
 
 from __future__ import annotations
 
+import asyncio
 import json
 import sqlite3
+import time
 from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass, replace
 from typing import Literal
@@ -25,7 +27,9 @@ from sadana.conversation import (
     ResolvedNames,
     ToolSpec,
     TurnKey,
+    TurnObserver,
     TurnResult,
+    _child_key,
     _noop_persist,
     run_child,
 )
@@ -142,6 +146,63 @@ async def _noop_persist_pause(_turn_key: TurnKey, _seq_in_turn: int, _result: pl
     return None
 
 
+class _RecordingNodeSink:
+    """H21. Turns `plugin_manifest.py`'s two clock-free `NodeSink` calls —
+    the walker itself reads no clock, per CLAUDE.md — into one
+    `observability.record_node()` row per node: `node_started` remembers
+    `time.time()` and this run's own `node_seq` counter (starting at 0,
+    incremented once per node); `node_finished` reads the clock a second
+    time and calls `record_node` with both. `node_finished` is itself a
+    plain, synchronous `NodeSink` method (matching the protocol
+    `plugin_manifest.NodeSink` declares), so it cannot itself `await` the
+    write — it schedules one via `asyncio.ensure_future` instead and
+    remembers the task. `flush()`, awaited once by `dispatch()` right
+    after `run_graph` returns, reaps every task this sink scheduled — so
+    every span this run produced is durably written (or its failure
+    logged, same as every other recording write) before the dispatch call
+    that owns this sink returns, without the walker itself ever awaiting
+    a sink call."""
+
+    def __init__(self, record_node: observability.RecordNodeFn, turn_key: TurnKey, seq_in_turn: int) -> None:
+        self._record_node = record_node
+        self._turn_key = turn_key
+        self._seq_in_turn = seq_in_turn
+        self._node_seq = 0
+        self._pending: dict[str, tuple[int, plugins.NodeKind, float, str]] = {}
+        self._tasks: list[asyncio.Task[None]] = []
+
+    def node_started(self, node: str, kind: plugins.NodeKind, input_preview: str) -> None:
+        self._node_seq += 1
+        self._pending[node] = (self._node_seq, kind, time.time(), input_preview)
+
+    def node_finished(self, trace: plugins.NodeTrace, output_preview: str) -> None:
+        node_seq, kind, started_at, input_preview = self._pending.pop(trace.node)
+        status: Literal["ok", "error"] = "ok" if trace.ok else "error"
+        self._tasks.append(
+            asyncio.ensure_future(
+                self._record_node(
+                    self._turn_key,
+                    self._seq_in_turn,
+                    node_seq,
+                    trace.node,
+                    kind,
+                    status,
+                    started_at,
+                    time.time(),
+                    port=trace.port,
+                    detail=trace.detail if trace.ok else None,
+                    input_preview=input_preview,
+                    output_preview=output_preview,
+                    error=trace.detail if not trace.ok else None,
+                )
+            )
+        )
+
+    async def flush(self) -> None:
+        if self._tasks:
+            await asyncio.gather(*self._tasks)
+
+
 def build_dispatch(
     conversation: Conversation,
     plugin_set: PluginSet,
@@ -153,6 +214,9 @@ def build_dispatch(
     approve: plugins.ApproveFn = plugin_manifest._default_approve,
     record_turn: observability.RecordTurnFn = observability.noop_record,
     record_plugin_run: observability.RecordPluginRunFn = observability.noop_record,
+    record_turn_started: observability.RecordTurnStartedFn = observability.noop_record_started,
+    record_plugin_run_started: observability.RecordPluginRunStartedFn = observability.noop_record_started,
+    record_node: observability.RecordNodeFn = observability.noop_record,
     memory_context: memory_store.DispatchContext | None = None,
     persist_pause: Callable[[TurnKey, int, plugins.DagResult], Awaitable[None]] = _noop_persist_pause,
 ) -> tuple[DispatchFn, ChildSeqTracker]:
@@ -191,6 +255,15 @@ def build_dispatch(
     `capturing_dispatch`'s own `captured` list already take). Both default
     to a no-op, so a caller that never opted in behaves exactly as before.
 
+    **Live records** (H21): `record_turn_started`/`record_plugin_run_started`
+    (both default `observability.noop_record_started`) open a `"running"`
+    row before, respectively, `ask`'s own child turn and a real `run_graph`
+    call — `record_turn`/`record_plugin_run` above then close the same row
+    exactly as they already do. `record_node` (default `observability.
+    noop_record`) backs a fresh `_RecordingNodeSink`, built once per
+    `dispatch()` call and handed to `plugin_manifest.run_graph` as
+    `node_sink` — one `spans` row per node that run visits.
+
     **Memory** (`docs/tasks/MEMORY-01-write-recall-and-forget/spec.md`):
     when `memory_context` is given, every call's `arguments` gets one
     reserved key, `_sadana_memory_ctx`, merged in *last* so it always wins
@@ -224,6 +297,13 @@ def build_dispatch(
     async def ask(skill: plugins.SkillRef, text: str) -> str | None:
         parent = replace(conversation, next_child_seq=tracker.next_seq)
         spec = ChildSpec(node_name=skill.skill, skill=skill, input=text, tools=frozenset())
+        # H21. The child's own key, computed exactly as `run_child` is
+        # about to compute it internally (same `parent.key`/`spec.node_name`/
+        # `parent.next_child_seq`) — so this "running" row is opened under
+        # the same `TurnKey` `record_turn` below closes it with, without
+        # `run_child` having to hand one back early just for this.
+        child_turn_key = TurnKey(conversation=_child_key(parent.key, spec.node_name, parent.next_child_seq), turn_seq=0)
+        await record_turn_started(child_turn_key, 0, time.time())
         (result, _child, updated_parent), duration_s = await observability.timed(
             run_child(
                 parent,
@@ -269,6 +349,8 @@ def build_dispatch(
         call_arguments = {**arguments, "_sadana_session_key": conversation.key}
         if memory_context is not None:
             call_arguments["_sadana_memory_ctx"] = memory_context
+        await record_plugin_run_started(turn_key, seq_in_turn, installed.manifest.name, entry.tool, time.time())
+        node_sink = _RecordingNodeSink(record_node, turn_key, seq_in_turn)
         result, duration_s = await observability.timed(
             plugin_manifest.run_graph(
                 installed.directory,
@@ -278,8 +360,10 @@ def build_dispatch(
                 ask=ask,
                 approve=approve,
                 output_dir=output_dir,
+                node_sink=node_sink,
             )
         )
+        await node_sink.flush()
         await record_plugin_run(turn_key, seq_in_turn, result, duration_s)
         if result.paused_node is not None:
             # The same `(turn_key, seq_in_turn)` `record_plugin_run` was just
@@ -456,6 +540,7 @@ async def take_turn_and_reconcile(
     now: float,
     persist: Callable[[tuple[Message, ...]], Awaitable[None]] = _noop_persist,
     record_turn: observability.RecordTurnFn = observability.noop_record,
+    observer: TurnObserver | None = None,
 ) -> tuple[TurnResult, Conversation]:
     """Self-check addition: `build_dispatch`'s own docstring named the
     reconciliation step as the caller's obligation, enforced by nothing but
@@ -468,7 +553,11 @@ async def take_turn_and_reconcile(
 
     `record_turn` (default a no-op) is awaited with the turn's own
     `TurnResult` and its wall-clock duration once it's done —
-    OBSERVABILITY-01's other emitter, alongside `build_dispatch`'s own."""
+    OBSERVABILITY-01's other emitter, alongside `build_dispatch`'s own.
+
+    `observer` (H21, default `None`): passed straight through to
+    `conversation.take_turn`/`run_turn` — no logic of its own here,
+    matching how `persist`/`record_turn` already thread through both."""
     (result, updated), duration_s = await observability.timed(
         _take_turn(
             conversation,
@@ -478,6 +567,7 @@ async def take_turn_and_reconcile(
             dispatch=dispatch,
             persist=persist,
             now=now,
+            observer=observer,
         )
     )
     await record_turn(result, duration_s)

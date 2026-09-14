@@ -122,9 +122,16 @@ on it: see `docs/console/capabilities.md`.
 
 ## §5 Frames
 
-Not yet. H30 is the work item that puts a real socket behind this door and
-defines the frame envelope events travel in; until then, §3's shape is
-reachable only by polling `GET /v1/changes`.
+Not yet delivered anywhere outside this process. H21 gives an ephemeral
+frame (`{"type": "ephemeral", "name": "message.delta", "harness_id",
+"data": {"conversation_id", "message_id", "delta", "seq"}}`) a real,
+bounded queue to land in (`door/events.py`'s `ephemeral_queue`), written to
+by a turn's own observer as it streams — but nothing drains that queue onto
+a socket yet. H30 is still the work item that puts a real socket behind
+this door and defines the frame envelope events travel in; until then, an
+ephemeral frame is visible only to something running inside this same
+process, and §3's own durable shape is reachable only by polling
+`GET /v1/changes`.
 
 ## §6 What the console's prompts did not anticipate
 

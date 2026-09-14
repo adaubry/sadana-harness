@@ -43,6 +43,12 @@ DECLARED: tuple[str, ...] = (
     "artifacts.download",
     "approvals.wait",
     "approvals.call",
+    # H21 (docs/tasks/H21-watched-streaming-live-runs-stop/spec.md): a
+    # turn can stream, a run's live state is real, and a run can be asked
+    # to stop.
+    "streaming",
+    "runs.live",
+    "runs.stop",
 )
 
 _unknown = [name for name in DECLARED if name not in ALL]

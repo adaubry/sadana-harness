@@ -10,7 +10,7 @@ from __future__ import annotations
 import sqlite3
 from collections.abc import Mapping
 
-from sadana.door import grammar, problems
+from sadana.door import grammar, problems, run_control
 from sadana.door.auth import Principal, account_key_for
 from sadana.door.nouns import ActionSpec, NounSpec, SearchDoc
 
@@ -151,12 +151,25 @@ def act(
     name: str,
     body: Mapping[str, object],
     if_match: str | None,
-) -> problems.Problem:
-    # Unreachable while `runs.stop` stays out of `capabilities.DECLARED`
-    # (router.py's own capability gate answers 501 first) — this body exists
-    # only so a future item that turns the capability on has somewhere to
-    # put the real behaviour, matching `harness.act`'s own stub shape.
-    return problems.make("HARNESS_CAPABILITY_MISSING", f"runs.{name} is not available on this harness")
+) -> Mapping[str, object] | problems.Problem:
+    if name != "stop":
+        return problems.make("HARNESS_CAPABILITY_MISSING", f"runs.{name} is not available on this harness")
+    # H21. `router.py`'s own `from_states=("running", "waiting")` gate
+    # already confirmed, via `get()`, that `id` names a run this account
+    # can see and that its own DB row is still in a live state, before
+    # dispatching here — this call does not itself flip any state; the
+    # observer's own `turn_finished` is what eventually settles it to
+    # `stopped`, cooperatively, once the turn notices. `False` here means
+    # this *process* is not holding a run by that id right now — already
+    # finished between the router's own check and this call, or the
+    # process restarted since the run started.
+    if not run_control.request_stop(id):
+        return problems.make("CONFLICT", f"run {id} is not currently held by this process")
+    conn = _reader(ctx)
+    row = _row(conn, account_key_for(principal), id)
+    if row is None:
+        return problems.make("NOT_FOUND", f"no run {id}")
+    return _render(ctx, conn, row)
 
 
 def search_doc(row: Mapping[str, object]) -> SearchDoc:

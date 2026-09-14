@@ -438,6 +438,133 @@ def test_build_dispatch_does_not_add_its_own_guard_around_the_given_recorder(tmp
         asyncio.run(dispatch("do_it", {"a": 1}))
 
 
+# ── H21: live records (record_*_started, the node_sink wrapper) ─────────
+
+
+def _fake_started_recorder():  # type: ignore[no-untyped-def]
+    calls: dict[str, list] = {"turn_started": [], "plugin_run_started": []}
+
+    async def record_turn_started(turn_key, user_message_seq, started_at):  # type: ignore[no-untyped-def]
+        calls["turn_started"].append((turn_key, user_message_seq, started_at))
+        return "run_fake"
+
+    async def record_plugin_run_started(turn_key, seq, plugin, entry, started_at):  # type: ignore[no-untyped-def]
+        calls["plugin_run_started"].append((turn_key, seq, plugin, entry, started_at))
+        return "run_fake"
+
+    return record_turn_started, record_plugin_run_started, calls
+
+
+def _fake_node_recorder():  # type: ignore[no-untyped-def]
+    calls: list[tuple] = []
+
+    async def record_node(turn_key, seq_in_turn, node_seq, node, kind, status, started_at, ended_at, **kwargs):  # type: ignore[no-untyped-def]
+        calls.append((turn_key, seq_in_turn, node_seq, node, kind, status, started_at, ended_at, kwargs))
+
+    return record_node, calls
+
+
+@pytest.mark.unit
+def test_build_dispatch_calls_record_plugin_run_started_before_record_plugin_run(tmp_path: Path) -> None:
+    plugin_set = _one_call_node_plugin_set(tmp_path)
+    _record_turn_started, record_plugin_run_started, started_calls = _fake_started_recorder()
+    conversation = _conversation()
+
+    dispatch, _tracker = build_dispatch(
+        conversation,
+        plugin_set,
+        provider="p",
+        model="m",
+        now=0.0,
+        record_plugin_run_started=record_plugin_run_started,
+    )
+    asyncio.run(dispatch("do_it", {"a": 1}))
+
+    assert len(started_calls["plugin_run_started"]) == 1
+    turn_key, seq, plugin, entry, started_at = started_calls["plugin_run_started"][0]
+    assert turn_key == TurnKey(conversation=conversation.key, turn_seq=conversation.next_turn_seq)
+    assert seq == 0
+    assert plugin == "p"
+    assert entry == "do_it"
+    assert started_at >= 0.0
+
+
+@pytest.mark.unit
+def test_build_dispatch_ask_calls_record_turn_started_for_the_child_turn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake_run_child, _seen = _fake_run_child_factory(exit_reason=ExitReason.COMPLETED, final_text="done")
+    monkeypatch.setattr(plugin_dispatch, "run_child", fake_run_child)
+    plugin_set = _one_ask_node_plugin_set(tmp_path)
+    record_turn_started, _record_plugin_run_started, calls = _fake_started_recorder()
+
+    dispatch, _tracker = build_dispatch(
+        _conversation(), plugin_set, provider="p", model="m", now=0.0, record_turn_started=record_turn_started
+    )
+    asyncio.run(dispatch("do_it", {}))
+
+    assert len(calls["turn_started"]) == 1
+    _turn_key, user_message_seq, started_at = calls["turn_started"][0]
+    assert user_message_seq == 0
+    assert started_at >= 0.0
+
+
+@pytest.mark.unit
+def test_build_dispatch_with_none_of_the_three_new_recorders_behaves_exactly_as_today(tmp_path: Path) -> None:
+    """Regression (plan.md's own Proof): a caller passing none of
+    `record_turn_started`/`record_plugin_run_started`/`record_node` keeps
+    working exactly as before this item — every one defaults to a no-op."""
+    plugin_set = _one_call_node_plugin_set(tmp_path)
+    dispatch, _tracker = build_dispatch(_conversation(), plugin_set, provider="p", model="m", now=0.0)
+
+    # Matches `test_build_dispatch_calls_record_plugin_run_once_per_dispatch_call`'s
+    # own posture: no `approve` given, so the call node's default
+    # `_default_approve` hits captured stdin and the node fails closed —
+    # this test only cares that adding the three new, defaulted recorder
+    # parameters didn't change that.
+    result = asyncio.run(dispatch("do_it", {"a": 1}))
+
+    assert result.plugin == "p"
+
+
+@pytest.mark.unit
+def test_build_dispatch_node_sink_records_one_span_per_node_with_started_before_ended(tmp_path: Path) -> None:
+    plugin_dir = tmp_path / "p"
+    plugin_dir.mkdir()
+    (plugin_dir / "init.py").write_text(
+        "def step_one(value):\n    return {'n': 1}\n\ndef step_two(value):\n    return {'n': 2}\n"
+    )
+    manifest = Manifest(
+        name="p",
+        version="0.1.0",
+        description="d",
+        entries=(Entry(tool="do_it", purpose="p", parameters="s.json", start="a"),),
+        nodes=(
+            Node(name="a", kind="compute", body="init:step_one", next="b"),
+            Node(name="b", kind="compute", body="init:step_two"),
+        ),
+    )
+    installed = InstalledPlugin(name="p", directory=plugin_dir, manifest=manifest)
+    plugin_set = PluginSet(catalog=(), tool_specs=(), by_tool={"do_it": (installed, manifest.entries[0])})
+    record_node, calls = _fake_node_recorder()
+    conversation = _conversation()
+
+    dispatch, _tracker = build_dispatch(
+        conversation, plugin_set, provider="p", model="m", now=0.0, record_node=record_node
+    )
+    asyncio.run(dispatch("do_it", {}))
+
+    assert len(calls) == 2
+    turn_key = TurnKey(conversation=conversation.key, turn_seq=conversation.next_turn_seq)
+    for turn_key_seen, seq_in_turn, _node_seq, _node, _kind, status, started_at, ended_at, _kwargs in calls:
+        assert turn_key_seen == turn_key
+        assert seq_in_turn == 0
+        assert status == "ok"
+        assert started_at <= ended_at
+    assert [c[3] for c in calls] == ["a", "b"]
+    assert [c[2] for c in calls] == [1, 2]
+
+
 @pytest.mark.unit
 def test_build_dispatch_threads_a_given_approve_to_run_graph(tmp_path: Path) -> None:
     """G3-real-plugin-under-eval: without this passthrough, a `call` node

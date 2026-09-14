@@ -30,9 +30,12 @@ from _scaffold import (
     validate,
 )
 
-from sadana import ids, stores
+from sadana import client_surface, ids, model_access, observability, plugin_dispatch, stores
+from sadana.conversation import ToolSpec
 from sadana.conversation_store import write_txn
 from sadana.door.nouns import runs
+from sadana.door.nouns.conversations import ConversationsNoun
+from sadana.door.nouns.messages import MessagesNoun
 from sadana.door.router import handle
 
 pytestmark = pytest.mark.contract
@@ -110,23 +113,120 @@ def test_completed_turn_with_a_failed_plugin_run_shows_failed_node(keys, tmp_pat
     assert json.loads(resp.body)["exit_reason"] == "failed_node"
 
 
-def test_stop_is_capability_missing(keys, tmp_path: Path) -> None:
+def test_stop_on_a_run_registered_mid_turn_stops_it_and_settles_to_stopped(
+    keys, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """H21. `runs.stop` is exercised for real — not `capabilities.DECLARED`
+    yet (step 15), so this test states `runs.stop` as its own
+    `extra_capabilities`, the same mechanism every other noun's own
+    capability-gated test already uses before its capability is wired in.
+    A fake provider stops the run *from inside its own first response* —
+    the same shape a genuinely concurrent stop request would have, since
+    this test has no second thread to send one from — then returns a tool
+    call so the turn's own `should_stop()` check (after the tool round,
+    before a second model call) is what actually ends it; the fake
+    provider asserts it is never called a second time, proving the stop
+    was honored rather than merely recorded."""
+    conns = stores.Connections(tmp_path / "door.db")
+    # A real (if unregistered) tool, not `make_runtime`'s own
+    # `EMPTY_PLUGIN_SET`: an empty tool surface makes any tool call
+    # `invalid_tool_calls` before the turn loop ever reaches its
+    # `should_stop()` check — this test needs a *valid, unregistered* call
+    # (a clean, dispatch-level "no installed plugin" `DagResult`) so the
+    # loop reaches the tool round and, after it, `should_stop()`.
+    plugin_set = plugin_dispatch.PluginSet(
+        catalog=(),
+        tool_specs=(ToolSpec(key="nonexistent_tool", name="nonexistent_tool", parameters={}, describe=lambda _r: ""),),
+        by_tool={},
+    )
+    runtime = client_surface.Runtime(
+        connections=conns,
+        plugin_set=plugin_set,
+        provider="p",
+        model="m",
+        recorder=observability.make_recorder(conns.writer),
+    )
+    conversation_key = ids.make_id("conv")
+    seed_conversation(runtime, account="console:u1", id=conversation_key)
+    ctx = make_ctx(
+        keys,
+        conns,
+        {"conversations": ConversationsNoun(runtime), "messages": MessagesNoun(runtime), "runs": runs},
+        extra_capabilities=("runs.stop",),
+    )
+    stop_token = mint(keys, sub="u1", scope=["runs:stop"])
+    seen_run_id: dict[str, str] = {}
+    calls = {"n": 0}
+
+    def fake_send(request: object, on_delta=None) -> model_access.Response:  # type: ignore[no-untyped-def]
+        calls["n"] += 1
+        if calls["n"] > 1:
+            raise AssertionError("should_stop() should have ended the turn before a second model call")
+        row = (
+            conns.reader()
+            .execute("SELECT id FROM turn_runs WHERE conversation_key = ? AND state = 'running'", (conversation_key,))
+            .fetchone()
+        )
+        assert row is not None
+        seen_run_id["id"] = row["id"]
+        stop_resp = handle(req("POST", f"/v1/runs/{row['id']}/actions/stop", token=stop_token, body=b"{}"), ctx=ctx)
+        assert stop_resp.status == 200
+        return model_access.Response(
+            content=None,
+            tool_calls=({"function": {"name": "nonexistent_tool", "arguments": "{}"}},),
+            finish_reason="tool_calls",
+            usage=model_access.Usage(),
+        )
+
+    monkeypatch.setattr(model_access, "send", fake_send)
+
+    msg_token = mint(keys, sub="u1", scope=["messages:write", "messages:read"])
+    created = handle(
+        req(
+            "POST",
+            f"/v1/conversations/{conversation_key}/messages",
+            token=msg_token,
+            body=json.dumps({"content": "hi"}).encode(),
+        ),
+        ctx=ctx,
+    )
+    assert created.status == 500  # INTERRUPTED is not `ok`, same as any other non-completed turn
+
+    read_token = mint(keys, sub="u1", scope=["runs:read"])
+    settled = handle(req("GET", f"/v1/runs/{seen_run_id['id']}", token=read_token), ctx=ctx)
+    assert json.loads(settled.body)["exit_reason"] == "stopped"
+
+
+def test_stop_on_a_run_not_held_by_this_process_answers_conflict(keys, tmp_path: Path) -> None:
+    """A `turn_runs` row seeded straight into the DB, never registered with
+    `run_control` — the "the process restarted since the run started"
+    case `door/nouns/runs.py`'s own docstring names."""
     conns = stores.Connections(tmp_path / "door.db")
     runtime = make_runtime(conns)
     conversation_key = ids.make_id("conv")
     seed_conversation(runtime, account="console:u1", id=conversation_key)
     run_id = seed_turn_run(conns.writer, conversation_key=conversation_key, turn_seq=0, state="running")
 
-    ctx = make_ctx(keys, conns, {"runs": runs})
-    token = mint(keys, sub="u1", scope=["runs:stop", "runs:read"])
+    ctx = make_ctx(keys, conns, {"runs": runs}, extra_capabilities=("runs.stop",))
+    token = mint(keys, sub="u1", scope=["runs:stop"])
     resp = handle(
-        req(
-            "POST",
-            f"/v1/runs/{run_id}/actions/stop",
-            token=token,
-            body=b"{}",
-            headers={"If-Match": '"1"'},
-        ),
+        req("POST", f"/v1/runs/{run_id}/actions/stop", token=token, body=b"{}"),
         ctx=ctx,
     )
-    assert resp.status == 501
+    assert resp.status == 409
+
+
+def test_stop_on_an_already_finished_run_answers_conflict(keys, tmp_path: Path) -> None:
+    conns = stores.Connections(tmp_path / "door.db")
+    runtime = make_runtime(conns)
+    conversation_key = ids.make_id("conv")
+    seed_conversation(runtime, account="console:u1", id=conversation_key)
+    run_id = seed_turn_run(conns.writer, conversation_key=conversation_key, turn_seq=0, state="done")
+
+    ctx = make_ctx(keys, conns, {"runs": runs}, extra_capabilities=("runs.stop",))
+    token = mint(keys, sub="u1", scope=["runs:stop"])
+    resp = handle(
+        req("POST", f"/v1/runs/{run_id}/actions/stop", token=token, body=b"{}"),
+        ctx=ctx,
+    )
+    assert resp.status == 409
