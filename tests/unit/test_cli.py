@@ -58,6 +58,29 @@ def test_build_parser_returns_a_fresh_instance_each_call() -> None:
 
 
 @pytest.mark.unit
+def test_door_is_a_registered_subcommand() -> None:
+    parser = build_parser()
+    [subparsers_action] = parser._subparsers._group_actions  # type: ignore[attr-defined]
+    assert "door" in subparsers_action.choices
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("argv", [["door", "--help"], ["door", "serve", "--help"], ["door", "token", "--help"]])
+def test_door_help_exits_zero(argv: list[str], capsys: pytest.CaptureFixture[str]) -> None:
+    with pytest.raises(SystemExit) as exc:
+        main(argv)
+    assert exc.value.code == 0
+    assert capsys.readouterr().out
+
+
+@pytest.mark.unit
+def test_door_with_no_subcommand_exits_two() -> None:
+    with pytest.raises(SystemExit) as exc:
+        main(["door"])
+    assert exc.value.code == 2
+
+
+@pytest.mark.unit
 def test_no_args_names_conversations_as_a_valid_choice(capsys: pytest.CaptureFixture[str]) -> None:
     with pytest.raises(SystemExit):
         main([])

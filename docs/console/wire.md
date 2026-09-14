@@ -1,0 +1,153 @@
+# The door — wire contract
+
+Written by sadana-harness H19 for the console's own agents. This is the
+box's half of a two-repository contract; where this document and the
+console's own generated contract (A04) disagree, `grammar.json`'s
+`$comment` says how that gets caught and fixed. §1-§4 below are
+implemented verbatim by `src/sadana/door/`; nothing in this document is
+aspirational except where a section says otherwise.
+
+## §1 Grammar
+
+**Paths.** `GET /v1/{plural}` · `GET /v1/{plural}/{id}` · `POST /v1/{plural}`
+· `PATCH /v1/{plural}/{id}` · `DELETE /v1/{plural}/{id}` ·
+`POST /v1/{plural}/{id}/actions/{name}` · one level of child nesting:
+`/v1/{plural}/{id}/{child_plural}[/{cid}]`. Fixed paths, outside that
+grammar: `GET /v1/operations/{id}`, `GET /v1/changes?since=<cursor>&limit=<n>`,
+`GET /v1/inventory`, `GET /v1/harness`, `POST /v1/harness/actions/{name}`.
+
+**Ids.** `<prefix>_<uuidv7 hex without dashes>`; prefix two to five lowercase
+letters, from a closed registry (`ids.PREFIXES`).
+
+**List params.** Exactly four: `filter`, `order_by` (`<field> asc|desc`,
+default `created_at desc`), `page_size` (1-200, default 50), `page_token`.
+One tolerated extra: `count=true` adds `"count": <n>` to the response. Any
+other name is `400 VALIDATION` naming it.
+
+**Filter grammar.** Fields `a` or `a.b`; operators `= != < <= > >= :` (`:` is
+string-only "contains"); boolean `AND OR NOT`, precedence `NOT > AND > OR`;
+parentheses; double-quoted strings with `\"` escapes; numbers; ISO-8601
+dates; `true`/`false`. Only fields a noun declares filterable; an unknown
+field is `400 VALIDATION`.
+
+**Cursors.** `page_token` is an opaque, base64url-encoded token bound to the
+`order_by` it was minted under. A token presented under a different
+`order_by` is `400 VALIDATION`. Paging is a keyset scan over already-sorted
+rows.
+
+**Standard fields**, on every resource: `id`, `created_at`, `updated_at`
+(ISO-8601 UTC, millisecond precision, trailing `Z`), `state`, `tags`
+(object), `harness_id`, `version` (integer), and `name` where the noun has
+one.
+
+**Problem Details** (RFC 9457): `{"type", "title", "status", "code",
+"detail"?, "instance"?, "errors"?: [{"field", "code"}]}`,
+`Content-Type: application/problem+json`. Exactly thirteen codes:
+
+| code | status |
+| --- | --- |
+| `UNAUTHENTICATED` | 401 |
+| `NOT_FOUND` | 404 |
+| `PAYMENT_REQUIRED` | 402 |
+| `FORBIDDEN` | 403 |
+| `VALIDATION` | 400 |
+| `CONFLICT` | 409 |
+| `PRECONDITION_FAILED` | 412 |
+| `RATE_LIMITED` | 429 |
+| `QUOTA_EXCEEDED` | 429 |
+| `HARNESS_OFFLINE` | 503 |
+| `HARNESS_CAPABILITY_MISSING` | 501 |
+| `IDEMPOTENCY_MISMATCH` | 422 |
+| `INTERNAL` | 500 |
+
+**Headers in.** `Authorization: Bearer <token>` (every request);
+`X-Sadana-Harness: hrn_…` (every request; must equal both the token's `hrn`
+claim and this box's own id); `Idempotency-Key` (every `POST` the console
+sends, though a bare `POST` with no key is processed and simply not stored
+for replay); `If-Match: "<version>"` (every `PATCH`/`DELETE`/action against
+an existing resource).
+
+**Headers out.** `ETag: "<version>"` on every single-resource response;
+`Retry-After` on any `429`.
+
+**Idempotency.** Same key + same body, for the same principal, replays the
+stored status and body byte-for-byte and creates nothing. Same key +
+different body is `422 IDEMPOTENCY_MISMATCH`. Keys expire after 24 hours.
+
+**Operations.** Anything the box can't answer within two seconds becomes
+`202 {"operation": {"id", "state": "running|succeeded|failed", "resource":
+{"noun", "id"} | null, "error": <Problem> | null, "created_at",
+"updated_at"}}`; poll `GET /v1/operations/{id}`.
+
+**Actions.** State-gated (`409 CONFLICT`, detail `"<action> requires state
+<from-list>; current state is <state>"`), then capability-gated (`501
+HARNESS_CAPABILITY_MISSING`, detail naming the capability), then
+scope-gated (`403 FORBIDDEN`, detail `"requires scope <noun>:<verb>"`).
+
+**Visibility.** An unknown id and an id the principal may not read are both
+`404 NOT_FOUND`. Never `403` for existence.
+
+## §2 The token
+
+ES256 JWT. Header carries `kid`. Claims: `sub`, `org`, `ws`, `hrn`, `scope`
+(array of `"<noun>:<verb>"`), `iat`, `exp`, with `exp - iat <= 300` and 30
+seconds of leeway. Keys come from a JWKS the console serves at
+`<console url>/.well-known/jwks.json`; the box caches it, refreshes at most
+once a minute on an unknown `kid`, and keeps an already-fetched key until
+every token it could have signed has necessarily expired. Every decode pins
+`algorithms=["ES256"]` — no other algorithm is ever accepted.
+
+Refusals: missing or unparseable token → `401`; expired → `401`; `hrn` claim
+≠ this box's own id → `403`; `org` claim ≠ the organisation recorded at
+enrollment (unset, until H30, means "any") → `403`; `X-Sadana-Harness`
+header ≠ the token's `hrn` claim → `403`; a route's required scope absent
+from the token's `scope` array → `403` naming it.
+
+The acting account is `"console:" + sub`. Nothing in a request body ever
+names an account.
+
+## §3 Events
+
+Rendered today by `GET /v1/changes`; H30 additionally pushes them as frames
+over the tether. One shape either way: `{"kind": "changed"|"deleted",
+"harness_id", "noun", "id", "state"?, "updated_at", "version"?,
+"search_doc"?: {"title", "subtitle"?, "body"?, "facets": {…}}}`.
+`tenant_id` is never included — the console's own ingest resolves it from
+the harness that delivered the event.
+
+## §4 Capabilities
+
+The closed list, what each gates, and which console prompt (if any) gates
+on it: see `docs/console/capabilities.md`.
+
+## §5 Frames
+
+Not yet. H30 is the work item that puts a real socket behind this door and
+defines the frame envelope events travel in; until then, §3's shape is
+reachable only by polling `GET /v1/changes`.
+
+## §6 What the console's prompts did not anticipate
+
+Carried here from `docs/reference/console_fit_plan.md` §6 and kept in sync
+with it — if that section changes, this one does too, in the same commit.
+
+**Node kinds are seven, not the smaller set the prompts assume.** They are
+`compute`, `ask`, `route`, `stop`, `call`, `each` and `wait`. Any console
+surface that draws, validates or filters a workflow graph handles all seven,
+and `wait` in particular is not an error state — it is the pause that lets
+anything waiting on a person be addressable rather than a blocking prompt.
+
+**A credential's value never travels with the thing that uses it.** The
+value lives on the box, written through a write-only secrets endpoint.
+Anywhere a plugin, a workflow or a config refers to a credential, it carries
+a `credential_ref` that must name an existing secret; a literal value in
+that position is a validation failure, not a convenience.
+
+**The harness `exit_reason` vocabulary is eight values, and the console's is
+five.** The harness reports `completed`, `budget_exhausted`,
+`wall_clock_exhausted`, `persistence_failed`, `provider_failed`,
+`context_overflow_unhandled`, `interrupted` and `invalid_tool_calls`. The
+mapping onto the console's five is the box's own job, done before it
+answers — the box translates before it answers, so the console never learns
+eight names and the harness never loses the distinction between running out
+of turns and running out of clock.

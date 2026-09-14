@@ -7,7 +7,7 @@ name = "sadana"
 version = "0.0.1"
 description = "sadana-harness"
 requires-python = ">=3.11"
-dependencies = ["jsonschema"]
+dependencies = ["jsonschema", "PyJWT[crypto]>=2.9"]
 
 [project.scripts]
 sadana = "sadana.cli:main"

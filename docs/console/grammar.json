@@ -1,0 +1,122 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://sadana.dev/schemas/console/grammar.json",
+  "$comment": "Written by sadana-harness H19 to the console contract. The console's A04 generates the same shapes; the two files are diffed at A04's acceptance test and the first divergence is a maintain intent in both repositories.",
+  "$defs": {
+    "StandardFields": {
+      "type": "object",
+      "required": ["id", "created_at", "updated_at", "state", "tags", "harness_id", "version"],
+      "properties": {
+        "id": { "type": "string" },
+        "created_at": { "type": "string", "format": "date-time" },
+        "updated_at": { "type": "string", "format": "date-time" },
+        "state": { "type": "string" },
+        "tags": { "type": "object" },
+        "harness_id": { "type": "string" },
+        "version": { "type": "integer" },
+        "name": { "type": "string" }
+      }
+    },
+    "ErrorCode": {
+      "type": "string",
+      "enum": [
+        "UNAUTHENTICATED",
+        "NOT_FOUND",
+        "PAYMENT_REQUIRED",
+        "FORBIDDEN",
+        "VALIDATION",
+        "CONFLICT",
+        "PRECONDITION_FAILED",
+        "RATE_LIMITED",
+        "QUOTA_EXCEEDED",
+        "HARNESS_OFFLINE",
+        "HARNESS_CAPABILITY_MISSING",
+        "IDEMPOTENCY_MISMATCH",
+        "INTERNAL"
+      ]
+    },
+    "FieldError": {
+      "type": "object",
+      "required": ["field", "code"],
+      "properties": {
+        "field": { "type": "string" },
+        "code": { "type": "string" }
+      }
+    },
+    "Problem": {
+      "type": "object",
+      "required": ["type", "title", "status", "code"],
+      "properties": {
+        "type": { "type": "string", "format": "uri" },
+        "title": { "type": "string" },
+        "status": { "type": "integer" },
+        "code": { "$ref": "#/$defs/ErrorCode" },
+        "detail": { "type": "string" },
+        "instance": { "type": "string" },
+        "errors": { "type": "array", "items": { "$ref": "#/$defs/FieldError" } }
+      }
+    },
+    "ListParams": {
+      "type": "object",
+      "properties": {
+        "filter": { "type": "string" },
+        "order_by": { "type": "string" },
+        "page_size": { "type": "integer", "minimum": 1, "maximum": 200 },
+        "page_token": { "type": "string" },
+        "count": { "type": "boolean" }
+      }
+    },
+    "ListResponse": {
+      "type": "object",
+      "required": ["data", "next_page_token"],
+      "properties": {
+        "data": { "type": "array", "items": { "$ref": "#/$defs/StandardFields" } },
+        "next_page_token": { "type": ["string", "null"] },
+        "count": { "type": "integer" }
+      }
+    },
+    "Operation": {
+      "type": "object",
+      "required": ["id", "state", "resource", "error", "created_at", "updated_at"],
+      "properties": {
+        "id": { "type": "string" },
+        "state": { "type": "string", "enum": ["running", "succeeded", "failed"] },
+        "resource": {
+          "type": ["object", "null"],
+          "required": ["noun", "id"],
+          "properties": {
+            "noun": { "type": "string" },
+            "id": { "type": "string" }
+          }
+        },
+        "error": { "anyOf": [{ "$ref": "#/$defs/Problem" }, { "type": "null" }, { "type": "object" }] },
+        "created_at": { "type": "string", "format": "date-time" },
+        "updated_at": { "type": "string", "format": "date-time" }
+      }
+    },
+    "SearchDoc": {
+      "type": "object",
+      "required": ["title", "facets"],
+      "properties": {
+        "title": { "type": "string" },
+        "subtitle": { "type": "string" },
+        "body": { "type": "string" },
+        "facets": { "type": "object" }
+      }
+    },
+    "ResourceChangedEvent": {
+      "type": "object",
+      "required": ["kind", "harness_id", "noun", "id", "updated_at"],
+      "properties": {
+        "kind": { "type": "string", "enum": ["changed", "deleted"] },
+        "harness_id": { "type": "string" },
+        "noun": { "type": "string" },
+        "id": { "type": "string" },
+        "state": { "type": "string" },
+        "updated_at": { "type": "string", "format": "date-time" },
+        "version": { "type": "integer" },
+        "search_doc": { "$ref": "#/$defs/SearchDoc" }
+      }
+    }
+  }
+}

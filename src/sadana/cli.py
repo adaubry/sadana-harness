@@ -16,6 +16,7 @@ import sys
 from sadana import __version__, builtin_seed, config, plugins
 from sadana.subcommands.chat import build_chat_parser
 from sadana.subcommands.conversations import build_conversations_parser
+from sadana.subcommands.door import build_door_parser
 from sadana.subcommands.editor import build_editor_parser
 from sadana.subcommands.gateway import build_gateway_parser
 from sadana.subcommands.marketplace import build_marketplace_parser
@@ -32,6 +33,7 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
     build_conversations_parser(subparsers)
     build_chat_parser(subparsers)
+    build_door_parser(subparsers)
     build_editor_parser(subparsers)
     build_gateway_parser(subparsers)
     build_marketplace_parser(subparsers)

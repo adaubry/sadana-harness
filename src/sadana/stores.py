@@ -37,6 +37,8 @@ from pathlib import Path
 
 from sadana import ledger, marketplace, memory_store, observability, persona_store, plugin_install, plugins
 from sadana.conversation_store import open_store, store_path_from_config
+from sadana.door import idempotency as door_idempotency
+from sadana.door import operations as door_operations
 
 
 def ensure_schemas(conn: sqlite3.Connection) -> None:
@@ -57,6 +59,8 @@ def ensure_schemas(conn: sqlite3.Connection) -> None:
     plugin_install._ensure_schema(conn)
     marketplace._ensure_schema(conn)
     observability.ensure_schema(conn)
+    door_idempotency.ensure_schema(conn)
+    door_operations.ensure_schema(conn)
 
 
 def reconcile_indexes(conn: sqlite3.Connection) -> None:

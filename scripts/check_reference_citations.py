@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Fail a commit if tracked content cites a docs/reference/ path that isn't
-tracked and isn't the one declared generated exception.
+"""Fail a commit if tracked content cites a docs/reference/ or docs/console/
+path that isn't tracked and isn't the one declared generated exception.
 
     scripts/check_reference_citations.py
 
@@ -8,7 +8,11 @@ Run by pre-commit (see .pre-commit-config.yaml), and by `make lint`/`make
 verify` through it. See docs/tasks/A2-reference-tracking-scope/spec.md for
 why: docs/reference/ mixes one regenerated index with hand-authored
 analysis, and a citation into it must resolve for someone who clones this
-repository fresh.
+repository fresh. `docs/console/` (H19) joined the same rule for the same
+reason: it is what the console's own agents are handed, and a citation into
+it that doesn't resolve is exactly as broken as one into docs/reference/ —
+before H19 that root was simply invisible to this regex, neither checked nor
+rejected, rather than deliberately exempt.
 """
 
 from __future__ import annotations
@@ -20,7 +24,7 @@ from collections.abc import Iterable
 from pathlib import Path
 from typing import NamedTuple
 
-CITATION_RE = re.compile(r"docs/reference/[\w.-]+\.(?:md|csv)")
+CITATION_RE = re.compile(r"docs/(?:reference|console)/[\w.-]+\.(?:md|csv|json)")
 ALLOWED_UNTRACKED = {"docs/reference/hermes_core_blocks_kind.csv"}
 
 
