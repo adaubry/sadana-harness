@@ -63,6 +63,7 @@ from sadana.conversation import (
     Message,
     TemplateRecipe,
     TurnKey,
+    TurnObserver,
     append,
     create_conversation,
     iteration_budget_from_config,
@@ -268,6 +269,7 @@ def _create(
     conversation: ConversationKey,
     template_name: str,
     now: float,
+    id: str | None = None,
 ) -> Conversation:
     """Build and insert one new conversation. Lock-free: both callers already
     hold the conversation's own lock, which is non-reentrant.
@@ -285,7 +287,13 @@ def _create(
 
     Raises `conversation_store.ConversationAlreadyExists` if the name is
     taken; callers that mean get-or-create reach here only after a failed
-    load."""
+    load.
+
+    `id` defaults to `None` (a freshly minted one, every existing caller).
+    The door (H20) is the only caller that ever passes one — its own
+    pre-minted `conversation`, so the created row's `id` equals its `key`
+    (spec.md's "Decisions already made": "key == id for console-created
+    conversations")."""
     # Every read here goes through this thread's own read-only connection, not
     # the writer. Sharing the writer for reads was H16's own defect, caught by
     # its deploy review: a SQLite transaction belongs to a *connection*, so a
@@ -324,6 +332,7 @@ def _create(
         now=now,
         account_key=account,
         agent=persona_store.get_selection(reader, account),
+        id=id,
     )
     return convo
 
@@ -334,6 +343,7 @@ def open_conversation(
     account: memory.AccountKey,
     conversation: ConversationKey,
     template_name: str | None,
+    id: str | None = None,
 ) -> None:
     """Open one conversation before anybody has said anything, and settle
     whether it is allowed to exist yet.
@@ -359,6 +369,9 @@ def open_conversation(
     first cut of this work item left it in `subcommands/chat.py`, which
     probed the store directly — a client reaching around the door, outside
     any lock, for the next client to copy.
+
+    `id`, like `_create`'s own, defaults to `None` and is passed straight
+    through — see `_create`'s docstring.
     """
     with stores.conversation_lock(conversation):
         if template_name is None:
@@ -371,6 +384,7 @@ def open_conversation(
             conversation=conversation,
             template_name=template_name,
             now=time.monotonic(),
+            id=id,
         )
 
 
@@ -382,6 +396,7 @@ async def take_turn(
     text: str,
     create_as: str | None,
     approve: plugins.ApproveFn | None = None,
+    observer: TurnObserver | None = None,
 ) -> TurnOutcome:
     """Run one turn for one person in one conversation, and say what happened.
 
@@ -423,6 +438,19 @@ async def take_turn(
     is already present on `runtime.conn`; `open_runtime()` ensures it once,
     and a caller that hand-builds a `Runtime` (this module's own tests) owns
     that setup itself.
+
+    `observer` (H21, default `None`): a one-line passthrough to
+    `plugin_dispatch.take_turn_and_reconcile`/`conversation.run_turn` — no
+    logic of its own here. Every existing caller (`subcommands/chat.py`,
+    `gateway_dispatch.handle_inbound`, `eval_harness.py`'s indirect path)
+    keeps compiling and passing with no change, since it is a new,
+    defaulted, trailing parameter. `runtime.recorder`'s three H21 fields
+    (`record_turn_started`, `record_plugin_run_started`, `record_node`) are
+    threaded into `build_dispatch` unconditionally, alongside the two
+    OBSERVABILITY-01 already passed — a caller that built its own
+    `Runtime` with `observability.make_recorder`'s real recorder gets live
+    records with no opt-in of its own, the same way it already gets
+    `record_turn`/`record_plugin_run`.
     """
     with stores.conversation_lock(conversation):
         conn = runtime.conn
@@ -490,6 +518,10 @@ async def take_turn(
             record_turn=runtime.recorder.record_turn,
             record_plugin_run=runtime.recorder.record_plugin_run,
             memory_context=memory_store.DispatchContext(account_key=account, conn=conn, conversation_key=conversation),
+            record_turn_started=runtime.recorder.record_turn_started,
+            record_plugin_run_started=runtime.recorder.record_plugin_run_started,
+            record_node=runtime.recorder.record_node,
+            memory_context=memory_store.DispatchContext(account_key=account, conn=conn),
             persist_pause=persist_pause,
             approve=resolved_approve,
         )
@@ -503,6 +535,7 @@ async def take_turn(
             now=now,
             persist=conversation_store.bind_persist(conn, convo, now=now),
             record_turn=runtime.recorder.record_turn,
+            observer=observer,
         )
         await asyncio.to_thread(conversation_store.save, conn, convo, now=now)
         return TurnOutcome(

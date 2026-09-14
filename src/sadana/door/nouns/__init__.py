@@ -98,3 +98,18 @@ def unavailable(plural: str, verb: str) -> problems.Problem:
     this, and any later fixed-path-only noun gets the same fallback instead
     of re-typing the string template."""
     return problems.make("HARNESS_CAPABILITY_MISSING", f"{plural}.{verb} is not available on this harness")
+
+
+def check_if_match(row: Mapping[str, object], if_match: str | None) -> problems.Problem | None:
+    """The shared `If-Match`/`version` precondition check (wire.md §1: an
+    existing resource's `update`/`remove`/action with no `If-Match` at all is
+    `412`, same as a stale one). H20 (`docs/tasks/H20-door-nouns-turn-side/
+    spec.md`) found this byte-identical across `conversations.py` and
+    `tests/contract/fixture_noun.py:WidgetsNoun._check_if_match` — moved
+    here, the one module every noun may depend on, rather than re-typed a
+    third time by the next noun that needs it."""
+    if if_match is None:
+        return problems.make("PRECONDITION_FAILED", "If-Match is required for this request")
+    if if_match != str(row["version"]):
+        return problems.make("PRECONDITION_FAILED", f"version is {row['version']}, If-Match named {if_match}")
+    return None

@@ -122,9 +122,16 @@ on it: see `docs/console/capabilities.md`.
 
 ## §5 Frames
 
-Not yet. H30 is the work item that puts a real socket behind this door and
-defines the frame envelope events travel in; until then, §3's shape is
-reachable only by polling `GET /v1/changes`.
+Not yet delivered anywhere outside this process. H21 gives an ephemeral
+frame (`{"type": "ephemeral", "name": "message.delta", "harness_id",
+"data": {"conversation_id", "message_id", "delta", "seq"}}`) a real,
+bounded queue to land in (`door/events.py`'s `ephemeral_queue`), written to
+by a turn's own observer as it streams — but nothing drains that queue onto
+a socket yet. H30 is still the work item that puts a real socket behind
+this door and defines the frame envelope events travel in; until then, an
+ephemeral frame is visible only to something running inside this same
+process, and §3's own durable shape is reachable only by polling
+`GET /v1/changes`.
 
 ## §6 What the console's prompts did not anticipate
 
@@ -151,3 +158,12 @@ mapping onto the console's five is the box's own job, done before it
 answers — the box translates before it answers, so the console never learns
 eight names and the harness never loses the distinction between running out
 of turns and running out of clock.
+
+**A promoted `messages.create` operation carries `resource: null`.** Found
+during H20, not anticipated by any prompt: the door's own `run_bounded`
+computes a create's `resource` once, from the URL's own id segment, before
+the slow call ever runs — and a create path carries no id segment to compute
+one from. Read the assistant's reply from the conversation's own messages
+once the operation settles (`succeeded` or `failed`), the same call the
+message list already serves. H30, which reopens the door's framework, is
+where a create-time resource hint gets added and this note retires.

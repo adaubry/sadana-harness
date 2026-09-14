@@ -284,7 +284,7 @@ def test_send_returns_needs_credential_when_env_var_missing_and_never_calls_requ
         ProviderManifest(
             name="test-fake-provider-missing-cred",
             env_vars=("SADANA_TEST_FAKE_KEY",),
-            request_fn=lambda req: (calls.append(req) or (200, {})),
+            request_fn=lambda req: calls.append(req) or (200, {}),
         )
     )
     monkeypatch.delenv("SADANA_TEST_FAKE_KEY", raising=False)
@@ -312,6 +312,74 @@ def test_send_calls_request_fn_and_classifies_its_result(monkeypatch: pytest.Mon
     outcome = send(request)
     assert isinstance(outcome, Response)
     assert outcome.content == "ok"
+
+
+# ── H21: streaming ────────────────────────────────────────────────────────
+
+
+@pytest.mark.unit
+def test_send_uses_stream_fn_and_forwards_deltas_when_request_asks_to_stream() -> None:
+    body = {
+        "choices": [{"message": {"content": "hi there"}, "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": 1, "completion_tokens": 2},
+    }
+
+    def stream_fn(req: Request, on_delta: model_access.OnDelta) -> tuple[int, dict]:
+        for fragment in ("hi", " there"):
+            on_delta(fragment)
+        return 200, body
+
+    register_provider(
+        ProviderManifest(name="test-fake-provider-stream", request_fn=lambda req: (200, body), stream_fn=stream_fn)
+    )
+    deltas: list[str] = []
+    request = Request(messages=(), provider="test-fake-provider-stream", model="x", stream=True)
+
+    outcome = send(request, on_delta=deltas.append)
+
+    assert deltas == ["hi", " there"]
+    assert isinstance(outcome, Response)
+    assert outcome.content == "hi there"
+
+
+@pytest.mark.unit
+def test_send_falls_back_to_request_fn_when_stream_requested_but_none_declared() -> None:
+    calls = []
+    register_provider(
+        ProviderManifest(name="test-fake-provider-no-stream", request_fn=lambda req: calls.append(req) or (200, {}))
+    )
+    request = Request(messages=(), provider="test-fake-provider-no-stream", model="x", stream=True)
+
+    send(request)
+
+    assert len(calls) == 1
+
+
+@pytest.mark.unit
+def test_resolve_threads_on_delta_through_a_streaming_retry() -> None:
+    attempts: list[int] = []
+
+    def stream_fn(req: Request, on_delta: model_access.OnDelta) -> tuple[int | None, dict]:
+        attempts.append(req.attempt)
+        if req.attempt == 0:
+            return None, {}  # transient — resolve() retries
+        on_delta("final")
+        return 200, {
+            "choices": [{"message": {"content": "final"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 0, "completion_tokens": 1},
+        }
+
+    register_provider(
+        ProviderManifest(name="test-fake-provider-stream-retry", request_fn=lambda req: (None, {}), stream_fn=stream_fn)
+    )
+    deltas: list[str] = []
+    request = Request(messages=(), provider="test-fake-provider-stream-retry", model="x", stream=True)
+
+    outcome = asyncio.run(resolve(request, on_delta=deltas.append))
+
+    assert attempts == [0, 1]
+    assert deltas == ["final"]
+    assert isinstance(outcome, Response)
 
 
 # ── mark_cache_boundary ───────────────────────────────────────────────────
@@ -443,7 +511,7 @@ def test_mark_cache_boundary_with_no_system_message_marks_only_trailing() -> Non
 def test_resolve_retries_transparently_and_returns_final_response(monkeypatch: pytest.MonkeyPatch) -> None:
     calls: list[int] = []
 
-    def fake_send(request: Request) -> model_access.Outcome:
+    def fake_send(request: Request, on_delta: model_access.OnDelta | None = None) -> model_access.Outcome:
         calls.append(request.attempt)
         if len(calls) < 3:
             return Retry(next_attempt=len(calls))
@@ -472,7 +540,7 @@ def test_resolve_retries_transparently_and_returns_final_response(monkeypatch: p
 def test_resolve_returns_each_non_retry_outcome_unchanged(
     monkeypatch: pytest.MonkeyPatch, final_outcome: model_access.Outcome
 ) -> None:
-    monkeypatch.setattr(model_access, "send", lambda request: final_outcome)
+    monkeypatch.setattr(model_access, "send", lambda request, on_delta=None: final_outcome)
     outcome = asyncio.run(resolve(Request(messages=(), provider="p", model="m")))
     assert outcome is final_outcome
 
@@ -505,7 +573,7 @@ def test_resolve_is_cancellable_between_attempts(monkeypatch: pytest.MonkeyPatch
 
     attempts_started: list[int] = []
 
-    def fake_send(request: Request) -> model_access.Outcome:
+    def fake_send(request: Request, on_delta: model_access.OnDelta | None = None) -> model_access.Outcome:
         attempts_started.append(request.attempt)
         time.sleep(0.02)  # real, measurable per-attempt cost
         return Retry(next_attempt=request.attempt + 1)  # retries forever unless cancelled

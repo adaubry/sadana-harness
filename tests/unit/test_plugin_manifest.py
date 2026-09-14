@@ -26,6 +26,7 @@ from sadana.plugins import (
     Manifest,
     ManifestParseError,
     Node,
+    NodeKind,
     NodeTrace,
     ResumeState,
     Setting,
@@ -1375,3 +1376,81 @@ def test_output_dir_raises_into_the_node_when_the_run_was_given_none(tmp_path: P
 
     assert result.failed_node == "write"
     assert "NoOutputDirectory" in (result.trace[0].detail or "")
+
+
+# ── H21: NodeSink ────────────────────────────────────────────────────────
+
+
+class _RecordingSink:
+    """A hand-built `NodeSink` test double — no dependency on step 6's
+    `TurnObserver` or on `plugin_dispatch.py`'s own clock-reading
+    implementation, which this item's own `plan.md` (step 7) calls out as
+    untested here on purpose."""
+
+    def __init__(self) -> None:
+        self.started: list[str] = []
+        self.finished: list[NodeTrace] = []
+
+    def node_started(self, node: str, kind: NodeKind, input_preview: str) -> None:
+        self.started.append(node)
+
+    def node_finished(self, trace: NodeTrace, output_preview: str) -> None:
+        self.finished.append(trace)
+
+
+@pytest.mark.unit
+def test_run_graph_node_sink_sees_every_node_once_in_order_with_the_raising_nodes_own_message(
+    tmp_path: Path,
+) -> None:
+    plugin_dir = _write_init_py(
+        tmp_path,
+        "def step_one(value):\n    return {'n': 1}\n\n"
+        "def step_two(value):\n    return {'n': 2}\n\n"
+        "def boom(value):\n    raise ValueError('nope')\n",
+    )
+    nodes = (
+        Node(name="a", kind="compute", body="init:step_one", next="b"),
+        Node(name="b", kind="compute", body="init:step_two", next="c"),
+        Node(name="c", kind="compute", body="init:boom"),
+    )
+    manifest = _manifest(*nodes)
+    sink = _RecordingSink()
+
+    result = asyncio.run(run_graph(plugin_dir, manifest, _entry("a"), {"raw": True}, ask=_stub_ask_ok, node_sink=sink))
+
+    assert result.failed_node == "c"
+    assert sink.started == ["a", "b", "c"]
+    assert [t.node for t in sink.finished] == ["a", "b", "c"]
+    assert [t.ok for t in sink.finished] == [True, True, False]
+
+    # The raising node's own message reaches the sink...
+    c_trace = sink.finished[-1]
+    assert c_trace.detail is not None
+    assert "ValueError" in c_trace.detail
+    assert "nope" in c_trace.detail
+    # ...distinct from the DagResult-level trace's generic sentence.
+    assert result.trace[-1].detail == "node raised ValueError"
+
+
+@pytest.mark.unit
+def test_run_graph_node_sink_gets_no_node_finished_for_a_wait_pause(tmp_path: Path) -> None:
+    plugin_dir = _write_init_py(tmp_path, "")
+    manifest = _manifest(Node(name="w", kind="wait"))
+    sink = _RecordingSink()
+
+    result = asyncio.run(run_graph(plugin_dir, manifest, _entry("w"), {}, ask=_stub_ask_ok, node_sink=sink))
+
+    assert result.paused_node == "w"
+    assert sink.started == ["w"]
+    assert sink.finished == []
+
+
+@pytest.mark.unit
+def test_run_graph_with_no_node_sink_behaves_exactly_as_before(tmp_path: Path) -> None:
+    plugin_dir = _write_init_py(tmp_path, "def step_one(value):\n    return 'one'\n")
+    manifest = _manifest(Node(name="a", kind="compute", body="init:step_one"))
+
+    result = asyncio.run(run_graph(plugin_dir, manifest, _entry("a"), {}, ask=_stub_ask_ok))
+
+    assert result.failed_node is None
+    assert result.text == "one"

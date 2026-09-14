@@ -1717,3 +1717,107 @@ def test_run_child_system_prompt_is_byte_identical_regardless_of_input(
 
     assert child_a.system_prompt == child_b.system_prompt
     assert child_a.prompt_sha256 == child_b.prompt_sha256
+
+
+# ── H21: TurnObserver — streaming and cooperative stop ──────────────────
+
+
+class _RecordingObserver:
+    def __init__(self, *, stop_after_calls: int | None = None) -> None:
+        self.started: list[tuple[TurnKey, int]] = []
+        self.deltas: list[tuple[int, str]] = []
+        self.finished: list[object] = []
+        self._should_stop_calls = 0
+        self._stop_after_calls = stop_after_calls
+
+    def turn_started(self, turn_key: TurnKey, user_message_seq: int) -> None:
+        self.started.append((turn_key, user_message_seq))
+
+    def text_delta(self, seq: int, text: str) -> None:
+        self.deltas.append((seq, text))
+
+    def turn_finished(self, result: object) -> None:
+        self.finished.append(result)
+
+    def should_stop(self) -> bool:
+        self._should_stop_calls += 1
+        if self._stop_after_calls is None:
+            return False
+        return self._should_stop_calls >= self._stop_after_calls
+
+
+@pytest.mark.unit
+def test_run_turn_calls_turn_started_exactly_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    surface = build_surface([_spec("noop", "noop")])
+    monkeypatch.setattr(model_access, "send", lambda request, on_delta=None: _text_response("hi there"))
+    observer = _RecordingObserver()
+
+    result, _messages, _budget, _prompt = _run(surface, observer=observer)
+
+    assert observer.started == [(result.turn_key, 0)]
+
+
+@pytest.mark.unit
+def test_run_turn_forwards_deltas_with_increasing_seq_across_model_calls(monkeypatch: pytest.MonkeyPatch) -> None:
+    surface = build_surface([_spec("noop", "noop")])
+    calls = 0
+
+    def fake_send(request: model_access.Request, on_delta: model_access.OnDelta | None = None) -> model_access.Outcome:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            assert on_delta is not None
+            on_delta("call")
+            on_delta("-one")
+            return _tool_call_response("noop")
+        assert on_delta is not None
+        on_delta("call-two")
+        return _text_response("done")
+
+    monkeypatch.setattr(model_access, "send", fake_send)
+    observer = _RecordingObserver()
+
+    _run(surface, observer=observer)
+
+    assert observer.deltas == [(1, "call"), (2, "-one"), (3, "call-two")]
+
+
+@pytest.mark.unit
+def test_run_turn_should_stop_before_first_model_call_makes_no_model_call(monkeypatch: pytest.MonkeyPatch) -> None:
+    surface = build_surface([_spec("noop", "noop")])
+    calls: list[model_access.Request] = []
+    monkeypatch.setattr(
+        model_access, "send", lambda request, on_delta=None: (calls.append(request) or _text_response("hi"))
+    )
+    observer = _RecordingObserver(stop_after_calls=1)
+
+    result, _messages, _budget, _prompt = _run(surface, observer=observer)
+
+    assert calls == []
+    assert result.exit_reason == ExitReason.INTERRUPTED
+    assert result.detail == "stopped"
+    assert observer.finished == [result]
+
+
+@pytest.mark.unit
+def test_run_turn_should_stop_after_tool_round_ends_before_a_second_model_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    surface = build_surface([_spec("noop", "noop")])
+    calls = 0
+
+    def fake_send(request: model_access.Request, on_delta: model_access.OnDelta | None = None) -> model_access.Outcome:
+        nonlocal calls
+        calls += 1
+        return _tool_call_response("noop")
+
+    monkeypatch.setattr(model_access, "send", fake_send)
+    # False on the first check (before the first model call), True on the
+    # second (after the tool round that first call's dispatch produces).
+    observer = _RecordingObserver(stop_after_calls=2)
+
+    result, _messages, _budget, _prompt = _run(surface, observer=observer)
+
+    assert calls == 1  # never reached a second model call
+    assert result.exit_reason == ExitReason.INTERRUPTED
+    assert result.detail == "stopped"
