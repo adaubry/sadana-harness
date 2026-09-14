@@ -20,21 +20,24 @@ if [ -n "$path" ]; then
 fi
 
 if [ -n "$cmd" ]; then
-  # Heredoc/redirect into an artifact path is a write wearing a Bash coat —
-  # but the path must be the actual destination of the redirect/tee/sed -i,
-  # not just present anywhere else in the command. Without this, a read-only
-  # `grep foo src/x.py > /tmp/out` gets gated as a write to src/x.py because
-  # the command merely contains a `>` somewhere.
-  pathre='(docs/tasks/[^[:space:]"'"'"']+|src/[^[:space:]"'"'"']+)'
-  tgt=$(printf '%s' "$cmd" \
-    | grep -oE ">>?[[:space:]]*$pathre|tee[[:space:]]+(-a[[:space:]]+)?$pathre|sed[[:space:]]+-i[^[:space:]]*[[:space:]].*$pathre" \
-    | grep -oE "$pathre" | tail -1 || true)
-  if [ -z "$tgt" ] && printf '%s' "$cmd" | grep -Eq 'python' && printf '%s' "$cmd" | grep -Eq '\.write\('; then
-    tgt=$(printf '%s' "$cmd" | grep -oE "$pathre" | head -1 || true)
-  fi
-  if [ -n "$tgt" ]; then
+  # A heredoc, redirect, tee, sed -i or python open(...,'w') aimed at a gated
+  # path is a write wearing a Bash coat. The path has to be the actual
+  # DESTINATION, not merely present in the command, or a read-only
+  # `grep foo src/x.py > /tmp/out` gets gated as a write to src/x.py.
+  pathre='(docs/tasks/[^[:space:]"'"'"']+|src/[^[:space:]"'"'"']+|tests/[^[:space:]"'"'"']+)'
+  openre="open\\((\"|')$pathre(\"|')[[:space:]]*,[[:space:]]*(\"|')[aw]"
+  # EVERY destination, not just the last one. `tail -1` here used to mean two
+  # heredocs in one command were gated by whichever came second, so putting a
+  # plan-listed path last waved every unlisted file before it straight through.
+  targets=$(printf '%s' "$cmd" \
+    | grep -oE ">>?[[:space:]]*$pathre|tee[[:space:]]+(-a[[:space:]]+)?$pathre|sed[[:space:]]+-i[^[:space:]]*[[:space:]].*$pathre|$openre" \
+    | grep -oE "$pathre" | sort -u || true)
+  # A here-string keeps the loop in this shell, so `exit` below really exits.
+  while IFS= read -r tgt; do
+    [ -n "$tgt" ] || continue
     python3 scripts/artifact.py gate write "$tgt" || exit $?
-  fi
+  done <<<"$targets"
+
   if printf '%s' "$cmd" | grep -Eq '(^|[;&|[:space:]])git[[:space:]]+commit'; then
     python3 scripts/artifact.py gate commit - || exit $?
   fi

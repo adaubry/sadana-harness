@@ -133,6 +133,8 @@ so make the inventory explicit rather than implicit.
 
 Intent: docs/tasks/<ID>-<slug>/intent.md
 
+Author: <name> (<role>). Status: draft.
+
 ## Requirements (numbered, each traceable to the intent)
 
 ## Design (how it integrates here — names files, modules, patterns)

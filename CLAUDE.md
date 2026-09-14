@@ -19,6 +19,9 @@ WSL only. Python lives in `.venv`; `make` puts it on PATH for you, so there is n
 - Paginate tools that load content the agent must read fully: Models will read page 1 and skip the rest.” Pagination on an instruction is an invitation to ignore it.
 - Infer process identity from argv substrings
 - Read source code in a test
+- Write `Status: approved` in any artifact, or add a path to `## Files that
+  change` after approval without saying so in your next message. That word is
+  the user's, and it is the approval.
 
 ## Please do
 

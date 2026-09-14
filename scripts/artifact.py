@@ -17,19 +17,44 @@ The design decision worth understanding:
     ignored; a "Challenged and changed" section cannot be filled in by a
     session that never ran the interview.
 
+Approval is the second thing it checks, and it is not the same thing. A
+valid artifact is one the methodology produced; an approved artifact is one a
+person read and agreed to. That word lives on the `Author: ... Status: ...`
+line, a person writes it, and no agent ever does. A plan's `## Files that
+change` is the other half: it is not documentation, it is the list of files
+the approval covers, and a write outside it is refused.
+
 Stage definitions live in STAGES below. Edit them; that is the tuning surface.
 """
 
 from __future__ import annotations
 
+import fnmatch
 import re
 import sys
+from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
 
 TASKS = Path("docs/tasks")
 ACTIVE = Path(".claude/active-task")
 PLACEHOLDER = re.compile(r"\b(TODO|TBD|FIXME|XXX)\b")
+# The approval word, and every path-shaped token a plan can claim.
+STATUS_RE = re.compile(r"^Author:.*?Status:\s*([^\s.,;]+)", re.M)
+# Two segments minimum, deliberately. A one-segment form (`src/`, `tests/`)
+# is indistinguishable from the prose every plan writes about those
+# directories, and accepting it hands a plan the whole tree because it
+# mentioned it. A lane that wants a directory writes the glob: `src/*`.
+PATH_TOKEN = re.compile(r"[\w.*?\[\]-]+(?:/[\w.*?\[\]-]+)+/?")
+# One grammar, deliberately: the rule that admits the header line is the same
+# expression status_of() parses it with, so "valid" cannot mean "unreadable".
+AUTHOR_RULE = (
+    STATUS_RE.pattern,
+    "needs an `Author: ... Status: ...` line — the status word is where approval is recorded",
+)
+# The build stage's ownership section, named once: planned_paths() and the
+# stage table below must agree or every source write is refused.
+OWNERSHIP_SECTION = "Files that change"
 
 
 @dataclass
@@ -47,6 +72,7 @@ class Stage:
     warn_rules: list[tuple[str, str]] = field(default_factory=list)  # advisory if present
     warn_absent_rules: list[tuple[str, str]] = field(default_factory=list)  # advisory if missing
     produces_code: bool = False
+    needs_approval: bool = True
 
 
 STAGES = [
@@ -63,7 +89,7 @@ STAGES = [
         trace="Changed during planning",
         header_rules=[
             (r"^#\s*Intent:\s*\S", "first line must be `# Intent: <short name>`"),
-            (r"^Author:\s*\S.*Status:\s*\S", "needs an `Author: ... Status: ...` line — an intent has an owner"),
+            AUTHOR_RULE,
         ],
         warn_rules=[
             (
@@ -90,6 +116,7 @@ STAGES = [
                 r"^Intent:\s*\S",
                 "needs an `Intent: <path>` line — a spec that cannot name its intent " "is not traceable",
             ),
+            AUTHOR_RULE,
         ],
         warn_absent_rules=[
             (
@@ -109,7 +136,7 @@ STAGES = [
         "build",
         "plan.md",
         "build-skill",
-        sections=["Files that change", "Order of work", "Proof"],
+        sections=[OWNERSHIP_SECTION, "Order of work", "Proof"],
         optional_sections=["Open questions"],
         trace="Risks",
         trace_min_words=15,
@@ -117,6 +144,7 @@ STAGES = [
         header_rules=[
             (r"^#\s*Plan:\s*\S", "first line must be `# Plan: <short name> (from intent.md <date>)`"),
             (r"from\s+intent\.md", "the header must cite the intent this plan descends from"),
+            AUTHOR_RULE,
         ],
         warn_absent_rules=[
             (r"^\s*\d+\.\s+\S", "Order of work reads better as a numbered sequence"),
@@ -134,6 +162,9 @@ STAGES = [
         sections=["Evidence", "Findings", "Decision"],
         trace="Findings",
         trace_min_words=6,
+        # Nothing reads review.md's status: it is the last artifact, and the
+        # decision it carries is the approval, not a word on its header line.
+        needs_approval=False,
         header_rules=[
             (r"```", "## Evidence must carry pasted `make verify` output, not a claim"),
         ],
@@ -160,6 +191,39 @@ def sections_of(text: str) -> dict[str, str]:
 
 def norm(s: str) -> str:
     return re.sub(r"[^a-z0-9]+", " ", s.lower()).strip()
+
+
+def status_of(path: Path) -> str:
+    """The approval word on an artifact's `Author: ... Status: ...` line.
+
+    Lowercased, trailing punctuation dropped. "" when the file or the line is
+    missing, which reads as "not approved" everywhere this is used.
+    """
+    if not path.exists():
+        return ""
+    m = STATUS_RE.search(path.read_text(encoding="utf-8"))
+    return m.group(1).lower() if m else ""
+
+
+def planned_paths(text: str) -> set[str]:
+    """Every path a plan.md's `## Files that change` section claims.
+
+    A token scan, not a layout parser. The plans already in this tree use four
+    incompatible formats — a comma-separated line, `-` bullets whose prose
+    wraps onto continuation lines carrying further paths, and two aligned-
+    column styles — and a parser that understands three of them refuses the
+    fourth. A wrong refusal teaches people to route around the gate, which is
+    worse than a claim that is too generous; the section always was a list of
+    claims, and this reads it as one.
+
+    Anything containing a `/` is a claim. `(new)`/`(edit)`/`(delete)`
+    annotations carry none and fall out by construction. A trailing `/` means
+    a directory, so it becomes a glob over what is inside it.
+    """
+    secs = {norm(k): v for k, v in sections_of(text).items()}
+    body = secs.get(norm(OWNERSHIP_SECTION), "").replace("`", " ")
+    found = {m.group(0).removeprefix("./") for m in PATH_TOKEN.finditer(body)}
+    return {p + "*" if p.endswith("/") else p for p in found}
 
 
 def validate(path: Path, stage: Stage) -> list[str]:
@@ -252,7 +316,7 @@ def cmd_status(tid: str | None) -> int:
         print("no active task. `artifact.py new <ID> <slug>` to start one.")
         return 0
     print(f"task: {d}")
-    nxt = None
+    nxt, waiting = None, []
     for s, probs in stage_state(d):
         if not (d / s.artifact).exists():
             mark, detail = "·", "not started"
@@ -260,16 +324,22 @@ def cmd_status(tid: str | None) -> int:
         elif probs:
             mark, detail = "✗", f"{len(probs)} problem(s)"
             nxt = nxt or s
+        elif s.needs_approval and status_of(d / s.artifact) != "approved":
+            mark, detail = "◦", "valid, awaiting approval"
+            waiting.append(s.artifact)
         else:
             mark, detail = "✓", "done"
         print(f"  {mark} {s.key:9s} {s.artifact:18s} {detail}")
         if probs and (d / s.artifact).exists():
             for p in probs:
                 print(f"      - {p}")
+    print()
+    if waiting:
+        print(f"waiting on the user: {', '.join(waiting)} — nobody else writes 'approved'.")
     if nxt:
-        print(f"\nnext: {nxt.key} — methodology: {nxt.skill} — produce {nxt.artifact}")
-    else:
-        print("\nall stages complete. Ready to commit.")
+        print(f"next: {nxt.key} — methodology: {nxt.skill} — produce {nxt.artifact}")
+    elif not waiting:
+        print("all stages complete. Ready to commit.")
     return 0
 
 
@@ -301,15 +371,28 @@ def cmd_check(tid: str | None) -> int:
     return 0
 
 
+def _refuse_unapproved(path: Path, prefix: str = "") -> int:
+    """Said identically by all three branches, because it is one rule."""
+    st = status_of(path) or "missing"
+    print(f"Blocked: {prefix}{path} is not approved.", file=sys.stderr)
+    print(f"  Status is '{st}'; the user writes 'approved' after reading it.", file=sys.stderr)
+    print("  Do not write that word yourself.", file=sys.stderr)
+    return 2
+
+
 def cmd_gate(action: str, target: str) -> int:
     """Answer for the hook. 0 = allow, 2 = block with reason on stderr."""
     d = task_dir(None)
+    rel = target.replace("\\", "/").removeprefix("./")
+    if rel.startswith("/"):
+        with suppress(ValueError):
+            rel = Path(rel).resolve().relative_to(Path.cwd().resolve()).as_posix()
 
     # Writing an artifact: every EARLIER stage must be complete.
-    name = Path(target).name
-    if name in BY_ARTIFACT and "docs/tasks/" in target.replace("\\", "/"):
+    name = Path(rel).name
+    if name in BY_ARTIFACT and "docs/tasks/" in rel:
         stage = BY_ARTIFACT[name]
-        owner = Path(target).parent
+        owner = Path(rel).parent
         idx = STAGES.index(stage)
         for prev in STAGES[:idx]:
             probs = validate(owner / prev.artifact, prev)
@@ -322,10 +405,12 @@ def cmd_gate(action: str, target: str) -> int:
                     print(f"  - {p}", file=sys.stderr)
                 print(f"Finish {prev.artifact} first (methodology: {prev.skill}).", file=sys.stderr)
                 return 2
+            if status_of(owner / prev.artifact) != "approved":
+                return _refuse_unapproved(owner / prev.artifact)
         return 0
 
     # Touching source: the build stage's plan must exist and be valid.
-    if action in ("write", "edit") and re.match(r"^(src|tests)/", target.replace("\\", "/")):
+    if action in ("write", "edit") and re.match(r"^(src|tests)/", rel):
         if not d:
             print(
                 "Blocked: no active task. Source changes belong to a work item.\n"
@@ -344,6 +429,16 @@ def cmd_gate(action: str, target: str) -> int:
                 print(f"  - {p}", file=sys.stderr)
             print(f"Produce it with /{build.skill} (plan mode), then retry.", file=sys.stderr)
             return 2
+        plan_path = d / build.artifact
+        if status_of(plan_path) != "approved":
+            return _refuse_unapproved(plan_path)
+        if not any(fnmatch.fnmatch(rel, e) for e in planned_paths(plan_path.read_text(encoding="utf-8"))):
+            print(f"Blocked: {plan_path} does not name {rel} under '## {OWNERSHIP_SECTION}'.", file=sys.stderr)
+            print(
+                "Add it there and tell the user you did — the approval was for the old list. Or stop.",
+                file=sys.stderr,
+            )
+            return 2
         return 0
 
     # Committing: everything up to and including test must be valid.
@@ -360,6 +455,8 @@ def cmd_gate(action: str, target: str) -> int:
                     print(f"  - {p}", file=sys.stderr)
                 print("One artifact, one commit. The chain has to be whole.", file=sys.stderr)
                 return 2
+            if s.needs_approval and status_of(d / s.artifact) != "approved":
+                return _refuse_unapproved(d / s.artifact, "cannot commit — ")
         return 0
     return 0
 

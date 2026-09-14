@@ -310,8 +310,10 @@ isolated guess at CLI-SHELL's scope.
    (Telegram, Slack, email, SMS, Discord, ~20 more) is still separate,
    unscheduled future work, one item each — only the *bridge itself*, and
    *who builds it*, were what this question actually asked.
-6. **Is VNC assumed sufficient for ops/troubleshooting access
+6. **Resolved.** Is VNC assumed sufficient for ops/troubleshooting access
    indefinitely, or does a browser dashboard eventually get built
-   alongside it** (§4.2's pty-bridge/web-dashboard row)? Not named as
-   needed today; worth deciding deliberately once it comes up rather than
-   building it speculatively now.
+   alongside it (§4.2's pty-bridge/web-dashboard row)? A browser interface
+   is being built — a hosted console above this harness — and it reaches a
+   box through a typed door rather than a pty bridge, which is what
+   `console_fit_plan.md` §2 records, along with the two §4.2 rows and the
+   §1.1 bullet it reverses to get there.

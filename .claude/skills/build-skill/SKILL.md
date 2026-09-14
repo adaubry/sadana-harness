@@ -61,6 +61,8 @@ that CSV.
 ```markdown
 # Plan: <short name> (from intent.md <YYYY-MM-DD>)
 
+Author: <name> (<role>). Status: draft.
+
 ## Files that change
 
 path/one.py (new), path/two.py, tests/test_two.py
