@@ -136,6 +136,7 @@ _NOUNS: dict[str, _Noun] = {
     "approvals": _Noun("appr", ()),
     "operations": _Noun("op", ()),
     "harness": _Noun("hrn", ()),
+    "inspections": _Noun("insp", ("SELECT id, updated_at, version FROM inspections WHERE id IS NOT NULL",)),
 }
 
 #: The closed list, in the order the console's own plan names them.

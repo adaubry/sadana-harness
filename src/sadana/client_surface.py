@@ -163,30 +163,43 @@ def open_runtime(*, provider: str | None = None, model: str | None = None) -> Ru
     builtin_seed.seed_all(plugins._plugins_root())
     # Connections first: its constructor ensures every schema and reconciles
     # `plugin_state` against the directory that was just seeded, and
-    # `_enabled_plugin_set` reads that table to know what is switched off.
+    # `enabled_plugin_set` reads that table to know what is switched off.
     connections = stores.Connections(conversation_store.store_path_from_config())
     _adopt_scheduled_memories(connections.writer)
     _adopt_scheduled_triggers(connections.writer)
     return Runtime(
         connections=connections,
-        plugin_set=_enabled_plugin_set(connections.writer),
+        plugin_set=enabled_plugin_set(connections.writer),
         provider=provider or config.env("SADANA_MODEL_ACCESS_PROVIDER", model_access.DEFAULT_PROVIDER),
         model=model or config.env("SADANA_MODEL_ACCESS_MODEL", model_access.DEFAULT_MODEL),
         recorder=observability.make_recorder(connections.writer),
     )
 
 
-def _enabled_plugin_set(conn: sqlite3.Connection) -> plugin_dispatch.PluginSet:
+def enabled_plugin_set(conn: sqlite3.Connection) -> plugin_dispatch.PluginSet:
     """Every installed plugin except the ones somebody switched off.
 
     The filter is here, at the one caller that has a store, rather than inside
     `build_plugin_set` — which stays a function of its arguments and needs no
     database. `plugin_install` owns `plugin_state` and answers which names are
     disabled; this is the only place the two meet.
-    """
+
+    Public (H24: `docs/tasks/H24-door-nouns-plugins-layout-install-inspect/
+    spec.md`) so `door/nouns/tools.py` can derive the same enabled tool
+    surface the real turn path uses, rather than a second copy of this
+    filter.
+
+    Filters on `p.directory.name`, not `p.manifest.name` — `plugin_state` (and
+    `disabled_names()`, which reads it) is keyed by the plugin's *directory*
+    name, the same key `plugin_install.reconcile_plugin_state` writes. A
+    plugin's declared name and its directory name are forced equal at
+    `install()` time, but not by `reconcile_plugin_state` for anything already
+    on disk — so filtering on the declared name could silently fail to
+    exclude a plugin somebody disabled, the exact gap H24's own disable verb
+    would otherwise ship as a silent no-op."""
     disabled = plugin_install.disabled_names(conn)
     return plugin_dispatch.build_plugin_set(
-        p for p in plugin_manifest.discover_plugins() if p.manifest.name not in disabled
+        p for p in plugin_manifest.discover_plugins() if p.directory.name not in disabled
     )
 
 
@@ -521,7 +534,6 @@ async def take_turn(
             record_turn_started=runtime.recorder.record_turn_started,
             record_plugin_run_started=runtime.recorder.record_plugin_run_started,
             record_node=runtime.recorder.record_node,
-            memory_context=memory_store.DispatchContext(account_key=account, conn=conn),
             persist_pause=persist_pause,
             approve=resolved_approve,
         )

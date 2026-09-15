@@ -21,8 +21,24 @@ from pathlib import Path
 
 from sadana import client_surface, config, gateway_daemon
 from sadana.door import auth, capabilities
-from sadana.door.nouns import agent_templates, agents, approvals, harness, memory_entries, memory_policies, schedules
-from sadana.door.nouns import approvals, artifacts, harness, runs, spans, traces
+from sadana.door.nouns import (
+    agent_templates,
+    agents,
+    approvals,
+    artifacts,
+    harness,
+    inspections,
+    memory_entries,
+    memory_policies,
+    nodes,
+    plugins,
+    runs,
+    schedules,
+    spans,
+    tools,
+    traces,
+    workflows,
+)
 from sadana.door.nouns.conversations import ConversationsNoun
 from sadana.door.nouns.messages import MessagesNoun
 from sadana.door.operations import resume_on_start
@@ -118,6 +134,11 @@ def cmd_door_serve(args: argparse.Namespace) -> int:
             "spans": spans,
             "traces": traces,
             "approvals": approvals,
+            "plugins": plugins,
+            "workflows": workflows,
+            "nodes": nodes,
+            "tools": tools,
+            "inspections": inspections,
         },
         clock=time.time,
     )

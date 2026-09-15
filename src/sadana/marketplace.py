@@ -103,10 +103,30 @@ class InvalidManifest:
     (nothing to key a row on); otherwise a `rejected` row is recorded with
     this same `detail` as its reason, and this is never shown to a
     reviewer as something needing a decision — there is nothing for a
-    human to judge in input that doesn't parse or has a dangling node."""
+    human to judge in input that doesn't parse or has a dangling node.
+
+    `revision` is always the fetch's own confirmed commit — a manifest can
+    only be structurally wrong *after* a real, verified clone. `manifest` is
+    `None` exactly when `plugin_name` is (nothing parsed to render), and is
+    the parsed-but-invalid shape otherwise — what `submit()` records for a
+    rejected release so a reviewer can still see what was submitted."""
 
     plugin_name: str | None
     detail: str
+    revision: str
+    manifest: dict[str, object] | None = None
+
+
+@dataclass(frozen=True)
+class Inspected:
+    """A tag's declared shape, captured without running any of it
+    (`docs/tasks/H24-door-nouns-plugins-layout-install-inspect/spec.md`)."""
+
+    manifest: dict[str, object]
+    revision: str
+
+
+InspectOutcome = Inspected | plugin_install.TagMismatch | plugin_install.FetchFailed | InvalidManifest
 
 
 SubmitOutcome = (
@@ -256,51 +276,80 @@ def _claim_release(
     return Pending(plugin_name=plugin_name, tag=tag)
 
 
-def submit(conn: sqlite3.Connection, repo_url: str, tag: str, *, now: float) -> SubmitOutcome:
-    """Fetch `tag` from `repo_url`, verify it, capture its shape, and
-    queue it for review — or auto-reject it, or refuse it, per the
-    outcomes above. Never imports or executes anything from `repo_url`."""
-    _ensure_schema(conn)
-    with tempfile.TemporaryDirectory(prefix="sadana-marketplace-") as tmp:
+def inspect_tag(repo_url: str, tag: str) -> InspectOutcome:
+    """Clone `tag` from `repo_url` to a temp dir, confirm the fetched tree
+    really is that tag, validate its manifest (`check_bodies=False`), and
+    discard the clone. Never imports the plugin's own code —
+    `check_bodies=False` is not an optimisation here, it is the whole safety
+    property this function exists for (CLAUDE.md: "A check that can execute
+    code as a side effect of validating it... must offer a mode that never
+    executes anything, and any caller handling input from a source it
+    doesn't already trust uses that mode").
+
+    Extracted from `submit()`'s own fetch-verify-validate sequence (H24:
+    `docs/tasks/H24-door-nouns-plugins-layout-install-inspect/spec.md`) so
+    the console's own `inspections` noun and this module's own vetting share
+    one implementation of "what does this tag look like," not two."""
+    with tempfile.TemporaryDirectory(prefix="sadana-inspect-") as tmp:
         dest = Path(tmp) / "release"
         fetched = plugin_install.fetch_verified_tag(repo_url, tag, dest)
         if isinstance(fetched, plugin_install.TagMismatch | plugin_install.FetchFailed):
             return fetched
 
         outcome = plugin_manifest.validate(fetched.directory, check_bodies=False)
-
         if isinstance(outcome, plugins.Valid):
-            manifest = outcome.manifest
-            manifest_json = json.dumps(plugins.manifest_to_dict(manifest))
-            return _claim_release(
-                conn,
-                plugin_name=manifest.name,
-                tag=tag,
-                repo_url=repo_url,
-                revision=fetched.revision,
-                manifest_json=manifest_json,
-                now=now,
-            )
+            return Inspected(manifest=plugins.manifest_to_dict(outcome.manifest), revision=fetched.revision)
 
         detail = plugins.describe_manifest_outcome(outcome)
         try:
             manifest = plugins._parse_manifest((fetched.directory / "plugin.toml").read_text(encoding="utf-8"))
         except Exception:
-            return InvalidManifest(plugin_name=None, detail=detail)
-
-        manifest_json = json.dumps(plugins.manifest_to_dict(manifest))
-        _insert_release(
-            conn,
+            return InvalidManifest(plugin_name=None, detail=detail, revision=fetched.revision)
+        return InvalidManifest(
             plugin_name=manifest.name,
+            detail=detail,
+            revision=fetched.revision,
+            manifest=plugins.manifest_to_dict(manifest),
+        )
+
+
+def submit(conn: sqlite3.Connection, repo_url: str, tag: str, *, now: float) -> SubmitOutcome:
+    """Fetch `tag` from `repo_url`, verify it, capture its shape, and
+    queue it for review — or auto-reject it, or refuse it, per the
+    outcomes above. Never imports or executes anything from `repo_url`."""
+    _ensure_schema(conn)
+    inspected = inspect_tag(repo_url, tag)
+    if isinstance(inspected, plugin_install.TagMismatch | plugin_install.FetchFailed):
+        return inspected
+
+    if isinstance(inspected, Inspected):
+        manifest_json = json.dumps(inspected.manifest)
+        return _claim_release(
+            conn,
+            plugin_name=str(inspected.manifest["name"]),
             tag=tag,
             repo_url=repo_url,
-            revision=fetched.revision,
+            revision=inspected.revision,
             manifest_json=manifest_json,
-            status="rejected",
-            reason=f"automatically rejected: {detail}",
             now=now,
         )
-        return InvalidManifest(plugin_name=manifest.name, detail=detail)
+
+    # inspected is InvalidManifest.
+    if inspected.plugin_name is None or inspected.manifest is None:
+        return inspected
+
+    _insert_release(
+        conn,
+        plugin_name=inspected.plugin_name,
+        tag=tag,
+        repo_url=repo_url,
+        revision=inspected.revision,
+        manifest_json=json.dumps(inspected.manifest),
+        status="rejected",
+        reason=f"automatically rejected: {inspected.detail}",
+        now=now,
+    )
+    return inspected
 
 
 def decide(

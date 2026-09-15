@@ -237,6 +237,113 @@ def test_install_rejects_a_non_tag_before_resolving_anything(tmp_path: Path, tag
 
 
 @pytest.mark.unit
+def test_install_from_git_discovers_the_name_from_the_manifest(tmp_path: Path) -> None:
+    """No `register()` call anywhere — the console's own create/
+    install-from-git reaches this with only a repository and a tag."""
+    repo = _make_upstream_repo(tmp_path, plugin_name="greeter", tag="v1.0.0")
+    plugins_root = tmp_path / "plugins"
+    conn = _conn()
+    try:
+        outcome = plugin_install.install_from_git(conn, str(repo), "v1.0.0", plugins_root=plugins_root)
+    finally:
+        conn.close()
+
+    assert isinstance(outcome, plugin_install.Installed)
+    assert outcome.name == "greeter"
+    assert outcome.directory == plugins_root / "greeter"
+    assert (plugins_root / "greeter" / "plugin.toml").is_file()
+
+
+@pytest.mark.unit
+def test_install_from_git_expect_name_mismatch_is_refused_without_touching_disk(tmp_path: Path) -> None:
+    repo = _make_upstream_repo(tmp_path, plugin_name="actually-called-this", tag="v1.0.0")
+    plugins_root = tmp_path / "plugins"
+    conn = _conn()
+    try:
+        outcome = plugin_install.install_from_git(
+            conn, str(repo), "v1.0.0", plugins_root=plugins_root, expect_name="expected-this-instead"
+        )
+    finally:
+        conn.close()
+
+    assert outcome == plugin_install.NameMismatch(expected="expected-this-instead", found="actually-called-this")
+    assert not (plugins_root / "actually-called-this").exists()
+    assert not (plugins_root / "expected-this-instead").exists()
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("tag", ["a" * 40, "not a valid tag"], ids=["bare-commit-sha", "malformed-ref-name"])
+def test_install_from_git_rejects_a_non_tag_before_fetching_anything(tmp_path: Path, tag: str) -> None:
+    plugins_root = tmp_path / "plugins"
+    conn = _conn()
+    try:
+        outcome = plugin_install.install_from_git(
+            conn, "https://example.invalid/greeter.git", tag, plugins_root=plugins_root
+        )
+    finally:
+        conn.close()
+
+    assert isinstance(outcome, plugin_install.FetchFailed)
+    assert not plugins_root.exists()
+
+
+@pytest.mark.unit
+def test_install_from_git_already_installed_without_replace_is_refused(tmp_path: Path) -> None:
+    repo = _make_upstream_repo(tmp_path, plugin_name="greeter", tag="v1.0.0")
+    plugins_root = tmp_path / "plugins"
+    conn = _conn()
+    try:
+        first = plugin_install.install_from_git(conn, str(repo), "v1.0.0", plugins_root=plugins_root)
+        second = plugin_install.install_from_git(conn, str(repo), "v1.0.0", plugins_root=plugins_root)
+    finally:
+        conn.close()
+
+    assert isinstance(first, plugin_install.Installed)
+    assert second == plugin_install.AlreadyInstalled(name="greeter")
+
+
+@pytest.mark.unit
+def test_install_from_git_with_replace_lands_the_new_tags_content(tmp_path: Path) -> None:
+    repo = _make_upstream_repo(tmp_path, plugin_name="greeter", tag="v1.0.0")
+    plugins_root = tmp_path / "plugins"
+    conn = _conn()
+    try:
+        plugin_install.install_from_git(conn, str(repo), "v1.0.0", plugins_root=plugins_root)
+        _retag(repo, plugin_name="greeter", tag="v1.0.0", content="second version")
+        outcome = plugin_install.install_from_git(conn, str(repo), "v1.0.0", plugins_root=plugins_root, replace=True)
+    finally:
+        conn.close()
+
+    assert isinstance(outcome, plugin_install.Installed)
+    assert "second version" in (plugins_root / "greeter" / "plugin.toml").read_text()
+
+
+@pytest.mark.unit
+def test_set_state_writes_the_row_and_records_a_change(tmp_path: Path) -> None:
+    repo = _make_upstream_repo(tmp_path, plugin_name="greeter", tag="v1.0.0")
+    plugins_root = tmp_path / "plugins"
+    with closing(_conn()) as conn:
+        plugin_install.install_from_git(conn, str(repo), "v1.0.0", plugins_root=plugins_root)
+        before = conn.execute("SELECT id, version FROM plugin_state WHERE name = 'greeter'").fetchone()
+
+        plugin_install.set_state(conn, before["id"], "disabled", now=time.time())
+
+        after = conn.execute("SELECT state, version FROM plugin_state WHERE id = ?", (before["id"],)).fetchone()
+        changes = ledger.changes_since(conn, 0, 10)
+
+    assert (after["state"], after["version"]) == ("disabled", before["version"] + 1)
+    assert (before["id"], "changed", "disabled") in {(c.id, c.kind, c.state) for c in changes}
+
+
+@pytest.mark.unit
+def test_set_state_unknown_id_is_a_silent_no_op(tmp_path: Path) -> None:
+    with closing(_conn()) as conn:
+        plugin_install._ensure_schema(conn)
+        plugin_install.set_state(conn, "plg_does_not_exist", "disabled", now=time.time())
+        assert conn.execute("SELECT * FROM plugin_state").fetchone() is None
+
+
+@pytest.mark.unit
 def test_discover_plugins_finds_a_freshly_installed_plugin_with_no_code_change(tmp_path: Path) -> None:
     repo = _make_upstream_repo(tmp_path, plugin_name="greeter", tag="v1.0.0")
     plugins_root = tmp_path / "plugins"
@@ -311,7 +418,7 @@ def test_registering_then_installing_records_two_changes(tmp_path: Path) -> None
 @pytest.mark.unit
 def test_a_directory_whose_manifest_is_invalid_reconciles_to_error(tmp_path: Path) -> None:
     """A broken plugin is the one the console most needs to show. Hiding it is
-    what `editor_server._list_plugins` already declined to do."""
+    what `editor_server.list_plugins` already declined to do."""
     plugins_root = tmp_path / "plugins"
     (plugins_root / "broken").mkdir(parents=True)
     (plugins_root / "broken" / "plugin.toml").write_text("this is not toml [[[")

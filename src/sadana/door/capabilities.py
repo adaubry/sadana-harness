@@ -50,6 +50,12 @@ DECLARED: tuple[str, ...] = (
     "streaming",
     "runs.live",
     "runs.stop",
+    # H24 (docs/tasks/H24-door-nouns-plugins-layout-install-inspect/spec.md):
+    # plugins through the door — install-from-git, inspect a tag before
+    # installing, save an edited plugin, disable/enable.
+    "plugins.install",
+    "plugins.inspect",
+    "plugins.write",
 )
 
 _unknown = [name for name in DECLARED if name not in ALL]
