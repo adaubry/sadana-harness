@@ -73,6 +73,7 @@ WSL only. Python lives in `.venv`; `make` puts it on PATH for you, so there is n
 - A stoppable loop with work dispatched off the event loop stops only at named loop-boundary checkpoints between iterations, never by cancelling or killing already-dispatched off-loop work.
 - A door noun whose value lives in a flat file (`config.toml`, `.env`, or similar) with no natural row of its own gets a minimal identity table — id, name-or-fixed-key, timestamps, version, state — holding identity and concurrency-control metadata only; the file stays the sole place its actual value is read from or written to, and the identity row never mirrors that value.
 - A release tag name is byte-identical to `sadana.__version__` at that commit — the upgrade action's own success check, and `sadana --version`, both depend on the two never diverging.
+- A test's precondition check reads state the test itself created, never real global host state (a systemd unit path, a real port, a real file outside the test's own tmp dir) — a prior, unrelated real action can make that precondition false on a host nothing else about the test controls.
 
 ## Glossary
 
