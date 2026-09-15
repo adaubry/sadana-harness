@@ -22,7 +22,7 @@ PLUGIN = "image-gen"
 
 
 def draw(value: dict) -> Artifact | str:
-    api_key = plugins.required_setting(PLUGIN, "api_key")
+    api_key = plugins.required_setting(PLUGIN, "api_key", secret=True)
 
     prompt = str(value.get("prompt", "")).strip()
     if not prompt:

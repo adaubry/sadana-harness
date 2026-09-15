@@ -6,6 +6,7 @@ import asyncio
 
 import pytest
 
+from sadana import config as config_module
 from sadana import model_access
 from sadana.context import CacheHint
 from sadana.model_access import (
@@ -289,6 +290,29 @@ def test_send_returns_needs_credential_when_env_var_missing_and_never_calls_requ
     )
     monkeypatch.delenv("SADANA_TEST_FAKE_KEY", raising=False)
     request = Request(messages=(), provider="test-fake-provider-missing-cred", model="x")
+    outcome = send(request)
+    assert isinstance(outcome, NeedsCredentialOrProviderChange)
+    assert calls == []
+
+
+@pytest.mark.unit
+def test_send_treats_an_unbound_secret_reader_as_a_missing_credential(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`config.secret()` raises `RuntimeError` when nothing has called
+    `config.bind_secret_reader()` yet — true for `eval_harness.py`,
+    CLAUDE.md's own sanctioned direct caller of `take_turn`, which binds no
+    reader at all. The credential preflight must answer
+    `NeedsCredentialOrProviderChange`, not let that exception escape."""
+    calls = []
+    register_provider(
+        ProviderManifest(
+            name="test-fake-provider-unbound-reader",
+            env_vars=("SADANA_TEST_FAKE_KEY",),
+            request_fn=lambda req: calls.append(req) or (200, {}),
+        )
+    )
+    monkeypatch.delenv("SADANA_TEST_FAKE_KEY", raising=False)
+    monkeypatch.setattr(config_module, "_secret_reader", None)
+    request = Request(messages=(), provider="test-fake-provider-unbound-reader", model="x")
     outcome = send(request)
     assert isinstance(outcome, NeedsCredentialOrProviderChange)
     assert calls == []

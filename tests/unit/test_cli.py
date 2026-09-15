@@ -101,16 +101,22 @@ def test_setup_subcommand_reachable_via_main(capsys: pytest.CaptureFixture[str])
 
 
 @pytest.mark.unit
-def test_main_loads_dotenv_before_subcommand_dispatch(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def test_main_binds_the_secret_reader_before_subcommand_dispatch(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """H14: `load_dotenv` no longer copies `.env` into `os.environ` —
+    `config.secret` is the read path now, and `main()` must have bound its
+    reader before any subcommand could call it."""
     state = tmp_path / "state"
     state.mkdir()
     (state / ".env").write_text('SADANA_CLI_TEST_KEY="from-file"\n', encoding="utf-8")
     monkeypatch.setenv("SADANA_STATE_DIR", str(state))
     monkeypatch.delenv("SADANA_CLI_TEST_KEY", raising=False)
     # "conversations" runs no handler that reads config — reaching it proves
-    # main() dispatched; load_dotenv ran and the value is now visible.
+    # main() dispatched; load_dotenv and the reader binding both ran.
     assert main(["conversations"]) == 0
-    assert sadana_config.env("SADANA_CLI_TEST_KEY", "") == "from-file"
+    assert sadana_config.env("SADANA_CLI_TEST_KEY", "") == ""
+    assert sadana_config.secret("SADANA_CLI_TEST_KEY") == "from-file"
 
 
 @pytest.mark.unit

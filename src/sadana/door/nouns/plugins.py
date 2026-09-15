@@ -40,10 +40,11 @@ import sqlite3
 from collections.abc import Mapping
 from pathlib import Path
 
-from sadana import editor_layout, editor_server, plugin_install, plugins
-from sadana.door import grammar, problems
+from sadana import config, editor_layout, editor_server, plugin_install, plugins
+from sadana.door import config_writer, grammar, problems
 from sadana.door.auth import Principal
 from sadana.door.nouns import ActionSpec, NounSpec, SearchDoc, check_if_match, unavailable
+from sadana.door.nouns import secrets as secrets_noun
 from sadana.door.nouns._plugin_manifests import assessed_by_directory_name, external_refs, validate_repo_url_and_tag
 
 CAPABILITIES: tuple[str, ...] = ("plugins.install", "plugins.write")
@@ -69,9 +70,6 @@ spec = NounSpec(
             from_states=(), to_state="", capability="plugins.install", scope_verb="install-from-git"
         ),
         "save": ActionSpec(from_states=(), to_state="", capability="plugins.write", scope_verb="save"),
-        # H14 hasn't landed `settings.write` into `capabilities.DECLARED`
-        # yet — router's own auto-gate already answers `501` naming it, no
-        # branch in `act()` below is reachable for this name.
         "set-settings": ActionSpec(from_states=(), to_state="", capability="settings.write", scope_verb="set-settings"),
     },
     parent=None,
@@ -283,6 +281,65 @@ def _save(ctx: object, row: sqlite3.Row, body: Mapping[str, object]) -> dict[str
     return _render_row(ctx, updated, with_layout=True)
 
 
+def _set_settings(ctx: object, row: sqlite3.Row, body: Mapping[str, object]) -> dict[str, object] | problems.Problem:
+    """``{settings: {key: value | {secret_ref: name}}}`` (H14,
+    `docs/tasks/H14-tuned-config-settings-secrets/spec.md`).
+
+    A secret-kind key accepts only ``{secret_ref: name}`` — a raw value
+    there is ``400 VALIDATION`` naming the key, and the reference itself
+    is validated against ``secrets.exists`` before anything is written. A
+    non-secret key accepts a raw scalar and is refused a reference. Every
+    key must already be declared in the plugin's own ``plugin.toml``; an
+    unknown key is ``400 VALIDATION`` naming it.
+
+    Writes: a secret-kind value stores the *reference* under
+    ``plugins.<plugin>.<key>`` in ``config.toml`` — ``plugins.read_setting``
+    follows it live, so rotating the referenced secret reaches this plugin
+    on the next call with no second ``set-settings`` needed. A non-secret
+    value writes the same dotted key with the value itself. All writes for
+    one call are validated first, applied second — a body naming three
+    settings where the third is invalid changes nothing, not the first two."""
+    settings = body.get("settings")
+    if not isinstance(settings, dict) or not settings:
+        return problems.make("VALIDATION", "'settings' is required and must be a non-empty object")
+    plugin_name = str(row["name"])
+    assessed = assessed_by_directory_name(_plugins_root()).get(plugin_name)
+    declared = {s.name: s for s in assessed[0].settings} if assessed is not None else {}
+
+    for key, value in settings.items():
+        if key not in declared:
+            return problems.make("VALIDATION", f"{plugin_name} does not declare a setting named {key!r}")
+        setting = declared[key]
+        if setting.secret:
+            if not isinstance(value, dict) or set(value) != {"secret_ref"}:
+                return problems.make(
+                    "VALIDATION", f"{key} is a secret setting; provide {{'secret_ref': <name>}}, not a raw value"
+                )
+            secret_ref = value["secret_ref"]
+            if not isinstance(secret_ref, str) or not secret_ref:
+                return problems.make("VALIDATION", f"{key}.secret_ref must be a non-empty string")
+            if not secrets_noun.exists(secret_ref):
+                return problems.make(
+                    "VALIDATION", f"no secret named {secret_ref!r}; POST /v1/secrets to create it first"
+                )
+        elif isinstance(value, dict) or not isinstance(value, str | int | float | bool):
+            return problems.make("VALIDATION", f"{key} is not a secret setting; provide a raw value")
+
+    path = config.get_paths().config_dir / "config.toml"
+    data = config.raw_toml()
+    for key, value in settings.items():
+        setting = declared[key]
+        applied = value["secret_ref"] if setting.secret else value
+        data = config_writer.apply(data, f"plugins.{plugin_name}.{key}", applied)
+    config_writer.write(path, data)
+
+    now = ctx.clock()  # type: ignore[attr-defined]
+    plugin_install.set_state(ctx.conns.writer, str(row["id"]), str(row["state"]), now=now)  # type: ignore[attr-defined]
+    updated = _get_row(ctx, str(row["id"]))
+    assert updated is not None, f"plugin {row['id']} vanished immediately after its own set-settings"
+    return _render_row(ctx, updated, with_layout=False)
+
+
 def act(
     ctx: object,
     principal: Principal,
@@ -321,10 +378,9 @@ def act(
         return _install_outcome_to_response(ctx, outcome)
     elif name == "save":
         return _save(ctx, row, body)
+    elif name == "set-settings":
+        return _set_settings(ctx, row, body)
     else:
-        # "set-settings": unreachable while settings.write is undeclared —
-        # router's own capability gate already answers 501 before this
-        # function is ever called for it.
         return unavailable(spec.plural, name)
 
     updated = _get_row(ctx, id)

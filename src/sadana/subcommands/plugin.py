@@ -82,7 +82,8 @@ def _render_settings(manifest: plugins.Manifest) -> list[str]:
     lines = [f"{manifest.name} needs:"]
     for setting in manifest.settings:
         kind = "secret" if setting.secret else "setting"
-        state = "set" if plugins.read_setting(manifest.name, setting.name) is not None else "NOT SET"
+        value = plugins.read_setting(manifest.name, setting.name, secret=setting.secret)
+        state = "set" if value is not None else "NOT SET"
         lines.append(f"  {setting.name}  [{kind}, {state}]  {setting.purpose}")
     lines.append(f"Set one with: sadana plugin set {manifest.name} <setting>")
     return lines

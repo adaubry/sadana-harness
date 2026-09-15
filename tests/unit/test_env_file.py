@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from sadana.env_file import drop_key, env_line_key, env_path, quote_env_value, upsert_key
+from sadana.env_file import drop_key, env_line_key, env_path, fingerprint, quote_env_value, read_key, upsert_key
 
 
 def _read_env(path: Path) -> dict[str, str]:
@@ -35,6 +35,20 @@ def test_upsert_creates_the_file_when_it_does_not_exist() -> None:
     path = env_path()
     upsert_key(path, "SADANA_PLUGIN__WEATHER__UNITS", "metric")
     assert _read_env(path) == {"SADANA_PLUGIN__WEATHER__UNITS": "metric"}
+
+
+@pytest.mark.unit
+def test_upsert_narrows_permissions_on_a_pre_existing_wider_file() -> None:
+    """``os.open``'s mode argument is only honored when ``O_CREAT`` actually
+    creates the file — a file that already exists at a wider mode (written
+    by something else before this module ever touched it) must still end
+    up at 0600, not keep its old permissions."""
+    path = env_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text('OLD="value"\n', encoding="utf-8")
+    path.chmod(0o644)
+    upsert_key(path, "A", "one")
+    assert path.stat().st_mode & 0o777 == 0o600
 
 
 @pytest.mark.unit
@@ -93,6 +107,42 @@ def test_env_line_key_reads_an_assignment_and_ignores_anything_else() -> None:
     assert env_line_key("  A = one") == "A"
     assert env_line_key("# a comment") == ""
     assert env_line_key("") == ""
+
+
+@pytest.mark.unit
+def test_read_key_on_a_missing_file_is_none() -> None:
+    assert read_key("A") is None
+
+
+@pytest.mark.unit
+def test_read_key_returns_the_unquoted_value() -> None:
+    path = env_path()
+    upsert_key(path, "A", "shh")
+    assert read_key("A") == "shh"
+    assert read_key("MISSING") is None
+
+
+@pytest.mark.unit
+def test_read_key_sees_a_value_rewritten_after_the_first_read() -> None:
+    path = env_path()
+    upsert_key(path, "A", "old")
+    assert read_key("A") == "old"
+    upsert_key(path, "A", "new")
+    assert read_key("A") == "new"
+
+
+@pytest.mark.unit
+def test_fingerprint_is_stable_and_never_contains_the_value() -> None:
+    value = "sk-abcdefghijklmnopqrstuvwxyz0123456789"  # pragma: allowlist secret
+    fp = fingerprint(value)
+    assert fp == fingerprint(value)
+    assert value not in fp
+    assert fp.startswith(value[-4:])
+
+
+@pytest.mark.unit
+def test_fingerprint_differs_for_different_values() -> None:
+    assert fingerprint("one-secret-value") != fingerprint("another-secret-value")
 
 
 @pytest.mark.unit

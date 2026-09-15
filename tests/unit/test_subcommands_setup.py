@@ -9,7 +9,6 @@ pins HOME, so these tests write only under ``tmp_path``.
 from __future__ import annotations
 
 import argparse
-import os
 from pathlib import Path
 
 import pytest
@@ -121,9 +120,13 @@ def test_cmd_setup_never_echoes_a_secret(monkeypatch: pytest.MonkeyPatch, capsys
 
 
 @pytest.mark.unit
-def test_cmd_setup_filled_env_is_ready_for_load_dotenv(
+def test_cmd_setup_filled_env_is_ready_for_config_secret(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """H14: `.env` is read through `config.secret` now, not copied into
+    `os.environ` by `load_dotenv` — the round trip that matters is the
+    writer (`cmd_setup`) and the reader (`config.secret`) agreeing on the
+    same env var name, through the real `.env` format."""
     monkeypatch.setattr("sys.stdin.isatty", lambda: False)
     assert cmd_setup(_args(openrouter_key="K", webhook_secret="S")) == 0
 
@@ -132,12 +135,8 @@ def test_cmd_setup_filled_env_is_ready_for_load_dotenv(
     dotenv = config.get_paths().state_dir / ".env"
     assert dotenv.exists()
     config.load_dotenv()
-    assert os.environ.get("OPENROUTER_API_KEY") == "K"
-    assert os.environ.get("SADANA_GATEWAY_WEBHOOK_SECRET") == "S"
-    # load_dotenv writes straight into os.environ, bypassing monkeypatch —
-    # undo it here so later tests aren't poisoned by values resolving from env.
-    os.environ.pop("OPENROUTER_API_KEY", None)
-    os.environ.pop("SADANA_GATEWAY_WEBHOOK_SECRET", None)
+    assert config.secret("OPENROUTER_API_KEY") == "K"
+    assert config.secret("SADANA_GATEWAY_WEBHOOK_SECRET") == "S"
 
 
 @pytest.mark.unit
@@ -148,9 +147,8 @@ def test_resolve_values_prompts_on_tty_and_raises_on_interrupt(
 
     monkeypatch.setattr("sys.stdin.isatty", lambda: True)
     monkeypatch.setattr("sys.stdout.isatty", lambda: True)
-    # load_dotenv writes straight into os.environ (bypassing monkeypatch), so
-    # an earlier test may have leaked real values — clear them so the prompt
-    # branch is what runs.
+    # Belt-and-braces: a real shell export of either name would otherwise
+    # win over the prompt this test means to exercise.
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
     monkeypatch.delenv("SADANA_GATEWAY_WEBHOOK_SECRET", raising=False)
 

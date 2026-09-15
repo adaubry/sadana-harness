@@ -56,6 +56,11 @@ DECLARED: tuple[str, ...] = (
     "plugins.install",
     "plugins.inspect",
     "plugins.write",
+    # H14 (docs/tasks/H14-tuned-config-settings-secrets/spec.md): behavior
+    # settings and secrets by reference, through provider/budget/
+    # integration/secret and plugin.set-settings.
+    "settings.write",
+    "secrets.write",
 )
 
 _unknown = [name for name in DECLARED if name not in ALL]

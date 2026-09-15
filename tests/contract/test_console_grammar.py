@@ -13,6 +13,7 @@ own nouns to this same file.
 from __future__ import annotations
 
 import json
+import re
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -104,6 +105,19 @@ def test_get_harness(door: SimpleNamespace) -> None:
     # else lands beside it) would otherwise re-break an exact-list equality
     # here for a reason that has nothing to do with what this test proves.
     assert set(body["capabilities"]) >= {"grammar.v1", "changes", "inventory"}
+    assert body["leaves_the_box"] == ["harness", "widgets"]
+    assert body["mirror"] == "full"
+
+
+@pytest.mark.contract
+def test_get_harness_mirror_reads_config_live(door: SimpleNamespace, monkeypatch: pytest.MonkeyPatch) -> None:
+    """H14: `mirror` is a sibling of `leaves_the_box`/`tether`, not a
+    rename or a type change of either — both stay exactly as they were."""
+    monkeypatch.setenv("SADANA_TETHER_MIRROR", "off")
+    resp = handle(_req("GET", "/v1/harness", token=_token(door)), ctx=door.ctx)
+    body = _json(resp)
+    assert body["mirror"] == "off"
+    assert body["tether"] == "disconnected"
     assert body["leaves_the_box"] == ["harness", "widgets"]
 
 
@@ -354,3 +368,114 @@ def test_a_slow_create_promotes_to_an_operation_then_completes(
         pytest.fail("operation never left the running state")
 
     assert _json(poll)["operation"]["state"] == "succeeded"
+
+
+# ── H14: no response body ever carries a secret's value ──────────────────
+@pytest.mark.contract
+def test_no_response_body_in_the_whole_run_ever_carries_a_secret_value(tmp_path: Path) -> None:
+    """spec.md's own acceptance criterion, verbatim: a secret value is
+    planted through the door, a representative sweep of this file's own
+    noun surface runs, and a regex for that literal value is asserted
+    absent from every response body the sweep produced."""
+    from sadana.door.nouns import budgets, integrations, providers
+    from sadana.door.nouns import secrets as secrets_noun
+
+    planted_value = "sk-planted-secret-value-nobody-should-see-again"  # pragma: allowlist secret
+    leak_pattern = re.compile(re.escape(planted_value))
+
+    private_pem, jwk = auth.generate_dev_keypair("test")
+    jwks_path = tmp_path / "jwks.json"
+    jwks_path.write_text(json.dumps(auth.jwks_document(jwk)))
+    verifier = auth.Verifier(auth.JwksSource(path=jwks_path))
+    conns = stores.Connections(tmp_path / "door.db")
+    ctx = DoorContext(
+        conns=conns,
+        runtime=auth.BoxIdentity(harness_id=_HARNESS_ID, org=None),
+        verifier=verifier,
+        capabilities=capabilities_module.declared(),
+        nouns={
+            "harness": harness,
+            "widgets": WidgetsNoun(harness_id=_HARNESS_ID),
+            "secrets": secrets_noun,
+            "providers": providers,
+            "budgets": budgets,
+            "integrations": integrations,
+        },
+        clock=time.time,
+    )
+    token = auth.mint_token(
+        private_pem,
+        "test",
+        sub="u1",
+        org=None,
+        ws="ws1",
+        hrn=_HARNESS_ID,
+        scope=[
+            "widgets:read",
+            "widgets:write",
+            "secrets:read",
+            "secrets:write",
+            "providers:read",
+            "providers:write",
+            "budgets:read",
+            "budgets:write",
+            "integrations:read",
+            "integrations:write",
+        ],
+    )  # type: ignore[arg-type]
+
+    bodies: list[bytes] = []
+
+    def call(method: str, path: str, *, body: bytes = b"", headers: dict | None = None) -> door_request.DoorResponse:
+        resp = handle(_req(method, path, token=token, body=body, headers=headers), ctx=ctx)
+        bodies.append(resp.body)
+        return resp
+
+    call("GET", "/v1/harness")
+    call("GET", "/v1/changes?since=0&limit=50")
+    call("GET", "/v1/inventory")
+    call("GET", "/v1/widgets")
+    created = json.loads(call("POST", "/v1/widgets", body=b'{"name": "w"}').body)
+    call("GET", f"/v1/widgets/{created['id']}")
+
+    secret = json.loads(
+        call("POST", "/v1/secrets", body=json.dumps({"name": "leak_test", "value": planted_value}).encode()).body
+    )
+    call("GET", "/v1/secrets")
+    call("GET", f"/v1/secrets/{secret['id']}")
+    call(
+        "PATCH",
+        f"/v1/secrets/{secret['id']}",
+        body=json.dumps({"kind": "api_key"}).encode(),
+        headers={"If-Match": str(secret["version"])},
+    )
+
+    prv_list = json.loads(call("GET", "/v1/providers").body)
+    if prv_list["data"]:
+        prv = prv_list["data"][0]
+        call(
+            "PATCH",
+            f"/v1/providers/{prv['id']}",
+            body=json.dumps({"credential_ref": "leak_test"}).encode(),
+            headers={"If-Match": str(prv["version"])},
+        )
+        call("GET", f"/v1/providers/{prv['id']}")
+
+    bdg = json.loads(call("GET", "/v1/budgets").body)["data"][0]
+    call(
+        "PATCH",
+        f"/v1/budgets/{bdg['id']}",
+        body=json.dumps({"iterations_max": 42}).encode(),
+        headers={"If-Match": str(bdg["version"])},
+    )
+    intg = json.loads(call("GET", "/v1/integrations").body)["data"][0]
+    call(
+        "PATCH",
+        f"/v1/integrations/{intg['id']}",
+        body=json.dumps({"webhook_secret_ref": "leak_test"}).encode(),
+        headers={"If-Match": str(intg["version"])},
+    )
+    call("GET", "/v1/integrations")
+
+    for body in bodies:
+        assert not leak_pattern.search(body.decode("utf-8", errors="replace"))

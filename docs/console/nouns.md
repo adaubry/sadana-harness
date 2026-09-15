@@ -330,16 +330,94 @@ look at a git tag before anyone installs it — never runs anything from it.
 
 ## provider
 
-Served by: not yet — no harness id assigned in `docs/reference/console_fit_plan.md` §3 yet.
+Served by: H14. One row per name this box's own model-provider registry
+declares wired (a real `request_fn`) — never a row a person creates.
+
+- **Fields:** `name` (read-only, from the registry), `model`, `base_url?`,
+  `credential_ref?`.
+- **States:** none — a provider either exists in the registry or it does
+  not; there is no in-between state to render.
+- **Actions:** none. `create`/`remove` are both declined
+  (`HARNESS_CAPABILITY_MISSING`): a provider's existence is a fact about
+  the box's own installed code, not something a console call can add or
+  take away.
+- **Filterable / orderable:** `name` / `created_at`.
+- **`search_doc`:** `{title: name, facets: {model}}`.
+- **Where it differs from the console's prompt:** `model`/`base_url`/
+  `credential_ref` live in `config.toml` under `[providers.<name>]`, read
+  fresh on every call — a `PATCH` takes effect on the next turn, no
+  restart. `credential_ref` is validated against the `secret` noun's own
+  existence check (a name, never an id) before being accepted; naming one
+  that resolves nowhere is `400 VALIDATION`. `id`/`created_at`/`version`
+  are minted the first time this box is ever asked about a given provider
+  — a floor, not a fact, the same posture `console_fit_plan.md` §5(b)
+  already documents for a legacy row filled in at first open.
 
 ## budget
 
-Served by: not yet — no harness id assigned in `docs/reference/console_fit_plan.md` §3 yet.
+Served by: H14. The box's own conversation budget — one row, box-wide, not
+one per account or per conversation.
+
+- **Fields:** `iterations_max`, `wall_clock_seconds`, `runs_per_day`
+  (read-only; the console's own plan quota — this box has no opinion about
+  it and always reports `null`).
+- **States:** none.
+- **Actions:** none. `create`/`remove` are declined: there is nothing to
+  create or delete, only a value to set, the same posture
+  `memory_policies` (H26) already takes for an identical shape.
+- **Filterable / orderable:** none / `created_at`.
+- **`search_doc`:** `{title: "Budget", facets: {iterations_max}}`.
+- **Where it differs from the console's prompt:** `list`/`get` render a
+  synthetic row (`id = "bdg_default"`, `version = 0`) until the first
+  `PATCH`, which mints a real row — `If-Match` against the synthetic
+  version (`"0"`) is what a first-ever write presents. A `PATCH` naming
+  `runs_per_day` is `400 VALIDATION`, never silently ignored.
 
 ## integration
 
-Served by: not yet — no harness id assigned in `docs/reference/console_fit_plan.md` §3 yet.
+Served by: H14. The box's own inbound webhook — one row, box-wide.
+
+- **Fields:** `webhook_url` (read-only — where a plugin's external answer
+  is posted; the box's inbound webhook address when bound),
+  `webhook_secret_ref`, `gateway_state` (read-only).
+- **States:** none.
+- **Actions:** none — `create`/`remove` declined, the same reason
+  `budget` declines them.
+- **Filterable / orderable:** none / `created_at`.
+- **`search_doc`:** `{title: "Integration", facets: {gateway_state}}`.
+- **Where it differs from the console's prompt:** `webhook_url` and
+  `gateway_state` are computed at read time — `webhook_url` from
+  `gateway.webhook_bind`/`.webhook_port`, `gateway_state` (`"running"` |
+  `"stopped"`) from a non-blocking probe of the same lock file
+  `gateway_daemon.run()` itself takes — never stored, so neither can go
+  stale against what is actually true. `webhook_secret_ref` is validated
+  against the `secret` noun's own existence check, exactly like
+  `provider.credential_ref`. The same synthetic-until-first-write row shape
+  as `budget` applies here too.
 
 ## secret
 
-Served by: not yet — no harness id assigned in `docs/reference/console_fit_plan.md` §3 yet (write-only per §6's credential-value rule, once it lands).
+Served by: H14. Write-only, referenced by name everywhere else in this API.
+
+- **Fields:** `name`, `kind`. Never `value` — on any verb, on any state.
+- **States:** none.
+- **Actions:** none.
+- **Filterable / orderable:** `name` / `created_at`.
+- **`search_doc`:** `{title: name, facets: {kind}}`.
+- **Where it differs from the console's prompt:** the standard grammar is
+  used as-is — `POST /v1/secrets {name, value, kind?}` creates (a real
+  minted id, `name` immutable after), `PATCH /v1/secrets/{id} {value?,
+  kind?}` rotates the value and/or `kind`. Not the shape a first sketch of
+  this noun proposed (`PUT /v1/secrets/{name}`), which has no counterpart
+  in this door's actual six-verb, id-addressed grammar and would have
+  reopened that shared framework for one noun. `list`/`get` add a
+  `fingerprint` (last four characters of the value, a middle dot, the
+  first eight hex characters of its SHA-256) computed live from
+  `state_dir/.env` on every call — never stored, never stale. `remove`
+  hard-deletes the row and the `.env` line; the tombstone this project's
+  own removal pattern leaves is the ledger's own permanent `deleted` row,
+  not a lingering `state` kept here. A name a `credential_ref`/
+  `secret_ref` elsewhere in this API names need never have been created
+  through this noun at all — a real, already-exported environment variable
+  satisfies the reference exactly as well, since the environment always
+  wins.

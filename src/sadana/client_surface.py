@@ -44,6 +44,7 @@ from sadana import (
     builtin_seed,
     config,
     conversation_store,
+    env_file,
     memory,
     memory_store,
     model_access,
@@ -69,6 +70,7 @@ from sadana.conversation import (
     iteration_budget_from_config,
     wall_clock_budget_from_config,
 )
+from sadana.redact import SecretRedactor
 
 logger = logging.getLogger(__name__)
 
@@ -150,7 +152,10 @@ def open_runtime(*, provider: str | None = None, model: str | None = None) -> Ru
     Calls `config.load_dotenv()` itself. `cli.main()` already does, but a
     client that is not the CLI would otherwise have to know to — and it is
     idempotent and never overrides a live environment variable
-    (`config.py:31`), so calling it twice costs nothing.
+    (`config.py:31`), so calling it twice costs nothing. The same is true of
+    the secret reader binding and the redaction filter just below: a client
+    that is not the CLI still needs both, and adding the same filter twice
+    only redacts an already-redacted line a second time.
 
     The returned `Runtime` owns open connections. A client that should not
     hold them for the life of the process closes the writer with
@@ -159,6 +164,8 @@ def open_runtime(*, provider: str | None = None, model: str | None = None) -> Ru
     thread-local readers are deliberately not closeable as a set — see
     `stores.Connections.reader`.
     """
+    logging.getLogger().addFilter(SecretRedactor())
+    config.bind_secret_reader(env_file.read_key)
     config.load_dotenv()
     builtin_seed.seed_all(plugins._plugins_root())
     # Connections first: its constructor ensures every schema and reconciles
@@ -167,11 +174,26 @@ def open_runtime(*, provider: str | None = None, model: str | None = None) -> Ru
     connections = stores.Connections(conversation_store.store_path_from_config())
     _adopt_scheduled_memories(connections.writer)
     _adopt_scheduled_triggers(connections.writer)
+    resolved_provider = provider or config.get("model_access.provider", model_access.DEFAULT_PROVIDER)
+    # H14: `providers.<name>.model` (the `provider` door noun's own `model`
+    # field) is that provider's preferred default — consulted here, under
+    # `model_access.model`'s own box-wide override, so `providers.update`
+    # gives its own `model` field real effect rather than leaving it
+    # write-only. `Runtime.provider`/`.model` are still resolved once, at
+    # open time (CLIENT-SURFACE-01's own settled design — "what a client
+    # holds for the life of its process"), so this reaches the *next*
+    # `open_runtime()` call (the next CLI invocation, or the next daemon
+    # restart), not an already-open `Runtime`'s next turn — unlike
+    # `credential_ref`/`base_url`, which `_build_request`/
+    # `chat_completions_url` re-read on every call and so reach an
+    # already-open runtime immediately. See spec.md's own Acceptance
+    # criteria for the corrected, narrower claim this actually proves.
+    default_model = config.get(f"providers.{resolved_provider}.model", model_access.DEFAULT_MODEL)
     return Runtime(
         connections=connections,
         plugin_set=enabled_plugin_set(connections.writer),
-        provider=provider or config.env("SADANA_MODEL_ACCESS_PROVIDER", model_access.DEFAULT_PROVIDER),
-        model=model or config.env("SADANA_MODEL_ACCESS_MODEL", model_access.DEFAULT_MODEL),
+        provider=resolved_provider,
+        model=model or config.get("model_access.model", default_model),
         recorder=observability.make_recorder(connections.writer),
     )
 

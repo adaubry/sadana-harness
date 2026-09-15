@@ -1405,7 +1405,7 @@ def _write_pause_c(
             json.dumps(paused_value),
         ),
     )
-    expires_at = now + config.env_int("SADANA_APPROVALS_TTL_S", 86400)
+    expires_at = now + config.get("approvals.ttl_s", 86400)
     c.execute(
         "INSERT INTO approvals (id, conversation_key, turn_seq, seq_in_turn, run_id, plugin, entry, node, "
         "kind, question, requested_at, expires_at, state, created_at, updated_at, version) "

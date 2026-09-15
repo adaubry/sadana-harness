@@ -166,9 +166,7 @@ def _get_executor() -> ThreadPoolExecutor:
     global _executor
     with _executor_lock:
         if _executor is None:
-            _executor = ThreadPoolExecutor(
-                max_workers=config.env_int("SADANA_DOOR_WORKERS", 8), thread_name_prefix="door-op"
-            )
+            _executor = ThreadPoolExecutor(max_workers=config.get("door.workers", 8), thread_name_prefix="door-op")
         return _executor
 
 

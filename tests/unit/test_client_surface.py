@@ -73,6 +73,30 @@ def test_open_runtime_resolves_provider_and_model_from_config(monkeypatch: pytes
 
 
 @pytest.mark.unit
+def test_open_runtime_falls_back_to_the_active_providers_own_model(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """H14: `providers.update`'s own `model` field (`providers.<name>.model`
+    in `config.toml`) is the active provider's preferred default, consulted
+    beneath `model_access.model`'s own box-wide override — without this,
+    the field the `provider` door noun renders and lets a caller `PATCH`
+    would be write-only."""
+    monkeypatch.delenv("SADANA_MODEL_ACCESS_MODEL", raising=False)
+    monkeypatch.delenv("SADANA_MODEL_ACCESS_PROVIDER", raising=False)
+    config_dir = tmp_path / "config" / "sadana"
+    config_dir.mkdir(parents=True)
+    (config_dir / "config.toml").write_text(
+        '[providers.openrouter]\nmodel = "anthropic/claude-provider-default"\n', encoding="utf-8"
+    )
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+
+    runtime = open_runtime()
+
+    assert runtime.provider == "openrouter"
+    assert runtime.model == "anthropic/claude-provider-default"
+
+
+@pytest.mark.unit
 def test_open_runtime_lets_an_explicit_override_win_over_config(monkeypatch: pytest.MonkeyPatch) -> None:
     """`sadana chat --provider/--model` is a per-run override of the same
     config key, so the argument has to beat the environment."""

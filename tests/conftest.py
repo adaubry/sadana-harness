@@ -15,7 +15,17 @@ from pathlib import Path
 
 import pytest
 
-from sadana import client_surface, model_access, observability, persona_store, plugin_dispatch, plugins, stores
+from sadana import (
+    client_surface,
+    config,
+    env_file,
+    model_access,
+    observability,
+    persona_store,
+    plugin_dispatch,
+    plugins,
+    stores,
+)
 from sadana.context import ContextState
 from sadana.conversation import (
     Conversation,
@@ -41,6 +51,10 @@ def _isolated_state(tmp_path, monkeypatch):  # type: ignore[no-untyped-def]
     monkeypatch.setenv("XDG_STATE_HOME", str(home / ".local" / "state"))
     monkeypatch.setenv("XDG_CONFIG_HOME", str(home / ".config"))
     monkeypatch.setenv("SADANA_STATE_DIR", str(home / ".sadana"))
+    # H14: `config.secret()` needs a bound reader before it can fall back to
+    # `state_dir/.env` — bound here, next to the redirect, so every test
+    # gets it for free the same way it gets the redirected state directory.
+    config.bind_secret_reader(env_file.read_key)
     return home
 
 

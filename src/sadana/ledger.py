@@ -137,6 +137,13 @@ _NOUNS: dict[str, _Noun] = {
     "operations": _Noun("op", ()),
     "harness": _Noun("hrn", ()),
     "inspections": _Noun("insp", ("SELECT id, updated_at, version FROM inspections WHERE id IS NOT NULL",)),
+    # H14 (docs/tasks/H14-tuned-config-settings-secrets/spec.md): identity
+    # and concurrency-control metadata only — the value each row is about
+    # lives in config.toml/.env, never in these tables.
+    "providers": _Noun("prv", ("SELECT id, updated_at, version FROM providers WHERE id IS NOT NULL",)),
+    "budgets": _Noun("bdg", ("SELECT id, updated_at, version FROM budgets WHERE id IS NOT NULL",)),
+    "integrations": _Noun("intg", ("SELECT id, updated_at, version FROM integrations WHERE id IS NOT NULL",)),
+    "secrets": _Noun("sec", ("SELECT id, updated_at, version FROM secrets WHERE id IS NOT NULL",)),
 }
 
 #: The closed list, in the order the console's own plan names them.

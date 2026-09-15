@@ -94,6 +94,23 @@ def _write_fixture_plugin(plugins_root: Path, name: str = "fixture-plugin") -> P
     return directory
 
 
+def _write_fixture_plugin_with_settings(plugins_root: Path, name: str = "fixture-plugin-settings") -> Path:
+    """A minimal plugin declaring one secret setting and one non-secret
+    one — H14's own `set-settings` fixture."""
+    directory = plugins_root / name
+    (directory / "schema").mkdir(parents=True)
+    (directory / "schema" / "t.json").write_text('{"type": "object", "properties": {}}\n')
+    (directory / "init.py").write_text("def go(value):\n    return value\n")
+    (directory / "plugin.toml").write_text(
+        f'[plugin]\nname = "{name}"\nversion = "0.1.0"\ndescription = "a fixture plugin"\n\n'
+        '[[entry]]\ntool = "t"\npurpose = "p"\nparameters = "schema/t.json"\nstart = "a"\n\n'
+        '[[node]]\nname = "a"\nkind = "stop"\n\n'
+        '[[setting]]\nname = "api_key"\npurpose = "an api key"\nsecret = true\n\n'
+        '[[setting]]\nname = "units"\npurpose = "metric or imperial"\nsecret = false\n'
+    )
+    return directory
+
+
 def _plugin_state_id(ctx: object, name: str) -> str:
     row = ctx.ctx.conns.reader().execute("SELECT id FROM plugin_state WHERE name = ?", (name,)).fetchone()  # type: ignore[attr-defined]
     assert row is not None, f"no plugin_state row for {name!r}"
@@ -355,11 +372,13 @@ def test_save_without_plugins_write_is_capability_missing(tmp_path: Path, monkey
 
 
 @pytest.mark.contract
-def test_set_settings_is_capability_missing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_set_settings_without_the_capability_is_capability_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     plugins_root = tmp_path / "plugins"
     _write_fixture_plugin(plugins_root)
     monkeypatch.setattr(plugins, "_plugins_root", lambda: plugins_root)
-    door = _door(tmp_path)
+    door = _door(tmp_path, capabilities=tuple(c for c in capabilities_module.declared() if c != "settings.write"))
     token = _token(door)
     plugin_install.reconcile_plugin_state(door.ctx.conns.writer, plugins_root)
     plg_id = _plugin_state_id(door, "fixture-plugin")
@@ -377,3 +396,102 @@ def test_set_settings_is_capability_missing(tmp_path: Path, monkeypatch: pytest.
 
     assert resp.status == 501
     assert "settings.write" in _json(resp)["detail"]
+
+
+@pytest.mark.contract
+def test_set_settings_refuses_a_raw_value_for_a_secret_key(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    plugins_root = tmp_path / "plugins"
+    _write_fixture_plugin_with_settings(plugins_root)
+    monkeypatch.setattr(plugins, "_plugins_root", lambda: plugins_root)
+    door = _door(tmp_path)
+    token = _token(door)
+    plugin_install.reconcile_plugin_state(door.ctx.conns.writer, plugins_root)
+    plg_id = _plugin_state_id(door, "fixture-plugin-settings")
+
+    resp = handle(
+        _req(
+            "POST",
+            f"/v1/plugins/{plg_id}/actions/set-settings",
+            token=token,
+            body=json.dumps({"settings": {"api_key": "sk-raw-value-not-a-reference"}}).encode(),
+            headers={"If-Match": '"1"'},
+        ),
+        ctx=door.ctx,
+    )
+    assert resp.status == 400
+    assert "api_key" in _json(resp)["detail"]
+
+
+@pytest.mark.contract
+def test_set_settings_accepts_a_reference_and_it_is_followed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    plugins_root = tmp_path / "plugins"
+    _write_fixture_plugin_with_settings(plugins_root)
+    monkeypatch.setattr(plugins, "_plugins_root", lambda: plugins_root)
+    monkeypatch.setenv("cred_x", "sk-the-real-value")  # pragma: allowlist secret
+    door = _door(tmp_path)
+    token = _token(door)
+    plugin_install.reconcile_plugin_state(door.ctx.conns.writer, plugins_root)
+    plg_id = _plugin_state_id(door, "fixture-plugin-settings")
+
+    resp = handle(
+        _req(
+            "POST",
+            f"/v1/plugins/{plg_id}/actions/set-settings",
+            token=token,
+            body=json.dumps({"settings": {"api_key": {"secret_ref": "cred_x"}, "units": "metric"}}).encode(),
+            headers={"If-Match": '"1"'},
+        ),
+        ctx=door.ctx,
+    )
+    assert resp.status == 200
+    assert plugins.read_setting("fixture-plugin-settings", "api_key", secret=True) == "sk-the-real-value"
+    assert plugins.read_setting("fixture-plugin-settings", "units", secret=False) == "metric"
+
+
+@pytest.mark.contract
+def test_set_settings_refuses_a_reference_naming_no_stored_secret(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    plugins_root = tmp_path / "plugins"
+    _write_fixture_plugin_with_settings(plugins_root)
+    monkeypatch.setattr(plugins, "_plugins_root", lambda: plugins_root)
+    door = _door(tmp_path)
+    token = _token(door)
+    plugin_install.reconcile_plugin_state(door.ctx.conns.writer, plugins_root)
+    plg_id = _plugin_state_id(door, "fixture-plugin-settings")
+
+    resp = handle(
+        _req(
+            "POST",
+            f"/v1/plugins/{plg_id}/actions/set-settings",
+            token=token,
+            body=json.dumps({"settings": {"api_key": {"secret_ref": "no_such_secret"}}}).encode(),
+            headers={"If-Match": '"1"'},
+        ),
+        ctx=door.ctx,
+    )
+    assert resp.status == 400
+
+
+@pytest.mark.contract
+def test_set_settings_refuses_an_undeclared_key(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    plugins_root = tmp_path / "plugins"
+    _write_fixture_plugin_with_settings(plugins_root)
+    monkeypatch.setattr(plugins, "_plugins_root", lambda: plugins_root)
+    door = _door(tmp_path)
+    token = _token(door)
+    plugin_install.reconcile_plugin_state(door.ctx.conns.writer, plugins_root)
+    plg_id = _plugin_state_id(door, "fixture-plugin-settings")
+
+    resp = handle(
+        _req(
+            "POST",
+            f"/v1/plugins/{plg_id}/actions/set-settings",
+            token=token,
+            body=json.dumps({"settings": {"not_declared": "x"}}).encode(),
+            headers={"If-Match": '"1"'},
+        ),
+        ctx=door.ctx,
+    )
+    assert resp.status == 400
+    assert "not_declared" in _json(resp)["detail"]
