@@ -22,8 +22,8 @@ but not yet declared by any shipped work item.
 | `streaming` | live event/frame delivery over the tether | 0.0.1 (H21) | not gated by a console prompt; declared for completeness |
 | `runs.live` | watching a run's progress as it happens | 0.0.1 (H21) | not gated by a console prompt; declared for completeness |
 | `runs.stop` | interrupting a run mid-flight | 0.0.1 (H21) | A15 |
-| `settings.write` | changing box configuration through the door | — (H14, not yet landed) | not gated by a console prompt; declared for completeness |
-| `secrets.write` | `PUT /v1/secrets/{name}` (write-only) | — (H14, not yet landed) | not gated by a console prompt; declared for completeness |
+| `settings.write` | changing box configuration through the door | 0.0.1 (H14) | not gated by a console prompt; declared for completeness |
+| `secrets.write` | `PUT /v1/secrets/{name}` (write-only) | 0.0.1 (H14) | not gated by a console prompt; declared for completeness |
 | `upgrade` | `POST /v1/harness/actions/upgrade` | 0.0.1 (H30) | not gated by a console prompt; declared for completeness |
 
 `grammar.v1`/`changes`/`inventory` are the only three H19 itself declared;
@@ -35,6 +35,5 @@ itself stayed off, correctly answering `501`, until H30 turned it on.
 The three `plugins.*` rows landed here, in H30's own commit, rather than
 in H24's: H24 had not merged onto a shared branch when this table was
 filled in (`docs/tasks/H30-tether-enroll-frames-lifecycle/review.md` §
-Findings has the full account). `declared()` reports fourteen of these
-sixteen names as of this table — every one but `settings.write`/
-`secrets.write`, which land with H14.
+Findings has the full account). `declared()` reports all sixteen of these
+names as of this table, now that H14 and H30 have both landed on `main`.

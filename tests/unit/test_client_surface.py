@@ -73,6 +73,30 @@ def test_open_runtime_resolves_provider_and_model_from_config(monkeypatch: pytes
 
 
 @pytest.mark.unit
+def test_open_runtime_falls_back_to_the_active_providers_own_model(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """H14: `providers.update`'s own `model` field (`providers.<name>.model`
+    in `config.toml`) is the active provider's preferred default, consulted
+    beneath `model_access.model`'s own box-wide override — without this,
+    the field the `provider` door noun renders and lets a caller `PATCH`
+    would be write-only."""
+    monkeypatch.delenv("SADANA_MODEL_ACCESS_MODEL", raising=False)
+    monkeypatch.delenv("SADANA_MODEL_ACCESS_PROVIDER", raising=False)
+    config_dir = tmp_path / "config" / "sadana"
+    config_dir.mkdir(parents=True)
+    (config_dir / "config.toml").write_text(
+        '[providers.openrouter]\nmodel = "anthropic/claude-provider-default"\n', encoding="utf-8"
+    )
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+
+    runtime = open_runtime()
+
+    assert runtime.provider == "openrouter"
+    assert runtime.model == "anthropic/claude-provider-default"
+
+
+@pytest.mark.unit
 def test_open_runtime_lets_an_explicit_override_win_over_config(monkeypatch: pytest.MonkeyPatch) -> None:
     """`sadana chat --provider/--model` is a per-run override of the same
     config key, so the argument has to beat the environment."""
@@ -622,7 +646,7 @@ def test_a_disabled_plugin_is_not_offered_to_the_model(tmp_path: Path, monkeypat
 
     H16's deploy review found the disabled-plugin exclusion covered only by a
     test that re-implemented the filter inline, leaving
-    `_enabled_plugin_set` — the one caller that actually runs — untested. This
+    `enabled_plugin_set` — the one caller that actually runs — untested. This
     drives that function and asserts the plugin reaches neither the catalog
     the model reads nor the tools it may call.
     """
@@ -643,8 +667,43 @@ def test_a_disabled_plugin_is_not_offered_to_the_model(tmp_path: Path, monkeypat
     with conversation_store.write_txn(connections.writer) as c:
         c.execute("UPDATE plugin_state SET state = 'disabled' WHERE name = 'switched-off'")
 
-    plugin_set = client_surface._enabled_plugin_set(connections.writer)
+    plugin_set = client_surface.enabled_plugin_set(connections.writer)
 
     assert [entry.name for entry in plugin_set.catalog] == ["keeper"]
     assert [spec.name for spec in plugin_set.tool_specs] == ["keeper_tool"]
     assert "switched_off_tool" not in plugin_set.by_tool
+
+
+@pytest.mark.unit
+def test_a_disabled_plugin_is_excluded_even_when_its_directory_name_differs_from_its_manifest_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """H24's own design-stage finding: `plugin_state` (and `disabled_names()`,
+    which reads it) is keyed by a plugin's *directory* name, while
+    `discover_plugins()` returns each plugin's *declared* manifest name.
+    `install()` forces the two equal, but `reconcile_plugin_state` does not —
+    so a directory hand-placed (or renamed) with a folder name unequal to its
+    `plugin.toml` name must still be excludable by disabling it. The
+    predecessor test above can't catch this: its two fixture plugins keep
+    folder name and manifest name identical throughout.
+    """
+    plugins_root = tmp_path / "plugins"
+    directory = plugins_root / "folder-name"
+    directory.mkdir(parents=True)
+    (directory / "s.json").write_text('{"type": "object"}')
+    (directory / "plugin.toml").write_text(
+        '[plugin]\nname = "declared-name"\nversion = "0.1.0"\ndescription = "d"\n\n'
+        '[[entry]]\ntool = "declared_name_tool"\npurpose = "p"\n'
+        'parameters = "s.json"\nstart = "a"\n\n'
+        '[[node]]\nname = "a"\nkind = "stop"\n'
+    )
+    monkeypatch.setattr(plugins, "_plugins_root", lambda: plugins_root)
+    connections = open_connections()
+    plugin_install.reconcile_plugin_state(connections.writer, plugins_root)
+    with conversation_store.write_txn(connections.writer) as c:
+        c.execute("UPDATE plugin_state SET state = 'disabled' WHERE name = 'folder-name'")
+
+    plugin_set = client_surface.enabled_plugin_set(connections.writer)
+
+    assert [entry.name for entry in plugin_set.catalog] == []
+    assert "declared_name_tool" not in plugin_set.by_tool

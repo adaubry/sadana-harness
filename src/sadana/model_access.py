@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
-import os
 import sys
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
@@ -280,13 +279,39 @@ def send(request: Request, on_delta: OnDelta | None = None) -> Outcome:
     if manifest.request_fn is None:
         raise ProviderNotWired(request.provider)
 
-    missing = [v for v in manifest.env_vars if not os.environ.get(v)]
+    # H14: a credential may live only in `state_dir/.env` now, reachable
+    # through `config.secret` but not through `os.environ` — this preflight
+    # checks `manifest.env_vars`' own declared names exactly as it always
+    # has, only the read mechanism changed. A provider whose
+    # `credential_ref` has been reconfigured to a *different* stored secret
+    # name (`providers.<name>.credential_ref` — see `door/nouns/
+    # providers.py`) is not reflected here; `model_access.py`'s own
+    # `ProviderManifest` stays exactly as it is (spec.md's own "not
+    # touched"), so this preflight cannot see a per-provider override
+    # without importing something a leaf module should not.
+    #
+    # `config.secret` raises when nothing has called `bind_secret_reader`
+    # yet — a real bug for the two entrypoints that always bind it, but
+    # `eval_harness.py` is CLAUDE.md's own sanctioned caller that reaches
+    # `send()` with no client, no store and no binding at all. This
+    # preflight's whole point is answering "is a credential available"
+    # without ever raising, so an unbound reader means exactly the same
+    # thing here as an unset variable: `NeedsCredentialOrProviderChange`,
+    # not a crash.
+    missing = []
+    for v in manifest.env_vars:
+        try:
+            present = config.secret(v)
+        except RuntimeError:
+            present = None
+        if not present:
+            missing.append(v)
     if missing:
         # Zero-network: the caller shouldn't have to make a doomed request
         # to learn a credential is simply absent.
         return NeedsCredentialOrProviderChange(f"missing env var(s): {', '.join(missing)}")
 
-    max_retries = config.env_int("SADANA_MODEL_ACCESS_MAX_RETRIES", 3)
+    max_retries = config.get("model_access.max_retries", 3)
     if request.stream and manifest.stream_fn is not None:
         status, body = manifest.stream_fn(request, on_delta or (lambda _text: None))
     else:

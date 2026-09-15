@@ -217,7 +217,7 @@ def test_a_step_whose_code_exists_is_not_reported_as_waiting(tmp_path: Path) -> 
 
 @pytest.mark.unit
 def test_a_body_check_never_imports_the_plugins_code(tmp_path: Path) -> None:
-    """`_waiting` reads the file with `ast`; importing it would run the
+    """`waiting` reads the file with `ast`; importing it would run the
     module's top level. The sentinel proves the difference."""
     _create(tmp_path)
     sentinel = tmp_path / "executed"

@@ -50,13 +50,17 @@ DECLARED: tuple[str, ...] = (
     "streaming",
     "runs.live",
     "runs.stop",
-    # H24's own three, added here because H24 had not landed on a shared
-    # branch when this chain reached this file (docs/tasks/
-    # H30-tether-enroll-frames-lifecycle/review.md § Findings) — H24's own
-    # agent rebases onto this rather than re-adding them.
+    # H24 (docs/tasks/H24-door-nouns-plugins-layout-install-inspect/spec.md):
+    # plugins through the door — install-from-git, inspect a tag before
+    # installing, save an edited plugin, disable/enable.
     "plugins.install",
     "plugins.inspect",
     "plugins.write",
+    # H14 (docs/tasks/H14-tuned-config-settings-secrets/spec.md): behavior
+    # settings and secrets by reference, through provider/budget/
+    # integration/secret and plugin.set-settings.
+    "settings.write",
+    "secrets.write",
     # H30 (docs/tasks/H30-tether-enroll-frames-lifecycle/spec.md): the
     # remote upgrade action.
     "upgrade",

@@ -251,10 +251,16 @@ and `wait` in particular is not an error state — it is the pause that P7 makes
 addressable.
 
 **A credential's value never travels with the thing that uses it.** The value
-lives on the box, written through `PUT /v1/secrets/{name}`, which is
-write-only (P9). Anywhere a plugin, a workflow or a config refers to a
-credential, it carries a `credential_ref` that must name an existing secret;
-a literal value in that position is a validation failure, not a convenience.
+lives on the box, in `state_dir/.env`, write-only (P9) — `POST /v1/secrets
+{name, value, kind?}` creates it and `PATCH /v1/secrets/{id} {value?}`
+rotates it, the door's own standard verbs rather than the natural-key `PUT`
+this section first sketched (H14: that shape had no counterpart in this
+door's actual six-verb, id-addressed grammar and would have reopened it for
+one noun). `list`/`get` answer a fingerprint, never the value. Anywhere a
+plugin, a workflow or a config refers to a credential, it carries a
+`credential_ref` (or `secret_ref`) that must name an existing secret by
+name, never by that secret's own minted id; a literal value in that
+position is a validation failure, not a convenience.
 
 **The harness `exit_reason` vocabulary is eight values, and the console's is
 five.** The harness reports `completed`, `budget_exhausted`,

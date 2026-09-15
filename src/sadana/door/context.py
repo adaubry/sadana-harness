@@ -26,13 +26,22 @@ from sadana.door.nouns import (
     agents,
     approvals,
     artifacts,
+    budgets,
     harness,
+    inspections,
+    integrations,
     memory_entries,
     memory_policies,
+    nodes,
+    plugins,
+    providers,
     runs,
     schedules,
+    secrets,
     spans,
+    tools,
     traces,
+    workflows,
 )
 from sadana.door.nouns.conversations import ConversationsNoun
 from sadana.door.nouns.messages import MessagesNoun
@@ -63,6 +72,15 @@ def build(
         "spans": spans,
         "traces": traces,
         "approvals": approvals,
+        "plugins": plugins,
+        "workflows": workflows,
+        "nodes": nodes,
+        "tools": tools,
+        "inspections": inspections,
+        "providers": providers,
+        "budgets": budgets,
+        "integrations": integrations,
+        "secrets": secrets,
     }
     return DoorContext(
         conns=conns,

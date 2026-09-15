@@ -23,7 +23,7 @@ from dataclasses import dataclass
 
 from sadana.gateway import MessageEvent, header_value
 
-_PATH = "/webhook"
+WEBHOOK_PATH = "/webhook"
 _SECRET_HEADER = "X-Sadana-Webhook-Secret"  # pragma: allowlist secret - a header name, not a secret value
 
 
@@ -84,7 +84,7 @@ def make_server(
             pass  # ponytail: quiet by default, add real logging when OBSERVABILITY exists
 
         def do_POST(self) -> None:
-            if self.path != _PATH:
+            if self.path != WEBHOOK_PATH:
                 self.send_response(404)
                 self.end_headers()
                 return

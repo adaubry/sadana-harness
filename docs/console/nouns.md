@@ -218,36 +218,227 @@ Served by: not yet (H20).
 
 ## plugin
 
-Served by: not yet (H24).
+Served by: H24.
+
+- **Fields:** `name`, `version` (the wire-standard integer version — see
+  "Where it differs"), `source_repo?`, `source_tag?`, `description`,
+  `declared_settings[{key, type: string|number|boolean|secret, required,
+  description}]`, `steps_count`, `needs_code_count`, `layout` (`get` only,
+  read-only: `nodes[{id, kind, x, y, w, h, label, needs_code,
+  external_refs[]}]`, `edges[{from, to}]`).
+- **States:** `installed` | `disabled` | `error`.
+- **Actions:** `disable` (`installed`→`disabled`, capability
+  `plugins.write`); `enable` (`disabled`→`installed`, capability
+  `plugins.write`); `install-from-git` (`{repo_url, tag}`, capability
+  `plugins.install`, consequential — re-targets an already-known plugin at a
+  new tag); `save` (`{manifest}`, capability `plugins.write`, consequential
+  — validation errors come back as `Problem.errors[]` with `field` shaped
+  `nodes.<name>.<field>` when the bad manifest text names a step and a known
+  field, `detail` alone otherwise); `set-settings` (H14; answers
+  `HARNESS_CAPABILITY_MISSING` naming `settings.write` until that lands).
+- **Filterable / orderable:** `state`, `name`, `source_repo` /
+  `created_at`.
+- **`search_doc`:** `{title: name, subtitle: description, facets: {state,
+  source_repo}}`.
+- **Where it differs from the console's prompt:** `create` **is**
+  `install-from-git` — a plugin being installed has no id yet, so there is
+  no action route to reach it through; the action form is also accepted on
+  an existing plugin's own `/v1/plugins/{id}/actions/install-from-git`, to
+  re-target it at a new tag. `version` is the standard wire optimistic-lock
+  integer, not the plugin's own declared semantic-version string
+  (`plugin.toml`'s `[plugin] version`), which this noun does not separately
+  expose. `declared_settings`/`steps_count`/`needs_code_count`/`layout` are
+  read through `editor_server.assess()`'s `check_bodies=False` posture, not
+  `plugin_manifest.discover_plugins()` — found while building this: the
+  latter excludes a plugin *entirely* the moment any one step still needs
+  code, which is exactly the state this surface exists to show. A promoted
+  `create`/`install-from-git` operation carries `resource: null`, the same
+  documented gap `docs/reference/console_fit_plan.md` §6 already names for
+  `messages.create` — poll the operation, then find the new plugin's id
+  through `/v1/changes`.
 
 ## workflow
 
-Served by: not yet (H24).
+Served by: H24.
+
+- **Fields:** `name` (= `entry.tool`), `node_count`.
+- **States:** none.
+- **Actions:** none — `create`/`update`/`remove`/every action answer
+  `HARNESS_CAPABILITY_MISSING`.
+- **Filterable / orderable:** `name` / `created_at`.
+- **`search_doc`:** `{title: name, subtitle: "<node_count> steps"}`.
+- **Where it differs from the console's prompt:** not a row — its id is a
+  pure function of `(plugin directory name, entry.tool)`
+  (`"wfl_" + sha256(...)[:32]`), the same documented exception
+  `agent_template`'s own id already takes above. `node_count` counts the
+  plugin's *whole* declared graph, not the subset reachable from this one
+  entry — no console screen this design answers needs the narrower count,
+  and computing it would be a strictly heavier step than this design
+  already pays for elsewhere (`editor_layout`'s own reachability walk).
 
 ## node
 
-Served by: not yet (H24).
+Served by: H24.
+
+- **Fields:** `kind`, `needs_code`, `external_refs[]`, `body_preview?` — the
+  standard `name` field doubles as the step's own label; nothing separate
+  is rendered.
+- **States:** none.
+- **Actions:** none. `update({label})` — not an action — renames the step
+  (`plugins.rename_node`, following every arrow, route port and entry that
+  named it), capability `plugins.write`.
+- **Filterable / orderable:** `kind`, `needs_code` / `created_at`.
+- **`search_doc`:** `{title: name, subtitle: kind, facets: {kind}}`.
+- **Where it differs from the console's prompt:** nested under a
+  `workflow`, but the nodes listed under one are the *owning plugin's whole
+  graph*, not a subset reachable from that one entry — the same reading
+  `workflow.node_count` already takes, for the same reason. `needs_code`
+  here is `editor_server.waiting()`'s own signal — a `body`/`skill`
+  reference that is *named* but does not resolve on disk — a different,
+  stronger question than `inspection.declared_shape.nodes[].needs_code`'s
+  purely structural check (which never touches disk, since an inspected
+  tag's clone is already discarded by the time this runtime ever forms an
+  answer).
 
 ## tool
 
-Served by: not yet (H24).
+Served by: H24. Read-only.
+
+- **Fields:** `name`, `description`, `plugin_id`.
+- **States / actions:** none — every write verb and action answer
+  `HARNESS_CAPABILITY_MISSING`.
+- **Filterable / orderable:** `name`, `plugin_id` / `created_at`.
+- **`search_doc`:** `{title: name, subtitle: description, facets: {plugin:
+  plugin_id}}`.
+- **Where it differs from the console's prompt:** over this harness's
+  currently *enabled* tool surface (`client_surface.enabled_plugin_set()`)
+  — a disabled plugin's tools never appear here, matching the real turn
+  path's own tool surface exactly. `plugin_id` is the owning plugin's
+  *directory* name (its stable key in `plugin_state`), not a separately
+  minted resource id.
 
 ## inspection
 
-Served by: not yet (H24).
+Served by: H24. How the console's own plugin registry asks this harness to
+look at a git tag before anyone installs it — never runs anything from it.
+
+- **Fields:** `repo_url`, `tag`, `revision`, `declared_shape: {name,
+  version, description, entries[], nodes[{id, kind, needs_code,
+  external_refs[]}], settings[], permissions_requested[]}` (`null` when
+  `state` is `failed` and nothing parsed), `checksum` (sha256 of the
+  canonical `declared_shape` JSON; `null` when `declared_shape` is), `error?`.
+- **States:** `ok` | `failed`.
+- **Actions:** none — `create({repo_url, tag})` (an operation; `plugins.inspect`)
+  is the only write, and `get` reads the settled row back. No `update`/
+  `remove`/action.
+- **Filterable / orderable:** `state`, `repo_url`, `tag` / `created_at`.
+- **`search_doc`:** `{title: "<repo_url>@<tag>", subtitle: state, facets:
+  {state, repo_url}}`.
+- **Where it differs from the console's prompt:** rows older than 7 days
+  are deleted on the first write of each new day (`door/idempotency.py`'s
+  own hour-grained sweep, one grain coarser here) — not a background job,
+  and not guaranteed exact to the hour. `declared_shape.permissions_requested`
+  is always `[]`: nothing in this harness's manifest model
+  (`plugins.Manifest`) captures a requested permission yet: the field is
+  still rendered, never omitted, so a console reading this contract never
+  has to special-case its absence. `declared_shape.nodes[].needs_code` is
+  computed structurally from the manifest alone — does the node's own
+  declared fields even name what its kind requires (`body` for
+  `compute`/`call`/`route`, `skill` for `ask`) — never by reopening the
+  clone `marketplace.inspect_tag()` already discarded; a body or skill that
+  is named but does not actually resolve is caught only once the tag is
+  installed, through the `plugin` noun's own `layout`.
 
 ## provider
 
-Served by: not yet — no harness id assigned in `docs/reference/console_fit_plan.md` §3 yet.
+Served by: H14. One row per name this box's own model-provider registry
+declares wired (a real `request_fn`) — never a row a person creates.
+
+- **Fields:** `name` (read-only, from the registry), `model`, `base_url?`,
+  `credential_ref?`.
+- **States:** none — a provider either exists in the registry or it does
+  not; there is no in-between state to render.
+- **Actions:** none. `create`/`remove` are both declined
+  (`HARNESS_CAPABILITY_MISSING`): a provider's existence is a fact about
+  the box's own installed code, not something a console call can add or
+  take away.
+- **Filterable / orderable:** `name` / `created_at`.
+- **`search_doc`:** `{title: name, facets: {model}}`.
+- **Where it differs from the console's prompt:** `model`/`base_url`/
+  `credential_ref` live in `config.toml` under `[providers.<name>]`, read
+  fresh on every call — a `PATCH` takes effect on the next turn, no
+  restart. `credential_ref` is validated against the `secret` noun's own
+  existence check (a name, never an id) before being accepted; naming one
+  that resolves nowhere is `400 VALIDATION`. `id`/`created_at`/`version`
+  are minted the first time this box is ever asked about a given provider
+  — a floor, not a fact, the same posture `console_fit_plan.md` §5(b)
+  already documents for a legacy row filled in at first open.
 
 ## budget
 
-Served by: not yet — no harness id assigned in `docs/reference/console_fit_plan.md` §3 yet.
+Served by: H14. The box's own conversation budget — one row, box-wide, not
+one per account or per conversation.
+
+- **Fields:** `iterations_max`, `wall_clock_seconds`, `runs_per_day`
+  (read-only; the console's own plan quota — this box has no opinion about
+  it and always reports `null`).
+- **States:** none.
+- **Actions:** none. `create`/`remove` are declined: there is nothing to
+  create or delete, only a value to set, the same posture
+  `memory_policies` (H26) already takes for an identical shape.
+- **Filterable / orderable:** none / `created_at`.
+- **`search_doc`:** `{title: "Budget", facets: {iterations_max}}`.
+- **Where it differs from the console's prompt:** `list`/`get` render a
+  synthetic row (`id = "bdg_default"`, `version = 0`) until the first
+  `PATCH`, which mints a real row — `If-Match` against the synthetic
+  version (`"0"`) is what a first-ever write presents. A `PATCH` naming
+  `runs_per_day` is `400 VALIDATION`, never silently ignored.
 
 ## integration
 
-Served by: not yet — no harness id assigned in `docs/reference/console_fit_plan.md` §3 yet.
+Served by: H14. The box's own inbound webhook — one row, box-wide.
+
+- **Fields:** `webhook_url` (read-only — where a plugin's external answer
+  is posted; the box's inbound webhook address when bound),
+  `webhook_secret_ref`, `gateway_state` (read-only).
+- **States:** none.
+- **Actions:** none — `create`/`remove` declined, the same reason
+  `budget` declines them.
+- **Filterable / orderable:** none / `created_at`.
+- **`search_doc`:** `{title: "Integration", facets: {gateway_state}}`.
+- **Where it differs from the console's prompt:** `webhook_url` and
+  `gateway_state` are computed at read time — `webhook_url` from
+  `gateway.webhook_bind`/`.webhook_port`, `gateway_state` (`"running"` |
+  `"stopped"`) from a non-blocking probe of the same lock file
+  `gateway_daemon.run()` itself takes — never stored, so neither can go
+  stale against what is actually true. `webhook_secret_ref` is validated
+  against the `secret` noun's own existence check, exactly like
+  `provider.credential_ref`. The same synthetic-until-first-write row shape
+  as `budget` applies here too.
 
 ## secret
 
-Served by: not yet — no harness id assigned in `docs/reference/console_fit_plan.md` §3 yet (write-only per §6's credential-value rule, once it lands).
+Served by: H14. Write-only, referenced by name everywhere else in this API.
+
+- **Fields:** `name`, `kind`. Never `value` — on any verb, on any state.
+- **States:** none.
+- **Actions:** none.
+- **Filterable / orderable:** `name` / `created_at`.
+- **`search_doc`:** `{title: name, facets: {kind}}`.
+- **Where it differs from the console's prompt:** the standard grammar is
+  used as-is — `POST /v1/secrets {name, value, kind?}` creates (a real
+  minted id, `name` immutable after), `PATCH /v1/secrets/{id} {value?,
+  kind?}` rotates the value and/or `kind`. Not the shape a first sketch of
+  this noun proposed (`PUT /v1/secrets/{name}`), which has no counterpart
+  in this door's actual six-verb, id-addressed grammar and would have
+  reopened that shared framework for one noun. `list`/`get` add a
+  `fingerprint` (last four characters of the value, a middle dot, the
+  first eight hex characters of its SHA-256) computed live from
+  `state_dir/.env` on every call — never stored, never stale. `remove`
+  hard-deletes the row and the `.env` line; the tombstone this project's
+  own removal pattern leaves is the ledger's own permanent `deleted` row,
+  not a lingering `state` kept here. A name a `credential_ref`/
+  `secret_ref` elsewhere in this API names need never have been created
+  through this noun at all — a real, already-exported environment variable
+  satisfies the reference exactly as well, since the environment always
+  wins.

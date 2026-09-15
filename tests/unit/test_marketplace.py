@@ -3,6 +3,7 @@ functions."""
 
 from __future__ import annotations
 
+import sys
 import threading
 import time
 from pathlib import Path
@@ -187,6 +188,73 @@ def test_submit_a_structurally_invalid_manifest_is_auto_rejected_not_queued(tmp_
     assert isinstance(outcome, marketplace.InvalidManifest)
     assert outcome.plugin_name == "broken"
     assert queue == ()
+
+
+@pytest.mark.unit
+def test_inspect_tag_returns_the_declared_shape_and_revision(tmp_path: Path) -> None:
+    repo = _make_upstream_repo(tmp_path, plugin_name="greeter", tag="v1.0.0")
+
+    outcome = marketplace.inspect_tag(str(repo), "v1.0.0")
+
+    assert isinstance(outcome, marketplace.Inspected)
+    assert outcome.manifest["name"] == "greeter"
+    assert len(outcome.revision) == 40
+
+
+@pytest.mark.unit
+def test_inspect_tag_never_imports_or_executes_the_fetched_repository(tmp_path: Path) -> None:
+    """The one property this function exists for — proven two ways: the
+    sentinel `submit()`'s own equivalent test already uses, and a direct
+    `sys.modules` check, since H24's own spec commits to that stronger
+    proof for the console-facing `inspections` noun built on this."""
+    repo = tmp_path / "upstream"
+    repo.mkdir()
+    _run_git(["init", "-q", "-b", "main"], cwd=repo)
+    _run_git(["config", "user.email", "test@example.com"], cwd=repo)
+    _run_git(["config", "user.name", "Test"], cwd=repo)
+    (repo / "schema").mkdir()
+    (repo / "schema" / "greeter_tool.json").write_text('{"type": "object", "properties": {}}\n')
+    (repo / "plugin.toml").write_text(
+        '[plugin]\nname = "greeter"\nversion = "v1.0.0"\ndescription = "d"\n\n'
+        '[[entry]]\ntool = "greeter_tool"\npurpose = "p"\n'
+        'parameters = "schema/greeter_tool.json"\nstart = "a"\n\n'
+        '[[node]]\nname = "a"\nkind = "compute"\nbody = "init:go"\n'
+    )
+    sentinel = tmp_path / "executed.marker"
+    (repo / "init.py").write_text(f"open({str(sentinel)!r}, 'w').close()\n\n\ndef go(value):\n    return value\n")
+    _run_git(["add", "."], cwd=repo)
+    _run_git(["commit", "-q", "-m", "initial"], cwd=repo)
+    _run_git(["tag", "v1.0.0"], cwd=repo)
+
+    outcome = marketplace.inspect_tag(str(repo), "v1.0.0")
+
+    assert isinstance(outcome, marketplace.Inspected)
+    assert not sentinel.exists()
+    assert "init" not in sys.modules
+
+
+@pytest.mark.unit
+def test_inspect_tag_a_structurally_invalid_manifest_still_reports_its_shape(tmp_path: Path) -> None:
+    """Unlike `submit()`, which only records this for a reviewer,
+    `inspect_tag()` hands the shape straight back — the console's own
+    `inspections` noun renders it even for a `state: failed` row."""
+    repo = _make_broken_upstream_repo(tmp_path, plugin_name="broken", tag="v1.0.0")
+
+    outcome = marketplace.inspect_tag(str(repo), "v1.0.0")
+
+    assert isinstance(outcome, marketplace.InvalidManifest)
+    assert outcome.plugin_name == "broken"
+    assert outcome.manifest is not None
+    assert outcome.manifest["name"] == "broken"
+
+
+@pytest.mark.unit
+def test_inspect_tag_an_unknown_tag_is_fetch_failed(tmp_path: Path) -> None:
+    repo = _make_upstream_repo(tmp_path, plugin_name="greeter", tag="v1.0.0")
+
+    outcome = marketplace.inspect_tag(str(repo), "no-such-tag")
+
+    assert isinstance(outcome, marketplace.plugin_install.FetchFailed)
 
 
 @pytest.mark.unit

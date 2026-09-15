@@ -293,13 +293,17 @@ def consume_iteration(budget: IterationBudget) -> IterationBudget | None:
 
 
 def iteration_budget_from_config() -> IterationBudget:
-    """Reads ``SADANA_CONVERSATION_MAX_ITERATIONS`` (default 60, matching
-    `docs/reference/conversation_block_blueprint.md` §5.7). Raises
-    ``ValueError`` for a negative configured value rather than building a
-    budget nobody could ever consume from."""
-    max_total = config.env_int("SADANA_CONVERSATION_MAX_ITERATIONS", 60)
+    """Reads ``conversation.iteration_max`` (default 60, matching
+    `docs/reference/conversation_block_blueprint.md` §5.7;
+    ``SADANA_CONVERSATION_MAX_ITERATIONS`` still overrides it, H14 —
+    passed explicitly as ``config.get``'s ``env_name``, since that legacy
+    name's word order ("max iterations") doesn't match the dotted key's
+    ("iteration max") closely enough for ``config.get``'s own derived-name
+    convention to find it). Raises ``ValueError`` for a negative configured
+    value rather than building a budget nobody could ever consume from."""
+    max_total = config.get("conversation.iteration_max", 60, env_name="SADANA_CONVERSATION_MAX_ITERATIONS")
     if max_total < 0:
-        raise ValueError(f"SADANA_CONVERSATION_MAX_ITERATIONS={max_total} must not be negative")
+        raise ValueError(f"conversation.iteration_max={max_total} must not be negative")
     return IterationBudget(max_total=max_total)
 
 
@@ -326,15 +330,18 @@ def wall_clock_remaining(budget: WallClockBudget, now: float) -> float:
 
 
 def wall_clock_budget_from_config(now: float) -> WallClockBudget | None:
-    """Reads ``SADANA_CONVERSATION_RUN_BUDGET_SECONDS`` (default 0,
-    translating `docs/reference/conversation_block_blueprint.md` §5.7's
-    ``run_budget_seconds: null``). Returns ``None`` when unset or 0 — a
-    0-second budget is not a coherent allotment, so it is free to mean
-    "disabled" without a new ``config.py`` primitive. Raises ``ValueError``
-    for a negative value, matching ``iteration_budget_from_config``."""
-    seconds = config.env_int("SADANA_CONVERSATION_RUN_BUDGET_SECONDS", 0)
+    """Reads ``conversation.wall_clock_s`` (default 0, translating
+    `docs/reference/conversation_block_blueprint.md` §5.7's
+    ``run_budget_seconds: null``; ``SADANA_CONVERSATION_RUN_BUDGET_SECONDS``
+    still overrides it, H14 — passed explicitly as ``config.get``'s
+    ``env_name``, the same reason ``iteration_budget_from_config`` needs
+    one). Returns ``None`` when unset or 0 — a 0-second budget is not a
+    coherent allotment, so it is free to mean "disabled" without a new
+    ``config.py`` primitive. Raises ``ValueError`` for a negative value,
+    matching ``iteration_budget_from_config``."""
+    seconds = config.get("conversation.wall_clock_s", 0, env_name="SADANA_CONVERSATION_RUN_BUDGET_SECONDS")
     if seconds < 0:
-        raise ValueError(f"SADANA_CONVERSATION_RUN_BUDGET_SECONDS={seconds} must not be negative")
+        raise ValueError(f"conversation.wall_clock_s={seconds} must not be negative")
     if seconds == 0:
         return None
     return WallClockBudget(deadline=now + seconds)
@@ -1328,14 +1335,14 @@ def child_iteration_budget_from_config() -> IterationBudget:
 
 
 def child_max_depth_from_config() -> int:
-    """Reads ``SADANA_CONVERSATION_CHILD_MAX_DEPTH`` (default 2, matching
-    blueprint §5.7). Unlike the iteration budget, this is a real ceiling
-    with no per-spawn override: depth bounds recursive spawning across
-    many children, a scenario no self-exhausting budget catches on its
-    own."""
-    max_depth = config.env_int("SADANA_CONVERSATION_CHILD_MAX_DEPTH", 2)
+    """Reads ``conversation.child_max_depth`` (default 2, matching
+    blueprint §5.7; ``SADANA_CONVERSATION_CHILD_MAX_DEPTH`` still overrides
+    it, H14). Unlike the iteration budget, this is a real ceiling with no
+    per-spawn override: depth bounds recursive spawning across many
+    children, a scenario no self-exhausting budget catches on its own."""
+    max_depth = config.get("conversation.child_max_depth", 2)
     if max_depth < 0:
-        raise ValueError(f"SADANA_CONVERSATION_CHILD_MAX_DEPTH={max_depth} must not be negative")
+        raise ValueError(f"conversation.child_max_depth={max_depth} must not be negative")
     return max_depth
 
 

@@ -24,7 +24,6 @@ plain, conforming ``data: {...}`` / ``data: [DONE]`` sequence, so a bare
 from __future__ import annotations
 
 import json
-import os
 import urllib.error
 import urllib.request
 from collections.abc import Iterable
@@ -33,14 +32,24 @@ from typing import Any
 from sadana import config
 from sadana.model_access import OnDelta, ProviderManifest, Request, register_provider
 
+#: The built-in default — `ProviderManifest`'s own static identity, and the
+#: fallback `chat_completions_url()` uses when nothing has overridden it.
 BASE_URL = "https://openrouter.ai/api/v1"
-CHAT_COMPLETIONS_URL = f"{BASE_URL}/chat/completions"
+
+
+def chat_completions_url() -> str:
+    """Read at the moment of use (H14, `docs/tasks/
+    H14-tuned-config-settings-secrets/spec.md`): `providers.openrouter.
+    base_url` in `config.toml`, or `BASE_URL` if nothing overrides it — a
+    change through the door takes effect on the next call, no restart."""
+    return f"{config.get('providers.openrouter.base_url', BASE_URL)}/chat/completions"
 
 
 def _build_request(request: Request, *, stream: bool) -> tuple[dict[str, Any], dict[str, str], float]:
     """The body/headers/timeout `request_fn` and `stream_fn` both need —
     identical but for `stream: true`, so it is built once."""
-    api_key = os.environ.get("OPENROUTER_API_KEY", "")
+    credential_ref = config.get("providers.openrouter.credential_ref", "OPENROUTER_API_KEY")
+    api_key = config.secret(credential_ref) or ""
     body: dict[str, Any] = {"model": request.model, "messages": list(request.messages)}
     if stream:
         body["stream"] = True
@@ -50,7 +59,7 @@ def _build_request(request: Request, *, stream: bool) -> tuple[dict[str, Any], d
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
     }
-    timeout_s = config.env_int("SADANA_MODEL_ACCESS_TIMEOUT_S", 30)
+    timeout_s = config.get("model_access.timeout_s", 30)
     return body, headers, timeout_s
 
 
@@ -82,7 +91,7 @@ def _post(url: str, headers: dict[str, str], body: dict[str, Any], timeout: floa
 
 def request_fn(request: Request) -> tuple[int | None, dict]:
     body, headers, timeout_s = _build_request(request, stream=False)
-    return _post(CHAT_COMPLETIONS_URL, headers, body, timeout_s)
+    return _post(chat_completions_url(), headers, body, timeout_s)
 
 
 def _accumulate_tool_call(tool_calls: dict[int, dict], tc_delta: dict) -> None:
@@ -144,7 +153,7 @@ def parse_stream(lines: Iterable[bytes], on_delta: OnDelta) -> dict:
 
 def stream_fn(request: Request, on_delta: OnDelta) -> tuple[int | None, dict]:
     body, headers, timeout_s = _build_request(request, stream=True)
-    req = urllib.request.Request(CHAT_COMPLETIONS_URL, data=json.dumps(body).encode(), headers=headers, method="POST")
+    req = urllib.request.Request(chat_completions_url(), data=json.dumps(body).encode(), headers=headers, method="POST")
     try:
         with urllib.request.urlopen(req, timeout=timeout_s) as resp:
             return 200, parse_stream(resp, on_delta)

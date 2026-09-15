@@ -206,7 +206,7 @@ def test_a_value_stored_by_plugin_set_is_what_read_setting_finds_after_load_dote
 
     config.load_dotenv()
 
-    assert plugins.read_setting("weather", "api_key") == "stored-value"
+    assert plugins.read_setting("weather", "api_key", secret=True) == "stored-value"
 
 
 @pytest.mark.unit
@@ -284,7 +284,10 @@ def test_plugin_set_prompts_without_echo_for_a_secret(tmp_path: Path, monkeypatc
     monkeypatch.setattr("getpass.getpass", lambda _prompt: "typed-in-the-dark")
 
     assert cmd_plugin_set(argparse.Namespace(name="weather", setting="api_key", value=None)) == 0
-    assert plugins.read_setting("weather", "api_key") is None  # not exported, only written
+    # H14: config.secret() reads a rewritten .env fresh, with no restart —
+    # the typed value is visible on the very next read, unlike the old
+    # os.environ-only read this test used to pin.
+    assert plugins.read_setting("weather", "api_key", secret=True) == "typed-in-the-dark"
     assignment = 'SADANA_PLUGIN__WEATHER__API_KEY="typed-in-the-dark"'  # pragma: allowlist secret
     assert assignment in env_path().read_text(encoding="utf-8")
 

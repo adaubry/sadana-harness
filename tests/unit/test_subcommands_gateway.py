@@ -13,7 +13,7 @@ import threading
 
 import pytest
 
-from sadana import gateway_daemon, scheduling
+from sadana import channel_webhook, gateway_daemon, scheduling
 from sadana.subcommands.gateway import (
     build_gateway_parser,
     cmd_gateway_install,
@@ -45,6 +45,44 @@ def test_cmd_gateway_run_refuses_to_start_when_secret_is_unset(
 
     assert result == 1
     assert "SADANA_GATEWAY_WEBHOOK_SECRET" in capsys.readouterr().err
+
+
+@pytest.mark.unit
+def test_cmd_gateway_run_follows_a_configured_webhook_secret_ref(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """H14 Deploy-stage finding: `integrations.update`'s `webhook_secret_ref`
+    was write-and-validate only — nothing read it, so the door's own
+    setting had no effect on the running gateway. `cmd_gateway_run` must
+    resolve `gateway.webhook_secret_ref` and follow it, not the fixed
+    legacy env-var name, once one has been configured."""
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    config_dir = tmp_path / "config" / "sadana"
+    config_dir.mkdir(parents=True)
+    (config_dir / "config.toml").write_text(
+        '[gateway]\nwebhook_secret_ref = "my_named_secret"\n',  # pragma: allowlist secret
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("my_named_secret", "the-real-value")  # pragma: allowlist secret
+    monkeypatch.delenv("SADANA_GATEWAY_WEBHOOK_SECRET", raising=False)
+
+    seen: dict[str, object] = {}
+
+    def _fake_make_server(host: str, port: int, *, secret: str, on_message: object) -> object:
+        seen["secret"] = secret
+        return object()
+
+    monkeypatch.setattr(channel_webhook, "make_server", _fake_make_server)
+
+    def _fake_run(*, make_server: object, lock_filename: str) -> int:
+        make_server()  # type: ignore[operator]
+        return 0
+
+    monkeypatch.setattr(gateway_daemon, "run", _fake_run)
+    monkeypatch.setattr(scheduling, "run_tick_loop", lambda **_kwargs: None)
+
+    result = cmd_gateway_run(argparse.Namespace(host=None, port=None))
+
+    assert result == 0
+    assert seen["secret"] == "the-real-value"  # pragma: allowlist secret
 
 
 @pytest.mark.unit

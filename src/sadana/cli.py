@@ -11,9 +11,11 @@ to `main()` itself.
 from __future__ import annotations
 
 import argparse
+import logging
 import sys
 
-from sadana import __version__, builtin_seed, config, plugins
+from sadana import __version__, builtin_seed, config, env_file, plugins
+from sadana.redact import SecretRedactor
 from sadana.subcommands.chat import build_chat_parser
 from sadana.subcommands.conversations import build_conversations_parser
 from sadana.subcommands.door import build_door_parser
@@ -48,6 +50,12 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # Before anything else can log or read a secret: the redaction filter
+    # protects every line any of this prints, and the secret reader is what
+    # `config.secret()` falls back to once `load_dotenv()` stops mutating
+    # `os.environ` (H14).
+    logging.getLogger().addFilter(SecretRedactor())
+    config.bind_secret_reader(env_file.read_key)
     # The state-dir .env that `sadana setup` writes: loaded before any
     # subcommand reads config, never overriding a live env var.
     config.load_dotenv()

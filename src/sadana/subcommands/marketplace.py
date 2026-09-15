@@ -155,7 +155,7 @@ def _report_decide_outcome(outcome: marketplace.DecideOutcome) -> int:
 def cmd_marketplace_serve_webhook(args: argparse.Namespace) -> int:
     host = args.host or config.env("SADANA_MARKETPLACE_HOST", "127.0.0.1")
     port = args.port or config.env_int("SADANA_MARKETPLACE_PORT", 8766)
-    secret = config.env("SADANA_MARKETPLACE_WEBHOOK_SECRET", "")
+    secret = config.secret("SADANA_MARKETPLACE_WEBHOOK_SECRET") or ""
     if not secret:
         print("SADANA_MARKETPLACE_WEBHOOK_SECRET is not set; refusing to start", file=sys.stderr)
         return 1

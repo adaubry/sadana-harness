@@ -184,10 +184,20 @@ and `wait` in particular is not an error state — it is the pause that lets
 anything waiting on a person be addressable rather than a blocking prompt.
 
 **A credential's value never travels with the thing that uses it.** The
-value lives on the box, written through a write-only secrets endpoint.
-Anywhere a plugin, a workflow or a config refers to a credential, it carries
-a `credential_ref` that must name an existing secret; a literal value in
-that position is a validation failure, not a convenience.
+value lives on the box, in `state_dir/.env` at `0600`, write-only (H14,
+`docs/tasks/H14-tuned-config-settings-secrets/spec.md`) — `POST
+/v1/secrets {name, value, kind?}` creates it and `PATCH /v1/secrets/{id}
+{value?}` rotates it, the door's own standard verbs, keyed by the secret's
+own minted id like every other noun. `list`/`get` answer a fingerprint —
+the last four characters of the value, a middle dot, the first eight hex
+characters of its SHA-256 — computed live on every call, never stored,
+never the value itself. Anywhere a plugin, a workflow or a config refers to
+a credential, it carries a `credential_ref` (or `secret_ref`) that names
+the secret by its own `name` field, never by the id `POST` minted for it —
+a real, already-exported environment variable satisfies that reference
+exactly as well as one written to `.env` through this noun, since the
+environment always wins; a literal value in that position is a validation
+failure, not a convenience.
 
 **The harness `exit_reason` vocabulary is eight values, and the console's is
 five.** The harness reports `completed`, `budget_exhausted`,

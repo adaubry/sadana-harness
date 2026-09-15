@@ -49,7 +49,7 @@ CREATE TABLE IF NOT EXISTS plugin_registry (
 -- H16 requirement 9: one row per directory holding a `plugin.toml`, so the
 -- inventory can be enumerated without walking the plugins root (P3).
 --
--- Listed the way `editor_server._list_plugins` lists — including a plugin that
+-- Listed the way `editor_server.list_plugins` lists — including a plugin that
 -- does not validate, which gets `state = 'error'`. `discover_plugins()` is
 -- deliberately not the source: it returns only what fully validates, which is
 -- right for deciding what an agent may call and exactly wrong for an index
@@ -341,6 +341,54 @@ def fetch_verified_tag(repo_url: str, tag: str, dest: Path) -> FetchedTag | TagM
         return FetchFailed(detail=str(exc))
 
 
+def _place_atomically(target: Path, source: Path, tmp: Path) -> FetchFailed | None:
+    """Atomically replace `target` with `source` (both already resolved,
+    `source` sitting inside `tmp`'s own `TemporaryDirectory`), rolling back
+    to whatever was at `target` before on any `OSError` mid-swap.
+
+    Shared by `install()` and `install_from_git()` — one placement sequence,
+    regardless of how the plugin's name was decided (H24:
+    `docs/tasks/H24-door-nouns-plugins-layout-install-inspect/spec.md`)."""
+    backup = tmp / "previous-plugin"
+    replaced_existing = target.exists()
+    moved_existing_aside = False
+    try:
+        if replaced_existing:
+            os.replace(target, backup)
+            moved_existing_aside = True
+        os.replace(source, target)
+    except OSError as exc:
+        if moved_existing_aside:
+            if target.exists():
+                shutil.rmtree(target, ignore_errors=True)
+            os.replace(backup, target)
+        return FetchFailed(detail=f"could not place plugin: {exc}")
+    return None
+
+
+def _fetch_and_verify_name(
+    repo_url: str, tag: str, dest: Path, *, expect_name: str | None
+) -> tuple[FetchedTag, plugins.Manifest] | NameMismatch | TagMismatch | FetchFailed:
+    """`fetch_verified_tag()`, then parse the fetched manifest and —
+    when `expect_name` is given — confirm it declares that name. The one
+    fetch-then-parse-then-check sequence `install()` and `install_from_git()`
+    both run, byte for byte; they differ only in *when* the expected name is
+    known (before the fetch for `install()`, only after it for
+    `install_from_git()`), which is why this takes it as a parameter rather
+    than assuming either caller's own ordering."""
+    fetched = fetch_verified_tag(repo_url, tag, dest)
+    if isinstance(fetched, TagMismatch | FetchFailed):
+        return fetched
+    manifest_path = fetched.directory / "plugin.toml"
+    try:
+        manifest = plugins._parse_manifest(manifest_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        return FetchFailed(detail=f"plugin.toml is invalid: {exc}")
+    if expect_name is not None and manifest.name != expect_name:
+        return NameMismatch(expected=expect_name, found=manifest.name)
+    return fetched, manifest
+
+
 def install(
     conn: sqlite3.Connection,
     name: str,
@@ -373,35 +421,88 @@ def install(
     plugins_root.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix=".install-", dir=plugins_root) as tmp:
         tmp_clone = Path(tmp) / "plugin"
-        fetched = fetch_verified_tag(repo_url, tag, tmp_clone)
-        if isinstance(fetched, TagMismatch | FetchFailed):
-            return fetched
+        outcome = _fetch_and_verify_name(repo_url, tag, tmp_clone, expect_name=name)
+        if isinstance(outcome, NameMismatch | TagMismatch | FetchFailed):
+            return outcome
+        fetched, _manifest = outcome
 
-        manifest_path = fetched.directory / "plugin.toml"
-        try:
-            manifest = plugins._parse_manifest(manifest_path.read_text(encoding="utf-8"))
-        except Exception as exc:
-            return FetchFailed(detail=f"plugin.toml is invalid: {exc}")
-        if manifest.name != name:
-            return NameMismatch(expected=name, found=manifest.name)
-
-        backup = Path(tmp) / "previous-plugin"
-        replaced_existing = target.exists()
-        moved_existing_aside = False
-        try:
-            if replaced_existing:
-                os.replace(target, backup)
-                moved_existing_aside = True
-            os.replace(fetched.directory, target)
-        except OSError as exc:
-            if moved_existing_aside:
-                if target.exists():
-                    shutil.rmtree(target, ignore_errors=True)
-                os.replace(backup, target)
-            return FetchFailed(detail=f"could not place plugin: {exc}")
+        error = _place_atomically(target, fetched.directory, Path(tmp))
+        if error is not None:
+            return error
 
     _record_installed(conn, name, repo_url=repo_url, tag=tag)
     return Installed(name=name, directory=target, revision=fetched.revision)
+
+
+def install_from_git(
+    conn: sqlite3.Connection,
+    repo_url: str,
+    tag: str,
+    *,
+    plugins_root: Path,
+    expect_name: str | None = None,
+    replace: bool = False,
+) -> InstallOutcome:
+    """Like `install()`, but the plugin's name comes from the fetched
+    manifest, not a pre-registered one — the console's own `create`/
+    `install-from-git`, which reaches this module with only a repository and
+    a tag, never a name
+    (`docs/tasks/H24-door-nouns-plugins-layout-install-inspect/spec.md`).
+
+    `expect_name`, when given, refuses a `NameMismatch` the same way
+    `install()`'s own `name` argument already does — the `act()`-path
+    re-install case, where an already-registered plugin's identity must not
+    silently change out from under its own id.
+
+    Shares `fetch_verified_tag()`, `is_valid_tag_syntax()`,
+    `_fetch_and_verify_name()` and `_place_atomically()`/`_record_installed()`
+    with `install()` — no second `git` invocation anywhere in this module.
+    Unlike `install()`, the plugin's name — and therefore whether it is a
+    safe path and whether it is already installed — can only be checked
+    *after* the fetch, since nothing is known about it before then."""
+    _ensure_schema(conn)  # unlike install(), never reaches resolve(), which does this implicitly
+    if not is_valid_tag_syntax(tag):
+        return FetchFailed(detail=f"{tag!r} is not a valid tag name")
+
+    plugins_root.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix=".install-", dir=plugins_root) as tmp:
+        tmp_clone = Path(tmp) / "plugin"
+        outcome = _fetch_and_verify_name(repo_url, tag, tmp_clone, expect_name=expect_name)
+        if isinstance(outcome, NameMismatch | TagMismatch | FetchFailed):
+            return outcome
+        fetched, manifest = outcome
+
+        target = plugins.plugin_dir(plugins_root, manifest.name)
+        if target is None:
+            return InvalidName(name=manifest.name)
+        if target.exists() and not replace:
+            return AlreadyInstalled(name=manifest.name)
+
+        error = _place_atomically(target, fetched.directory, Path(tmp))
+        if error is not None:
+            return error
+
+    _record_installed(conn, manifest.name, repo_url=repo_url, tag=tag)
+    return Installed(name=manifest.name, directory=target, revision=fetched.revision)
+
+
+def set_state(conn: sqlite3.Connection, id: str, to_state: str, *, now: float) -> None:
+    """Writes `plugin_state.state` for one row, found by `id` — `disable`/
+    `enable`'s one write (H24). Mirrors
+    `conversation_store.set_schedule_state`'s shape: read the current
+    version inside the write transaction, bump it, record the change.
+    A silent no-op if `id` names no row — the door's own `act()` already
+    checked the row exists before calling this."""
+    with write_txn(conn) as c:
+        row = c.execute("SELECT version FROM plugin_state WHERE id = ?", (id,)).fetchone()
+        if row is None:
+            return
+        new_version = row["version"] + 1
+        c.execute(
+            "UPDATE plugin_state SET state = ?, updated_at = ?, version = ? WHERE id = ?",
+            (to_state, now, new_version, id),
+        )
+        ledger.record_change(c, noun="plugins", id=id, kind="changed", state=to_state, version=new_version, at=now)
 
 
 def _record_installed(conn: sqlite3.Connection, name: str, *, repo_url: str, tag: str) -> None:
@@ -445,7 +546,7 @@ def reconcile_plugin_state(conn: sqlite3.Connection, plugins_root: Path) -> None
 
     Every directory holding a `plugin.toml` gets a row, whether or not it
     validates — a broken plugin is one the console most needs to show, and
-    hiding it is what `editor_server._list_plugins` already declined to do.
+    hiding it is what `editor_server.list_plugins` already declined to do.
     `state` is `'installed'` when it validates and `'error'` when it does not.
 
     A row already marked `'disabled'` keeps that word. Only `'installed'` and
@@ -453,7 +554,7 @@ def reconcile_plugin_state(conn: sqlite3.Connection, plugins_root: Path) -> None
     about the files, but whether it is *switched off* is a decision somebody
     made, and a reconciliation must not overrule a decision with an
     observation. Nothing writes `'disabled'` yet — H24 adds that verb, and
-    `client_surface._enabled_plugin_set` already honours it, over
+    `client_surface.enabled_plugin_set` already honours it, over
     `disabled_names()` below.
 
     A row whose directory has gone is announced as `deleted` and removed.
@@ -554,7 +655,7 @@ def _validates(directory: Path) -> bool:
     installed from a git tag is such a source, and an index has no business
     running one.
 
-    `editor_server._assess` reached the same conclusion for the same reason:
+    `editor_server.assess` reached the same conclusion for the same reason:
     listing what is there is a different question from deciding what may run.
 
     Imported inside the function rather than at module scope: `plugin_manifest`

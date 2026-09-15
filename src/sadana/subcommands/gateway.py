@@ -69,11 +69,21 @@ def cmd_gateway_run(args: argparse.Namespace) -> int:
     # `door/router.py`'s error log) is otherwise silently swallowed. A
     # long-running foreground daemon is exactly where that should stop.
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
-    host = args.host or config.env("SADANA_GATEWAY_HOST", "127.0.0.1")
-    port = args.port or config.env_int("SADANA_GATEWAY_PORT", 8765)
-    secret = config.env("SADANA_GATEWAY_WEBHOOK_SECRET", "")
+    # H14: dotted keys, with the legacy env var passed explicitly as
+    # `env_name` — neither `webhook_bind` nor `webhook_port` shares enough
+    # of its old name's word order for `config.get`'s own derived-name
+    # convention to find it on its own.
+    host = args.host or config.get("gateway.webhook_bind", "127.0.0.1", env_name="SADANA_GATEWAY_HOST")
+    port = args.port or config.get("gateway.webhook_port", 8765, env_name="SADANA_GATEWAY_PORT")
+    # H14: `integrations.update`'s own `webhook_secret_ref` field is a name,
+    # never the value — the legacy env var name is this reference's own
+    # default, so a box that has never gone through the door keeps working
+    # unchanged, and setting the reference through the door is what makes
+    # this actually configurable.
+    webhook_secret_ref = config.get("gateway.webhook_secret_ref", "SADANA_GATEWAY_WEBHOOK_SECRET")
+    secret = config.secret(webhook_secret_ref) or ""
     if not secret:
-        print("SADANA_GATEWAY_WEBHOOK_SECRET is not set; refusing to start", file=sys.stderr)
+        print(f"no secret named {webhook_secret_ref!r} is set; refusing to start", file=sys.stderr)
         return 1
 
     # One door, opened once: the provider, the model, the plugin scan, the
@@ -96,7 +106,7 @@ def cmd_gateway_run(args: argparse.Namespace) -> int:
     # own SIGTERM/lock/shutdown sequence (scheduling.run_tick_loop's own
     # docstring: it dies with the process, and this project's "best-effort,
     # no catch-up" posture already accepts an abrupt mid-tick kill).
-    tick_interval = config.env_int("SADANA_SCHEDULING_TICK_SECONDS", 30)
+    tick_interval = config.get("gateway.scheduler_interval_s", 30, env_name="SADANA_SCHEDULING_TICK_SECONDS")
     threading.Thread(
         target=scheduling.run_tick_loop,
         kwargs={"runtime": runtime, "interval_seconds": tick_interval},
