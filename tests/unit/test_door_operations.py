@@ -167,6 +167,67 @@ def test_resume_on_start_fails_every_row_still_running(tmp_path: Path) -> None:
 
 
 @pytest.mark.unit
+def test_ensure_schema_adding_resume_target_version_is_idempotent(tmp_path: Path) -> None:
+    """CLAUDE.md's own rule for a new column on an existing table: a
+    guarded `ALTER TABLE`, safe to run again on a connection that already
+    has it — never a backfill migration that only runs once."""
+    conn = sqlite3.connect(tmp_path / "idempotent.db", isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    ledger.ensure_schema(conn)
+    operations.ensure_schema(conn)
+    operations.ensure_schema(conn)  # must not raise "duplicate column"
+
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(operations)")}
+    assert "resume_target_version" in columns
+
+
+@pytest.mark.unit
+def test_resume_on_start_succeeds_an_upgrade_whose_target_now_matches(tmp_path: Path) -> None:
+    from sadana import __version__
+
+    conns = _conns(tmp_path)
+    op = operations.start_operation(conns, resume_target_version=__version__)
+
+    operations.resume_on_start(conns)
+
+    final = operations.get(conns.writer, op.id)
+    assert final is not None
+    assert final.state == "succeeded"
+    assert final.detail is None
+
+
+@pytest.mark.unit
+def test_resume_on_start_fails_an_upgrade_naming_the_actual_version(tmp_path: Path) -> None:
+    from sadana import __version__
+
+    conns = _conns(tmp_path)
+    op = operations.start_operation(conns, resume_target_version="not-" + __version__)
+
+    operations.resume_on_start(conns)
+
+    final = operations.get(conns.writer, op.id)
+    assert final is not None
+    assert final.state == "failed"
+    assert final.detail == f"restarted on {__version__}"
+
+
+@pytest.mark.unit
+def test_resume_on_start_upgrade_branch_does_not_change_a_plain_rows_own_behaviour(tmp_path: Path) -> None:
+    """The additive branch is keyed on `resume_target_version` alone — a
+    `running` row with none set (every caller before H30) keeps today's
+    unconditional "the process restarted" failure."""
+    conns = _conns(tmp_path)
+    op = operations.start_operation(conns)  # no `resume_target_version`
+
+    operations.resume_on_start(conns)
+
+    final = operations.get(conns.writer, op.id)
+    assert final is not None
+    assert final.state == "failed"
+    assert final.detail == "the process restarted"
+
+
+@pytest.mark.unit
 def test_ledger_record_change_guards_the_operations_prefix(tmp_path: Path) -> None:
     """The direct exercise the plan calls for: H16 reserved `operations`
     with prefix `op` and never wrote to it. A mismatched id must still raise

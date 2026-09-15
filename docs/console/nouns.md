@@ -9,21 +9,42 @@ routing step, never a stub response.
 
 ## harness
 
-Served by: H19. Singleton — `GET /v1/harness`, never a plural collection.
+Served by: H19, H30. Singleton — `GET /v1/harness`, never a plural collection.
 
 - **Fields:** `id`, `version` (`sadana.__version__`), `capabilities`,
-  `tether`, `org`, `ledger_head`, `leaves_the_box`.
-- **States:** none — `harness` carries no `state` field.
-- **Actions:** `upgrade` (declared, capability-gated off until H30);
-  `deregister`, `purge-account` are not declared at all yet (H30 adds both,
-  and mints their capability names inside the console's own frozen
-  contract).
+  `tether` (live: `disconnected`/`connecting`/`connected`, from the
+  tether's own connection state — never a hardcoded value), `connected_at`
+  (present only while connected), `org`, `ledger_head`, `leaves_the_box`.
+- **States:** none — `harness` carries no `state` field, and none of its
+  three actions is state-gated (each declares `from_states=()`).
+- **Actions:**
+  - `upgrade` — scope `harness:upgrade`, capability `upgrade` (declared).
+    Body: `{"version": "<tag>"}`. Validates the tag, promotes a `running`
+    operation naming the target, launches `scripts/upgrade.sh` detached,
+    and returns that operation as a real `202` — the box then checks out
+    the tag, reinstalls, and restarts its own service; `door/operations
+    .resume_on_start` resolves the operation to `succeeded`/`failed` on the
+    next boot by comparing `sadana.__version__` against the recorded
+    target.
+  - `deregister` — scope `harness:deregister`, no capability (not in the
+    closed sixteen — scope-gated only). Stops the tether, deletes the
+    box's local identity and private key, tombstones this noun in the
+    ledger. Every other table is untouched: the data is the customer's.
+  - `purge-account` — scope `harness:purge`, no capability, consequential.
+    Body: `{"account_key": "<key>"}`. Deletes every row `stores
+    .PURGE_STEPS` names for that account (memory, persona selection,
+    schedules, conversation ownership) — never the box's own identity, and
+    never conversation/message content itself, which is not one account's
+    own data.
 - **Filterable / orderable:** neither — there is exactly one `harness` and
   no list endpoint for it.
 - **`search_doc`:** `{"title": "Harness <id>"}` — present for protocol
   uniformity; nothing in H19 ever writes a `harness`-noun ledger row for it
-  to render from.
-- **Where it differs from the console's prompt:** none known yet.
+  to render from (`deregister`'s own tombstone, H30, is the first).
+- **Where it differs from the console's prompt:** the exact `upgrade`/
+  `deregister`/`purge-account` body shapes above are this box's own fix,
+  per `docs/console/wire.md`'s own note that where the console's prompt is
+  silent on a field name, this box's own documentation settles it.
 
 ## operations
 

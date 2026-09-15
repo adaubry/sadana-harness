@@ -71,6 +71,7 @@ WSL only. Python lives in `.venv`; `make` puts it on PATH for you, so there is n
 - A wire-facing `<noun>_id` field that names a noun with no door of its own yet resolves against that other noun's own natural key/name, validated for existence — never a placeholder id scheme invented ahead of the noun that will actually own it.
 - A row on an append-only table may be pre-written as a named placeholder state and finalized exactly once via a conditional upsert guarded by that placeholder state in SQL — never a general-purpose upsert, and never a second finalization.
 - A stoppable loop with work dispatched off the event loop stops only at named loop-boundary checkpoints between iterations, never by cancelling or killing already-dispatched off-loop work.
+- A release tag name is byte-identical to `sadana.__version__` at that commit — the upgrade action's own success check, and `sadana --version`, both depend on the two never diverging.
 
 ## Glossary
 

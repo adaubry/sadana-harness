@@ -44,7 +44,10 @@ _KEY_MAX_AGE_SECONDS = 300.0 + 30.0
 
 @dataclass(frozen=True)
 class BoxIdentity:
-    """This box's own identity, from config until H30 persists enrollment."""
+    """This box's own identity. Built from `tether.identity.load()` once a
+    box has enrolled (H30); a box that has never enrolled builds this from
+    CLI args/config instead — `subcommands/door.py`'s own call site is
+    where that choice is made, not here."""
 
     harness_id: str
     org: str | None
@@ -67,6 +70,13 @@ class JwksSource:
 
     url: str | None = None
     path: Path | None = None
+
+
+def jwks_url(base: str) -> str:
+    """`<base>/.well-known/jwks.json` — one place, so `enroll.py` and
+    `subcommands/gateway.py` (both deriving a console's JWKS URL from a
+    base they already have) build the same string the same way."""
+    return base.rstrip("/") + "/.well-known/jwks.json"
 
 
 class Verifier:
@@ -155,6 +165,30 @@ class Verifier:
 
         return Principal(sub=sub, org=org, ws=ws, hrn=hrn, scope=frozenset(scope))
 
+    def verify_signature_only(self, token: str) -> dict[str, Any] | None:
+        """Verifies `token`'s signature and expiry against this `Verifier`'s
+        JWKS, with none of `verify()`'s claim-shape or box-identity checks.
+        `enroll.py` uses this, not `verify()`: enrollment is what decides
+        this box's own `harness_id`/`org` in the first place, so there is
+        no `BoxIdentity` yet to check the token's `hrn`/`org` against.
+        Returns the verified claims, or `None` for anything that fails to
+        verify — an unparseable token, an unknown `kid`, an unreachable
+        JWKS, or an expired signature are all simply "does not verify"."""
+        try:
+            unverified = jwt.get_unverified_header(token)
+        except jwt.InvalidTokenError:
+            return None
+        kid = unverified.get("kid")
+        if not kid:
+            return None
+        key = self._key_for(kid)
+        if key is None:
+            return None
+        try:
+            return dict(jwt.decode(token, key=key, algorithms=["ES256"], leeway=30))
+        except jwt.InvalidTokenError:
+            return None
+
 
 def require_scope(principal: Principal, scope: str) -> problems.Problem | None:
     if scope not in principal.scope:
@@ -198,6 +232,7 @@ def mint_token(
     scope: Sequence[str],
     ttl: int = 300,
     now: float | None = None,
+    iss: str | None = None,
 ) -> str:
     now = time.time() if now is None else now
     claims: dict[str, Any] = {
@@ -210,4 +245,6 @@ def mint_token(
     }
     if org is not None:
         claims["org"] = org
+    if iss is not None:
+        claims["iss"] = iss
     return jwt.encode(claims, private_pem, algorithm="ES256", headers={"kid": kid})

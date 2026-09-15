@@ -521,7 +521,6 @@ async def take_turn(
             record_turn_started=runtime.recorder.record_turn_started,
             record_plugin_run_started=runtime.recorder.record_plugin_run_started,
             record_node=runtime.recorder.record_node,
-            memory_context=memory_store.DispatchContext(account_key=account, conn=conn),
             persist_pause=persist_pause,
             approve=resolved_approve,
         )

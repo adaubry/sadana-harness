@@ -36,7 +36,7 @@ from contextlib import closing, contextmanager
 from pathlib import Path
 
 from sadana import ledger, marketplace, memory_store, observability, persona_store, plugin_install, plugins
-from sadana.conversation_store import open_store, store_path_from_config
+from sadana.conversation_store import open_store, store_path_from_config, write_txn
 from sadana.door import idempotency as door_idempotency
 from sadana.door import operations as door_operations
 
@@ -156,6 +156,34 @@ class Connections:
             conn.execute("PRAGMA query_only=1")
             self._readers.conn = conn
         return conn
+
+
+#: Every `(table, account_column)` pair for a table that carries an
+#: account's data (H30, `docs/tasks/H30-tether-enroll-frames-lifecycle/
+#: spec.md`, serving P11). Mechanical, not curated:
+#: `tests/unit/test_stores_purge.py` scans `sqlite_master` for every table
+#: with an `account_key` column and fails, by name, the moment one isn't
+#: listed here — the same "a fact about the schema, not a hand-maintained
+#: guess" posture `ledger.py`'s own `_NOUNS` table takes.
+PURGE_STEPS: tuple[tuple[str, str], ...] = (
+    ("memory_entries", "account_key"),
+    ("memory_rubric_overrides", "account_key"),
+    ("persona_selections", "account_key"),
+    ("schedules", "account_key"),
+    ("conversation_accounts", "account_key"),
+)
+
+
+def purge_account(conns: Connections, account_key: str) -> None:
+    """Deletes every row `PURGE_STEPS` names for `account_key`, inside one
+    transaction — either every table loses its rows for this account, or
+    none do. `conversation_accounts` losing its row only forgets who
+    *owns* a conversation; the conversation and its messages are not an
+    account's own data and are untouched, the same "the data is the
+    customer's" posture `harness.deregister` takes."""
+    with write_txn(conns.writer) as c:
+        for table, column in PURGE_STEPS:
+            c.execute(f"DELETE FROM {table} WHERE {column} = ?", (account_key,))  # noqa: S608 -- table/column are this module's own closed tuple, never caller input
 
 
 # ponytail: a plain dict, never evicted. One `threading.Lock` is about 64 bytes,

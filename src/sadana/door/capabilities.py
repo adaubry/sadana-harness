@@ -50,6 +50,16 @@ DECLARED: tuple[str, ...] = (
     "streaming",
     "runs.live",
     "runs.stop",
+    # H24's own three, added here because H24 had not landed on a shared
+    # branch when this chain reached this file (docs/tasks/
+    # H30-tether-enroll-frames-lifecycle/review.md § Findings) — H24's own
+    # agent rebases onto this rather than re-adding them.
+    "plugins.install",
+    "plugins.inspect",
+    "plugins.write",
+    # H30 (docs/tasks/H30-tether-enroll-frames-lifecycle/spec.md): the
+    # remote upgrade action.
+    "upgrade",
 )
 
 _unknown = [name for name in DECLARED if name not in ALL]

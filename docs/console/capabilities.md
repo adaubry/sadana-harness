@@ -12,22 +12,29 @@ but not yet declared by any shipped work item.
 | `grammar.v1` | the door itself answers requests at all | 0.0.1 (H19) | not gated by a console prompt; declared for completeness |
 | `changes` | `GET /v1/changes` | 0.0.1 (H19) | not gated by a console prompt; declared for completeness |
 | `inventory` | `GET /v1/inventory` | 0.0.1 (H19) | not gated by a console prompt; declared for completeness |
-| `artifacts.download` | downloading a stored artifact's bytes | — | not gated by a console prompt; declared for completeness |
-| `plugins.install` | installing a plugin from a git source | — | not gated by a console prompt; declared for completeness |
-| `plugins.inspect` | reading a plugin's own layout/manifest | — | not gated by a console prompt; declared for completeness |
-| `plugins.write` | editing and saving a plugin | — | A24 |
-| `schedules.write` | creating/editing a cron schedule | — | A18 |
-| `approvals.wait` | a paused `call` node becoming an addressable, resumable resource | — | not gated by a console prompt; declared for completeness |
-| `approvals.call` | resolving a pending approval | — | not gated by a console prompt; declared for completeness |
-| `streaming` | live event/frame delivery over the tether | — | not gated by a console prompt; declared for completeness |
-| `runs.live` | watching a run's progress as it happens | — | not gated by a console prompt; declared for completeness |
-| `runs.stop` | interrupting a run mid-flight | — | A15 |
-| `settings.write` | changing box configuration through the door | — | not gated by a console prompt; declared for completeness |
-| `secrets.write` | `PUT /v1/secrets/{name}` (write-only) | — | not gated by a console prompt; declared for completeness |
-| `upgrade` | `POST /v1/harness/actions/upgrade` | — | not gated by a console prompt; declared for completeness |
+| `artifacts.download` | downloading a stored artifact's bytes | 0.0.1 (H20) | not gated by a console prompt; declared for completeness |
+| `plugins.install` | installing a plugin from a git source | 0.0.1 (H24) | not gated by a console prompt; declared for completeness |
+| `plugins.inspect` | reading a plugin's own layout/manifest | 0.0.1 (H24) | not gated by a console prompt; declared for completeness |
+| `plugins.write` | editing and saving a plugin | 0.0.1 (H24) | A24 |
+| `schedules.write` | creating/editing a cron schedule | 0.0.1 (H27) | A18 |
+| `approvals.wait` | a paused `call` node becoming an addressable, resumable resource | 0.0.1 (H18) | not gated by a console prompt; declared for completeness |
+| `approvals.call` | resolving a pending approval | 0.0.1 (H18) | not gated by a console prompt; declared for completeness |
+| `streaming` | live event/frame delivery over the tether | 0.0.1 (H21) | not gated by a console prompt; declared for completeness |
+| `runs.live` | watching a run's progress as it happens | 0.0.1 (H21) | not gated by a console prompt; declared for completeness |
+| `runs.stop` | interrupting a run mid-flight | 0.0.1 (H21) | A15 |
+| `settings.write` | changing box configuration through the door | — (H14, not yet landed) | not gated by a console prompt; declared for completeness |
+| `secrets.write` | `PUT /v1/secrets/{name}` (write-only) | — (H14, not yet landed) | not gated by a console prompt; declared for completeness |
+| `upgrade` | `POST /v1/harness/actions/upgrade` | 0.0.1 (H30) | not gated by a console prompt; declared for completeness |
 
-`grammar.v1`/`changes`/`inventory` are the only three this box declares as
-of H19; `harness`'s own `upgrade` action is already declared in its
-`NounSpec` (so a request names a real action) but the capability itself
-stays off until H30, which is what makes the action correctly answer `501`
-today rather than doing anything.
+`grammar.v1`/`changes`/`inventory` are the only three H19 itself declared;
+every other row above landed with the work item named in "landed in" —
+`harness`'s own `upgrade` action was declared in its `NounSpec` from H19
+onward (so a request has always named a real action) but the capability
+itself stayed off, correctly answering `501`, until H30 turned it on.
+
+The three `plugins.*` rows landed here, in H30's own commit, rather than
+in H24's: H24 had not merged onto a shared branch when this table was
+filled in (`docs/tasks/H30-tether-enroll-frames-lifecycle/review.md` §
+Findings has the full account). `declared()` reports fourteen of these
+sixteen names as of this table — every one but `settings.write`/
+`secrets.write`, which land with H14.
