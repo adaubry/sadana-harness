@@ -258,10 +258,14 @@ def _git(*args: str, cwd: Path | None = None) -> str:
     return result.stdout
 
 
-def _is_valid_tag_syntax(tag: str) -> bool:
+def is_valid_tag_syntax(tag: str) -> bool:
     """A bare 40-char commit SHA is not a released version (Requirement
     3); everything else must be a syntactically valid ref name. Reuses
-    `git check-ref-format` rather than hand-rolling the same rules."""
+    `git check-ref-format` rather than hand-rolling the same rules.
+
+    Public (H30): `door/nouns/harness.py`'s `upgrade` action validates a
+    console-supplied tag with this same check before ever shelling out to
+    `scripts/upgrade.sh` — one tag-syntax rule, not a second copy of it."""
     if _SHA_RE.fullmatch(tag):
         return False
     try:
@@ -397,7 +401,7 @@ def install(
     really that tag, and place it at `plugins_root / name` — atomically,
     and only once every check above held. See spec.md's Design section
     for the full, numbered walk-through this function implements."""
-    if not _is_valid_tag_syntax(tag):
+    if not is_valid_tag_syntax(tag):
         return FetchFailed(detail=f"{tag!r} is not a valid tag name")
 
     # Before the name is allowed to become a path at all. `plugins_root / name`
@@ -450,14 +454,14 @@ def install_from_git(
     re-install case, where an already-registered plugin's identity must not
     silently change out from under its own id.
 
-    Shares `fetch_verified_tag()`, `_is_valid_tag_syntax()`,
+    Shares `fetch_verified_tag()`, `is_valid_tag_syntax()`,
     `_fetch_and_verify_name()` and `_place_atomically()`/`_record_installed()`
     with `install()` — no second `git` invocation anywhere in this module.
     Unlike `install()`, the plugin's name — and therefore whether it is a
     safe path and whether it is already installed — can only be checked
     *after* the fetch, since nothing is known about it before then."""
     _ensure_schema(conn)  # unlike install(), never reaches resolve(), which does this implicitly
-    if not _is_valid_tag_syntax(tag):
+    if not is_valid_tag_syntax(tag):
         return FetchFailed(detail=f"{tag!r} is not a valid tag name")
 
     plugins_root.mkdir(parents=True, exist_ok=True)

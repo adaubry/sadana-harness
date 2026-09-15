@@ -28,7 +28,7 @@ from concurrent.futures import TimeoutError as FutureTimeoutError
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from sadana import config, ids, ledger
+from sadana import __version__, config, ids, ledger
 from sadana.conversation_store import write_txn
 from sadana.door import grammar, problems
 
@@ -52,6 +52,14 @@ CREATE TABLE IF NOT EXISTS operations (
 
 def ensure_schema(conn: sqlite3.Connection) -> None:
     conn.executescript(_SCHEMA)
+    # H30: idempotent column add, never a backfill migration (CLAUDE.md's
+    # own rule) — a legacy row with no target simply isn't an upgrade,
+    # which is exactly what NULL already means here. A real column, not a
+    # second shape inside `detail_json`: that column stays the single
+    # `{"detail": str}` shape every caller has always given it.
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(operations)")}
+    if "resume_target_version" not in columns:
+        conn.execute("ALTER TABLE operations ADD COLUMN resume_target_version TEXT")
 
 
 @dataclass(frozen=True)
@@ -65,6 +73,10 @@ class Operation:
     created_at: float
     updated_at: float
     version: int
+    #: Set only by `harness.upgrade` (H30); `resume_on_start` is the one
+    #: reader. Never rendered by `to_wire()` — internal bookkeeping, not a
+    #: console-facing fact about the operation.
+    resume_target_version: str | None = None
 
     def to_wire(self) -> dict[str, object]:
         resource = {"noun": self.resource_noun, "id": self.resource_id} if self.resource_noun else None
@@ -90,6 +102,7 @@ def _row_to_operation(row: sqlite3.Row) -> Operation:
         created_at=row["created_at"],
         updated_at=row["updated_at"],
         version=row["version"],
+        resume_target_version=row["resume_target_version"],
     )
 
 
@@ -98,16 +111,19 @@ def get(conn: sqlite3.Connection, id: str) -> Operation | None:
     return _row_to_operation(row) if row is not None else None
 
 
-def _promote(conns: Connections, *, resource: tuple[str, str] | None) -> Operation:
+def _promote(
+    conns: Connections, *, resource: tuple[str, str] | None, resume_target_version: str | None = None
+) -> Operation:
     op_id = ids.make_id("op")
     now = time.time()
     resource_noun, resource_id = resource if resource is not None else (None, None)
     with write_txn(conns.writer) as c:
         c.execute(
             "INSERT INTO operations "
-            "(id, state, resource_noun, resource_id, error_json, detail_json, created_at, updated_at, version) "
-            "VALUES (?, 'running', ?, ?, NULL, NULL, ?, ?, 1)",
-            (op_id, resource_noun, resource_id, now, now),
+            "(id, state, resource_noun, resource_id, error_json, detail_json, resume_target_version, "
+            "created_at, updated_at, version) "
+            "VALUES (?, 'running', ?, ?, NULL, NULL, ?, ?, ?, 1)",
+            (op_id, resource_noun, resource_id, resume_target_version, now, now),
         )
         ledger.record_change(c, noun="operations", id=op_id, kind="created", state="running", version=1, at=now)
     return Operation(
@@ -120,7 +136,19 @@ def _promote(conns: Connections, *, resource: tuple[str, str] | None) -> Operati
         created_at=now,
         updated_at=now,
         version=1,
+        resume_target_version=resume_target_version,
     )
+
+
+def start_operation(
+    conns: Connections, *, resource: tuple[str, str] | None = None, resume_target_version: str | None = None
+) -> Operation:
+    """Writes a `running` operation row directly — for a caller (H30's
+    `harness.upgrade`) that already knows its work will outlive this
+    dispatch, unlike `run_bounded`, which only promotes after `fn` runs
+    past its timeout. `resume_target_version`, when given, is what
+    `resume_on_start` checks against `sadana.__version__` on the next boot."""
+    return _promote(conns, resource=resource, resume_target_version=resume_target_version)
 
 
 def _transition(conns: Connections, op_id: str, *, state: str, error: dict[str, object] | None) -> None:
@@ -139,18 +167,38 @@ def _transition(conns: Connections, op_id: str, *, state: str, error: dict[str, 
 
 def resume_on_start(conns: Connections) -> None:
     """Called once, at process start. A row still `running` belonged to a
-    process that no longer exists — it cannot finish, so it is marked failed
-    with a detail naming why, never left `running` forever."""
+    process that no longer exists — it cannot finish on its own, so it is
+    resolved here, never left `running` forever.
+
+    One row shape resolves differently, additively (H30): a `running` row
+    with a `resume_target_version` set is exactly the operation that
+    *expects* its own process to restart — `harness.upgrade` writes it
+    before ever running `scripts/upgrade.sh`. It resolves to `succeeded`
+    when `sadana.__version__` now matches that target, `failed` naming the
+    actual version otherwise. Every other row (no target) keeps the
+    unconditional "the process restarted" failure this function always
+    gave — this is the only branch, and it changes nothing for a caller
+    that never sets a target."""
     now = time.time()
     with write_txn(conns.writer) as c:
-        rows = c.execute("SELECT id, version FROM operations WHERE state = 'running'").fetchall()
+        rows = c.execute("SELECT id, version, resume_target_version FROM operations WHERE state = 'running'").fetchall()
         for row in rows:
+            target = row["resume_target_version"]
+            if target is not None:
+                if __version__ == target:
+                    new_state, new_detail_json = "succeeded", None
+                else:
+                    new_state = "failed"
+                    new_detail_json = json.dumps({"detail": f"restarted on {__version__}"})
+            else:
+                new_state = "failed"
+                new_detail_json = json.dumps({"detail": "the process restarted"})
             c.execute(
-                "UPDATE operations SET state = 'failed', detail_json = ?, updated_at = ?, version = ? WHERE id = ?",
-                (json.dumps({"detail": "the process restarted"}), now, row["version"] + 1, row["id"]),
+                "UPDATE operations SET state = ?, detail_json = ?, updated_at = ?, version = ? WHERE id = ?",
+                (new_state, new_detail_json, now, row["version"] + 1, row["id"]),
             )
             ledger.record_change(
-                c, noun="operations", id=row["id"], kind="changed", state="failed", version=row["version"] + 1, at=now
+                c, noun="operations", id=row["id"], kind="changed", state=new_state, version=row["version"] + 1, at=now
             )
 
 

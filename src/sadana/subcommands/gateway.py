@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import http.server
+import logging
 import sys
 import threading
 
@@ -26,7 +27,12 @@ from sadana import (
     gateway_service,
     scheduling,
 )
+from sadana.door import auth
+from sadana.door import context as door_context
 from sadana.gateway import MessageEvent
+from sadana.tether import client as tether_client
+from sadana.tether import identity as tether_identity
+from sadana.tether import keys as tether_keys
 
 
 def build_gateway_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
@@ -58,6 +64,11 @@ def build_gateway_parser(subparsers: argparse._SubParsersAction[argparse.Argumen
 
 
 def cmd_gateway_run(args: argparse.Namespace) -> int:
+    # Nothing in this project configures logging anywhere else — every
+    # existing `logger`/`_logger` call (this module's own tether, and
+    # `door/router.py`'s error log) is otherwise silently swallowed. A
+    # long-running foreground daemon is exactly where that should stop.
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
     # H14: dotted keys, with the legacy env var passed explicitly as
     # `env_name` — neither `webhook_bind` nor `webhook_port` shares enough
     # of its old name's word order for `config.get`'s own derived-name
@@ -102,6 +113,21 @@ def cmd_gateway_run(args: argparse.Namespace) -> int:
         daemon=True,
         name="sadana-scheduling-tick",
     ).start()
+
+    # A box that has never enrolled runs exactly as it did before H30 — no
+    # identity, no tether. `door_context.build()` calls `resume_on_start`
+    # itself, so this is the only place that needs to remember it for the
+    # tether's own operations (the upgrade lifecycle in particular).
+    enrolled = tether_identity.load()
+    if enrolled is not None:
+        console_or_relay = enrolled.console_url or enrolled.relay_url
+        ctx = door_context.build(
+            runtime,
+            box_identity=auth.BoxIdentity(harness_id=enrolled.harness_id, org=enrolled.org),
+            verifier=auth.Verifier(auth.JwksSource(url=auth.jwks_url(console_or_relay))),
+        )
+        key = tether_keys.load(tether_keys.default_path())
+        tether_client.start(ctx, enrolled, key)
 
     return gateway_daemon.run(make_server=make_server, lock_filename="gateway.lock")
 

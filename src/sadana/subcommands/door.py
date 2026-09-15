@@ -16,38 +16,13 @@ import http.server
 import ipaddress
 import json
 import sys
-import time
 from pathlib import Path
 
 from sadana import client_surface, config, gateway_daemon
-from sadana.door import auth, capabilities
-from sadana.door.nouns import (
-    agent_templates,
-    agents,
-    approvals,
-    artifacts,
-    budgets,
-    harness,
-    inspections,
-    integrations,
-    memory_entries,
-    memory_policies,
-    nodes,
-    plugins,
-    providers,
-    runs,
-    schedules,
-    secrets,
-    spans,
-    tools,
-    traces,
-    workflows,
-)
-from sadana.door.nouns.conversations import ConversationsNoun
-from sadana.door.nouns.messages import MessagesNoun
-from sadana.door.operations import resume_on_start
-from sadana.door.router import DoorContext
+from sadana.door import auth
+from sadana.door import context as door_context
 from sadana.door.serve import make_server
+from sadana.tether import identity
 
 
 def build_door_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
@@ -107,8 +82,16 @@ def cmd_door_serve(args: argparse.Namespace) -> int:
     source = auth.JwksSource(url=jwks_url) if jwks_url else auth.JwksSource(path=jwks_path)
     verifier = auth.Verifier(source)
 
-    harness_id = config.env("SADANA_DOOR_HARNESS_ID", "hrn_dev")
-    org = config.env("SADANA_DOOR_ORG", "") or None
+    # An enrolled box (H30) is the box's real identity from here on; a box
+    # that has never enrolled falls back to the args/config it always used,
+    # so `door serve` and the conformance test keep working unenrolled.
+    enrolled = identity.load()
+    if enrolled is not None:
+        harness_id = enrolled.harness_id
+        org = enrolled.org
+    else:
+        harness_id = config.env("SADANA_DOOR_HARNESS_ID", "hrn_dev")
+        org = config.env("SADANA_DOOR_ORG", "") or None
 
     # H20: `conversations.py`/`messages.py` are the first nouns that need a
     # `client_surface.Runtime` (to call `open_conversation`/`take_turn`) —
@@ -116,39 +99,13 @@ def cmd_door_serve(args: argparse.Namespace) -> int:
     # replaces `door.py`'s own bare `stores.Connections(...)` call rather than
     # building a second, narrower one beside it.
     turn_runtime = client_surface.open_runtime()
-    conns = turn_runtime.connections
-    resume_on_start(conns)
 
-    ctx = DoorContext(
-        conns=conns,
-        runtime=auth.BoxIdentity(harness_id=harness_id, org=org),
-        verifier=verifier,
-        capabilities=capabilities.declared(),
-        nouns={
-            "artifacts": artifacts,
-            "conversations": ConversationsNoun(turn_runtime),
-            "harness": harness,
-            "agents": agents,
-            "agent_templates": agent_templates,
-            "memory_entries": memory_entries,
-            "memory_policies": memory_policies,
-            "schedules": schedules,
-            "messages": MessagesNoun(turn_runtime),
-            "runs": runs,
-            "spans": spans,
-            "traces": traces,
-            "approvals": approvals,
-            "plugins": plugins,
-            "workflows": workflows,
-            "nodes": nodes,
-            "tools": tools,
-            "inspections": inspections,
-            "providers": providers,
-            "budgets": budgets,
-            "integrations": integrations,
-            "secrets": secrets,
-        },
-        clock=time.time,
+    # `door.context.build()` (H30) is the one place the noun registry is
+    # assembled, shared with the tether — a second, independently-typed
+    # dict here is exactly what `console_fit_plan.md` §5(e)'s "one door, two
+    # transports" would otherwise let drift.
+    ctx = door_context.build(
+        turn_runtime, box_identity=auth.BoxIdentity(harness_id=harness_id, org=org), verifier=verifier
     )
 
     def _make_server() -> http.server.ThreadingHTTPServer:

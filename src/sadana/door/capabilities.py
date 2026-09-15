@@ -61,6 +61,9 @@ DECLARED: tuple[str, ...] = (
     # integration/secret and plugin.set-settings.
     "settings.write",
     "secrets.write",
+    # H30 (docs/tasks/H30-tether-enroll-frames-lifecycle/spec.md): the
+    # remote upgrade action.
+    "upgrade",
 )
 
 _unknown = [name for name in DECLARED if name not in ALL]

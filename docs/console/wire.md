@@ -122,16 +122,55 @@ on it: see `docs/console/capabilities.md`.
 
 ## §5 Frames
 
-Not yet delivered anywhere outside this process. H21 gives an ephemeral
-frame (`{"type": "ephemeral", "name": "message.delta", "harness_id",
-"data": {"conversation_id", "message_id", "delta", "seq"}}`) a real,
-bounded queue to land in (`door/events.py`'s `ephemeral_queue`), written to
-by a turn's own observer as it streams — but nothing drains that queue onto
-a socket yet. H30 is still the work item that puts a real socket behind
-this door and defines the frame envelope events travel in; until then, an
-ephemeral frame is visible only to something running inside this same
-process, and §3's own durable shape is reachable only by polling
-`GET /v1/changes`.
+Delivered by H30 (`src/sadana/tether/`), over the one outbound WebSocket
+§1's own grammar assumes a transport for. Every frame is a JSON object
+with a `"type"` field; an unrecognised one answers with an `error` frame,
+never a crash or a silently dropped connection.
+
+- **`challenge`** `{"type": "challenge", "nonce"}` — the relay's first
+  frame after the WebSocket upgrade.
+- **`challenge_response`** `{"type": "challenge_response", "harness_id",
+  "signature"}` — `signature` is base64 of the *raw* r‖s ES256 signature
+  (not DER) over the nonce's own UTF-8 bytes, from the box's self-generated
+  P-256 key pair.
+- **`welcome`** `{"type": "welcome"}` — any other reply to the signed
+  challenge closes the connection and backs off.
+- **`hello`** `{"type": "hello", "harness_id", "version", "capabilities",
+  "ledger_head"}`, sent by the box immediately after `welcome`.
+  `capabilities` is computed fresh at connect time from `declared()` —
+  never a value fixed earlier in the process — so a reconnect after a
+  later capability lands advertises it with no code change on the box.
+  `ledger_head` is what the console's own `GET /changes?since=` catch-up
+  seeds from after a reconnect; the box does not remember a cursor across
+  one itself.
+- **`heartbeat`** `{"type": "heartbeat", "at"}`, sent by the box every 15s
+  while connected. The box never marks itself degraded or offline — that
+  judgment, from missed heartbeats, is the console's alone.
+- **`request`** `{"type": "request", "id", "method", "path", "query",
+  "headers", "body"}` ↔ **`response`** `{"type": "response", "id",
+  "status", "headers", "body"}`, matched by `id`. `body` is a JSON value or
+  `null`; a binary body (the artifact download) is base64 with
+  `"encoding": "base64"` alongside it. A response body over
+  `SADANA_TETHER_MAX_RESPONSE_BYTES` (default 8 MiB) answers as a clean
+  `500 INTERNAL` `response` — still correlated by `id` — rather than
+  inlining an unbounded blob into one frame.
+- **`event`** `{"type": "event", "cursor", "event": <§3's own shape,
+  without `tenant_id`>}` — the ledger tail, in order, for as long as the
+  connection lasts. A dropped connection is expected to leave a gap; the
+  console's own `GET /changes?since=` closes it, not a cursor the box
+  remembers across a reconnect.
+- **`ephemeral`** `{"type": "ephemeral", "name", "harness_id", "data"}` —
+  H21's own queue (`door/events.py`'s `ephemeral_queue`), drained onto the
+  wire unchanged. Lossy by design: a delta still queued from before a
+  disconnect is discarded, not delivered late, at the moment a new
+  connection is established.
+- **`error`** `{"type": "error", "code", "detail"}`.
+
+`429` on the WebSocket upgrade itself, with a `Retry-After` header, is
+obeyed exactly — the box sleeps that long and nothing else. Any other
+disconnection or connect failure reconnects with exponential backoff and
+full jitter, capped at 60 seconds; the attempt count resets after a
+connection that stayed up at least that long.
 
 ## §6 What the console's prompts did not anticipate
 
