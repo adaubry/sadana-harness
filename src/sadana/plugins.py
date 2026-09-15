@@ -15,7 +15,6 @@ caller of it ever risks an import cycle."""
 from __future__ import annotations
 
 import json
-import os
 import re
 import tomllib
 from collections import deque
@@ -356,21 +355,52 @@ def setting_env_var(plugin: str, name: str) -> str:
     return f"SADANA_PLUGIN__{plugin.replace('-', '_').upper()}__{name.upper()}"
 
 
-def read_setting(plugin: str, name: str) -> str | None:
+def read_setting(plugin: str, name: str, *, secret: bool) -> str | None:
     """What a node body calls to read one of its own plugin's settings.
 
+    ``secret`` is the exact value the plugin's own ``[[setting]]`` declared
+    (H14, `docs/tasks/H14-tuned-config-settings-secrets/spec.md`) — a fact
+    fixed at the call site, not something this function could discover on
+    its own without re-parsing ``plugin.toml`` on every read.
+
+    A ``secret=True`` setting resolves two ways, checked in this order:
+    first, ``plugins.<plugin>.<name>`` in ``config.toml`` as a *reference*
+    — what ``door/nouns/plugins.py``'s ``set-settings`` writes for a
+    ``{secret_ref: name}`` body — and if one is there, it is followed
+    through ``config.secret`` for the live value, so rotating the
+    referenced secret (``PATCH /v1/secrets/{id}``) reaches every plugin
+    pointing at it on the very next call, no restart and no second
+    `set-settings` call needed. Second, failing that, ``setting_env_var``'s
+    namespaced name via ``config.secret`` directly — ``sadana plugin set``'s
+    own long-standing path, storing the raw value itself, unchanged.
+
+    A ``secret=False`` setting resolves through ``config.get`` under
+    ``[plugins.<plugin>]`` in ``config.toml``, keyed by the setting's own
+    plain name — with ``setting_env_var``'s own namespaced name passed as
+    ``config.get``'s ``env_name`` override, so
+    ``SADANA_PLUGIN__<PLUGIN>__<SETTING>`` keeps overriding a non-secret
+    setting exactly as it always did (its double-underscore shape doesn't
+    match ``config.get``'s own derived-name convention, so without the
+    override this old name would silently stop working).
+
     ``None`` when unset *and* when set to the empty string: a blank line in
-    ``.env`` is a value nobody supplied, and treating the two alike is what
-    stops ``missing_settings`` below being defeated by one.
+    ``.env`` (or an empty string in ``config.toml``) is a value nobody
+    supplied, and treating the two alike is what stops ``missing_settings``
+    below being defeated by one.
 
     This is the only channel by which a value reaches a running plugin. It
     is deliberately not ``arguments`` and not the walk's threaded value —
     nothing the model writes can reach it, and nothing it returns can end up
     in a ``DagResult``, a ``NodeTrace`` or a recorded run by accident."""
-    return os.environ.get(setting_env_var(plugin, name)) or None
+    if secret:
+        ref = config.get(f"plugins.{plugin}.{name}", "")
+        if ref:
+            return config.secret(ref) or None
+        return config.secret(setting_env_var(plugin, name)) or None
+    return config.get(f"plugins.{plugin}.{name}", "", env_name=setting_env_var(plugin, name)) or None
 
 
-def required_setting(plugin: str, name: str) -> str:
+def required_setting(plugin: str, name: str, *, secret: bool) -> str:
     """A declared setting that must be there, for a body that has already been
     let past the preflight.
 
@@ -384,7 +414,7 @@ def required_setting(plugin: str, name: str) -> str:
 
     Written once because three plugins were each carrying it, two of them with
     the same eight-line comment character for character."""
-    value = read_setting(plugin, name)
+    value = read_setting(plugin, name, secret=secret)
     assert value is not None, f"run_graph's missing-settings preflight should have refused this run ({plugin}.{name})"
     return value
 
@@ -394,7 +424,7 @@ def missing_settings(manifest: Manifest) -> tuple[str, ...]:
 
     Derived on every call, never stored: reading it fresh is what makes
     "set it, then run again" work without restarting anything."""
-    return tuple(s.name for s in manifest.settings if read_setting(manifest.name, s.name) is None)
+    return tuple(s.name for s in manifest.settings if read_setting(manifest.name, s.name, secret=s.secret) is None)
 
 
 def manifest_to_dict(manifest: Manifest) -> dict[str, object]:
@@ -427,9 +457,14 @@ def manifest_to_dict(manifest: Manifest) -> dict[str, object]:
     }
 
 
-def _toml_string(value: str) -> str:
+def toml_string(value: str) -> str:
     """One TOML basic string, or ``ValueError`` if TOML cannot carry the
     text at all.
+
+    No longer private (H14, `docs/tasks/H14-tuned-config-settings-secrets/
+    spec.md`): `door/config_writer.py`'s own emitter reuses this for every
+    string value it writes to `config.toml` rather than re-hardening a
+    second copy of the same escaping against the same two bugs.
 
     Most of the escaping is ``json.dumps``'s job: TOML basic strings and
     JSON strings agree on ``"``, ``\\`` and every control character below
@@ -473,32 +508,32 @@ def manifest_to_toml(manifest: Manifest) -> str:
     produces ``None``/``()`` for an absent one."""
     lines = [
         "[plugin]",
-        f"name = {_toml_string(manifest.name)}",
-        f"version = {_toml_string(manifest.version)}",
-        f"description = {_toml_string(manifest.description)}",
+        f"name = {toml_string(manifest.name)}",
+        f"version = {toml_string(manifest.version)}",
+        f"description = {toml_string(manifest.description)}",
     ]
     for entry in manifest.entries:
         lines += [
             "",
             "[[entry]]",
-            f"tool = {_toml_string(entry.tool)}",
-            f"purpose = {_toml_string(entry.purpose)}",
-            f"parameters = {_toml_string(entry.parameters)}",
-            f"start = {_toml_string(entry.start)}",
+            f"tool = {toml_string(entry.tool)}",
+            f"purpose = {toml_string(entry.purpose)}",
+            f"parameters = {toml_string(entry.parameters)}",
+            f"start = {toml_string(entry.start)}",
         ]
     for node in manifest.nodes:
-        lines += ["", "[[node]]", f"name = {_toml_string(node.name)}", f"kind = {_toml_string(node.kind)}"]
+        lines += ["", "[[node]]", f"name = {toml_string(node.name)}", f"kind = {toml_string(node.kind)}"]
         for field, value in (("body", node.body), ("skill", node.skill), ("next", node.next)):
             if value is not None:
-                lines.append(f"{field} = {_toml_string(value)}")
+                lines.append(f"{field} = {toml_string(value)}")
         if node.ports:
-            lines.append("ports = [" + ", ".join(_toml_string(p) for p in node.ports) + "]")
+            lines.append("ports = [" + ", ".join(toml_string(p) for p in node.ports) + "]")
     for setting in manifest.settings:
         lines += [
             "",
             "[[setting]]",
-            f"name = {_toml_string(setting.name)}",
-            f"purpose = {_toml_string(setting.purpose)}",
+            f"name = {toml_string(setting.name)}",
+            f"purpose = {toml_string(setting.purpose)}",
             f"secret = {'true' if setting.secret else 'false'}",
         ]
     return "\n".join(lines) + "\n"

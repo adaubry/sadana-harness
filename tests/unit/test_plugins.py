@@ -512,13 +512,13 @@ def test_setting_env_var_refuses_a_name_that_never_passed_validation() -> None:
 @pytest.mark.unit
 def test_read_setting_returns_the_value_when_set(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("SADANA_PLUGIN__WEATHER__API_KEY", "sk-live")
-    assert read_setting("weather", "api_key") == "sk-live"
+    assert read_setting("weather", "api_key", secret=True) == "sk-live"
 
 
 @pytest.mark.unit
 def test_read_setting_is_none_when_unset(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("SADANA_PLUGIN__WEATHER__API_KEY", raising=False)
-    assert read_setting("weather", "api_key") is None
+    assert read_setting("weather", "api_key", secret=True) is None
 
 
 @pytest.mark.unit
@@ -526,7 +526,54 @@ def test_read_setting_treats_an_empty_value_as_unset(monkeypatch: pytest.MonkeyP
     """A blank line in .env is a value nobody supplied; conflating the two
     is what stops the preflight being defeated by one."""
     monkeypatch.setenv("SADANA_PLUGIN__WEATHER__API_KEY", "")
-    assert read_setting("weather", "api_key") is None
+    assert read_setting("weather", "api_key", secret=True) is None
+
+
+@pytest.mark.unit
+def test_read_setting_secret_follows_a_stored_reference(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """H14: `door.nouns.plugins`'s `set-settings` stores a *reference*
+    under `plugins.<plugin>.<name>` for a secret-kind setting; `read_setting`
+    follows it through `config.secret` for the live value, so rotating the
+    referenced secret is visible on the very next call."""
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    monkeypatch.delenv("SADANA_PLUGIN__WEATHER__API_KEY", raising=False)
+    config_dir = tmp_path / "config" / "sadana"
+    config_dir.mkdir(parents=True)
+    (config_dir / "config.toml").write_text(
+        '[plugins.weather]\napi_key = "cred_x"\n',  # pragma: allowlist secret
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("cred_x", "sk-first")  # pragma: allowlist secret
+    assert read_setting("weather", "api_key", secret=True) == "sk-first"
+    monkeypatch.setenv("cred_x", "sk-rotated")  # pragma: allowlist secret
+    assert read_setting("weather", "api_key", secret=True) == "sk-rotated"
+
+
+@pytest.mark.unit
+def test_read_setting_secret_falls_back_to_the_raw_env_var_with_no_reference(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`sadana plugin set`'s own long-standing path — a raw value directly
+    under the namespaced env var — keeps working unchanged when nothing has
+    ever set a reference for this setting."""
+    monkeypatch.setenv("SADANA_PLUGIN__WEATHER__API_KEY", "sk-direct")
+    assert read_setting("weather", "api_key", secret=True) == "sk-direct"
+
+
+@pytest.mark.unit
+def test_read_setting_non_secret_falls_back_to_config_toml(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """H14: a `secret=False` setting resolves through `config.get` under
+    `[plugins.<plugin>]`, not through `os.environ` directly — but its old
+    `SADANA_PLUGIN__<PLUGIN>__<SETTING>` env var still overrides it."""
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    monkeypatch.delenv("SADANA_PLUGIN__WEATHER__UNITS", raising=False)
+    assert read_setting("weather", "units", secret=False) is None
+
+    config_dir = tmp_path / "config" / "sadana"
+    config_dir.mkdir(parents=True)
+    (config_dir / "config.toml").write_text('[plugins.weather]\nunits = "metric"\n', encoding="utf-8")
+    assert read_setting("weather", "units", secret=False) == "metric"
+
+    monkeypatch.setenv("SADANA_PLUGIN__WEATHER__UNITS", "imperial")
+    assert read_setting("weather", "units", secret=False) == "imperial"
 
 
 @pytest.mark.unit

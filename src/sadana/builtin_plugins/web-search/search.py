@@ -16,7 +16,7 @@ PLUGIN = "web-search"
 
 
 def search(value: dict) -> str:
-    api_key = plugins.required_setting(PLUGIN, "api_key")
+    api_key = plugins.required_setting(PLUGIN, "api_key", secret=True)
 
     query = str(value.get("query", "")).strip()
     if not query:

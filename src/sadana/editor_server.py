@@ -64,9 +64,14 @@ def _defined_functions(source: str) -> set[str]:
     return {node.name for node in tree.body if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)}
 
 
-def _waiting(directory: Path, manifest: plugins.Manifest) -> list[dict[str, str]]:
+def waiting(directory: Path, manifest: plugins.Manifest) -> list[dict[str, str]]:
     """Every step pointing at something that does not exist yet, and what it
     is waiting for. Never imports anything.
+
+    Public (H24: `docs/tasks/H24-door-nouns-plugins-layout-install-inspect/
+    spec.md`) so `door/nouns/plugins.py` can render `needs_code`/
+    `needs_code_count` from the same source this editor's own status word
+    reads, rather than a second reimplementation.
 
     Two things land here, and running the editor for the first time is what
     showed they belong together. A ``compute``/``call``/``route`` step waits
@@ -104,9 +109,13 @@ def _read_manifest(directory: Path) -> plugins.Manifest | str:
         return plugins.describe_manifest_outcome(plugins.ManifestParseError(detail=str(exc)))
 
 
-def _assess(directory: Path) -> tuple[plugins.Manifest, list[str], list[dict[str, str]]] | str:
+def assess(directory: Path) -> tuple[plugins.Manifest, list[str], list[dict[str, str]]] | str:
     """One read of a plugin: the manifest, what is wrong with it, and what it
     is waiting for — or a sentence saying it would not parse.
+
+    Public (H24) so `door/nouns/plugins.py` can build a plugin's
+    manifest-derived fields from the same one-read-per-request this editor
+    already relies on.
 
     One function rather than two so `plugin.toml` is read once per request
     instead of once by the parse and again by `validate()`, and so the status
@@ -133,13 +142,13 @@ def _assess(directory: Path) -> tuple[plugins.Manifest, list[str], list[dict[str
     outcome = plugin_manifest.validate(directory, check_bodies=False)
     settled = isinstance(outcome, plugins.Valid | plugins.UnresolvedSkill)
     problems = [] if settled else [plugins.describe_manifest_outcome(outcome)]
-    return manifest, problems, _waiting(directory, manifest)
+    return manifest, problems, waiting(directory, manifest)
 
 
 def _plugin_payload(directory: Path) -> Response:
     """What the page needs to draw one plugin: the manifest, where each box
     goes, what is wrong with it, and what each step is still waiting for."""
-    assessed = _assess(directory)
+    assessed = assess(directory)
     if isinstance(assessed, str):
         return _error(400, assessed)
     manifest, problems, waiting = assessed
@@ -156,7 +165,7 @@ def _plugin_payload(directory: Path) -> Response:
 
 
 def _status_word(directory: Path) -> str:
-    assessed = _assess(directory)
+    assessed = assess(directory)
     if isinstance(assessed, str):
         return "unreadable"
     _manifest, problems, waiting = assessed
@@ -165,13 +174,17 @@ def _status_word(directory: Path) -> str:
     return "unfinished" if waiting else "ready"
 
 
-def _list_plugins(plugins_root: Path) -> Response:
+def list_plugins(plugins_root: Path) -> Response:
     """Every directory holding a `plugin.toml`, with a word about each.
 
     Deliberately not `plugin_manifest.discover_plugins()`, which returns only
     plugins that fully validate — that is right for deciding what an agent may
     call, and exactly wrong here, because it would hide the half-finished
-    plugins this editor exists to finish."""
+    plugins this editor exists to finish.
+
+    Public (H24) so `door/nouns/plugins.py` can enumerate every plugin
+    directory the same way this editor does — including one that doesn't
+    validate — rather than `discover_plugins()`'s narrower, valid-only set."""
     if not plugins_root.is_dir():
         return _json(200, {"plugins": []})
     found = [
@@ -309,7 +322,7 @@ def _edit_step(directory: Path, body: bytes) -> Response:
     pure functions in `plugins.py` rather than in the page's JavaScript, where
     nothing in this repository could test them (CLAUDE.md: a browser surface
     holds no logic that can be held in Python)."""
-    assessed = _assess(directory)
+    assessed = assess(directory)
     if isinstance(assessed, str):
         return _error(400, assessed)
     manifest = assessed[0]
@@ -423,7 +436,7 @@ def handle(
     if method == "GET" and path == "/api/kinds":
         return _kinds()
     if method == "GET" and path == "/api/plugins":
-        return _list_plugins(plugins_root)
+        return list_plugins(plugins_root)
     if method == "POST" and path == "/api/plugins":
         return _create(plugins_root, body)
 

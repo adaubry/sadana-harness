@@ -7,7 +7,19 @@ from pathlib import Path
 
 import pytest
 
-from sadana.config import Paths, env, env_bool, env_int, env_path, get_paths, load_dotenv
+from sadana import config as config_module
+from sadana.config import (
+    Paths,
+    bind_secret_reader,
+    env,
+    env_bool,
+    env_int,
+    env_path,
+    get,
+    get_paths,
+    load_dotenv,
+    secret,
+)
 
 
 @pytest.mark.unit
@@ -142,7 +154,11 @@ def test_load_dotenv_missing_file_is_a_no_op(monkeypatch: pytest.MonkeyPatch, tm
 
 
 @pytest.mark.unit
-def test_load_dotenv_loads_quoted_and_bare_values(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def test_load_dotenv_no_longer_populates_os_environ(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """H14: `load_dotenv` stopped copying `.env` into `os.environ` —
+    `config.secret` is the read path for these values now, and nothing
+    downstream reads `os.environ` expecting `.env`'s contents to already
+    be there."""
     state = tmp_path / "state"
     state.mkdir()
     (state / ".env").write_text('AAA="quoted value"\nBBB=bare\n', encoding="utf-8")
@@ -150,8 +166,8 @@ def test_load_dotenv_loads_quoted_and_bare_values(monkeypatch: pytest.MonkeyPatc
     monkeypatch.delenv("AAA", raising=False)
     monkeypatch.delenv("BBB", raising=False)
     load_dotenv()
-    assert env("AAA", "") == "quoted value"
-    assert env("BBB", "") == "bare"
+    assert env("AAA", "unset") == "unset"
+    assert env("BBB", "unset") == "unset"
 
 
 @pytest.mark.unit
@@ -166,11 +182,147 @@ def test_load_dotenv_never_overrides_a_live_var(monkeypatch: pytest.MonkeyPatch,
 
 
 @pytest.mark.unit
-def test_load_dotenv_skips_comments_blank_and_malformed_lines(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def test_load_dotenv_raises_on_an_unreadable_encoding(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """A malformed `.env` still fails loudly at startup, the same moment it
+    always has — deferring that failure to the first `config.secret()` call
+    would turn a file problem into a much harder to diagnose runtime one."""
     state = tmp_path / "state"
     state.mkdir()
-    (state / ".env").write_text("# comment\n\n=novalue\nBAD\nCCC=ok\n= trailing-space-ok\n", encoding="utf-8")
+    (state / ".env").write_bytes(b"\xff\xfe\x00\x00not-utf8")
     monkeypatch.setenv("SADANA_STATE_DIR", str(state))
-    monkeypatch.delenv("CCC", raising=False)
-    load_dotenv()
-    assert env("CCC", "") == "ok"
+    with pytest.raises(UnicodeDecodeError):
+        load_dotenv()
+
+
+# ── get ───────────────────────────────────────────────────────────────────
+
+
+def _write_config_toml(config_dir: Path, text: str) -> None:
+    config_dir.mkdir(parents=True, exist_ok=True)
+    (config_dir / "config.toml").write_text(text, encoding="utf-8")
+
+
+@pytest.mark.unit
+def test_get_returns_default_when_file_and_key_are_absent(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    monkeypatch.delenv("SADANA_MODEL_ACCESS_TIMEOUT_S", raising=False)
+    assert get("model_access.timeout_s", 30) == 30
+
+
+@pytest.mark.unit
+def test_get_returns_the_files_value(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    config_dir = tmp_path / "config" / "sadana"
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    monkeypatch.delenv("SADANA_MODEL_ACCESS_TIMEOUT_S", raising=False)
+    _write_config_toml(config_dir, "[model_access]\ntimeout_s = 45\n")
+    assert get("model_access.timeout_s", 30) == 45
+
+
+@pytest.mark.unit
+def test_get_environment_wins_over_the_file(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    config_dir = tmp_path / "config" / "sadana"
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    _write_config_toml(config_dir, "[model_access]\ntimeout_s = 45\n")
+    monkeypatch.setenv("SADANA_MODEL_ACCESS_TIMEOUT_S", "99")
+    assert get("model_access.timeout_s", 30) == 99
+
+
+@pytest.mark.unit
+def test_get_sees_a_rewritten_file_on_the_next_call(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    # Values of different lengths, not just different mtimes: the cache key
+    # is (mtime_ns, size), and two writes close enough together could share
+    # an mtime tick on some filesystems — a size difference makes this
+    # assertion hold regardless of clock granularity.
+    config_dir = tmp_path / "config" / "sadana"
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    monkeypatch.delenv("SADANA_MODEL_ACCESS_TIMEOUT_S", raising=False)
+    _write_config_toml(config_dir, "[model_access]\ntimeout_s = 45\n")
+    assert get("model_access.timeout_s", 30) == 45
+    _write_config_toml(config_dir, "[model_access]\ntimeout_s = 999999\n")
+    assert get("model_access.timeout_s", 30) == 999999
+
+
+@pytest.mark.unit
+def test_get_reads_a_nested_dotted_table(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    config_dir = tmp_path / "config" / "sadana"
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    _write_config_toml(config_dir, '[providers.openrouter]\nbase_url = "https://example.test"\n')
+    assert get("providers.openrouter.base_url", "default") == "https://example.test"
+
+
+@pytest.mark.unit
+def test_get_string_default_from_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    monkeypatch.setenv("SADANA_MODEL_ACCESS_PROVIDER", "anthropic")
+    assert get("model_access.provider", "openrouter") == "anthropic"
+
+
+@pytest.mark.unit
+def test_get_bool_default_coerces_env_string(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    monkeypatch.setenv("SADANA_SOME_FLAG", "true")
+    assert get("some.flag", False) is True
+
+
+# ── secret ────────────────────────────────────────────────────────────────
+#
+# `secret()`'s reader fallback is exercised via `monkeypatch.setattr` on the
+# module's own `_secret_reader`, the same idiom `test_model_access.py` uses
+# for its `_REGISTRY`/`_discovered` globals — monkeypatch reverts it after
+# each test with no reset fixture needed. `bind_secret_reader` itself gets
+# one dedicated test below, with an explicit manual restore, since it is
+# the one thing here monkeypatch did not set.
+
+
+@pytest.mark.unit
+def test_secret_returns_a_real_environment_variable(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-from-shell")
+    monkeypatch.setattr(
+        config_module, "_secret_reader", lambda name: pytest.fail("must not touch the file when env answers")
+    )
+    assert secret("OPENROUTER_API_KEY") == "sk-from-shell"
+
+
+@pytest.mark.unit
+def test_secret_falls_back_to_the_bound_reader(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.setattr(
+        config_module, "_secret_reader", lambda name: "from-file" if name == "OPENROUTER_API_KEY" else None
+    )
+    assert secret("OPENROUTER_API_KEY") == "from-file"
+
+
+@pytest.mark.unit
+def test_secret_sees_a_rewritten_reader_value_on_the_next_call(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("A_SECRET", raising=False)  # pragma: allowlist secret
+    values = {"A_SECRET": "old"}  # pragma: allowlist secret
+    monkeypatch.setattr(config_module, "_secret_reader", lambda name: values.get(name))
+    assert secret("A_SECRET") == "old"  # pragma: allowlist secret
+    values["A_SECRET"] = "new"  # pragma: allowlist secret
+    assert secret("A_SECRET") == "new"  # pragma: allowlist secret
+
+
+@pytest.mark.unit
+def test_secret_returns_none_when_the_reader_has_no_value(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("MISSING_SECRET", raising=False)
+    monkeypatch.setattr(config_module, "_secret_reader", lambda name: None)
+    assert secret("MISSING_SECRET") is None
+
+
+@pytest.mark.unit
+def test_secret_raises_before_any_reader_is_bound(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("NEVER_BOUND", raising=False)
+    monkeypatch.setattr(config_module, "_secret_reader", None)
+    with pytest.raises(RuntimeError):
+        secret("NEVER_BOUND")
+
+
+@pytest.mark.unit
+def test_bind_secret_reader_sets_the_module_level_reader() -> None:
+    original = config_module._secret_reader
+    try:
+        bind_secret_reader(lambda name: f"bound:{name}")
+        assert config_module._secret_reader is not None
+        assert config_module._secret_reader("X") == "bound:X"
+    finally:
+        config_module._secret_reader = original

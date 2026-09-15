@@ -39,6 +39,11 @@ from sadana import ledger, marketplace, memory_store, observability, persona_sto
 from sadana.conversation_store import open_store, store_path_from_config
 from sadana.door import idempotency as door_idempotency
 from sadana.door import operations as door_operations
+from sadana.door.nouns import budgets as door_nouns_budgets
+from sadana.door.nouns import inspections as door_nouns_inspections
+from sadana.door.nouns import integrations as door_nouns_integrations
+from sadana.door.nouns import providers as door_nouns_providers
+from sadana.door.nouns import secrets as door_nouns_secrets
 
 
 def ensure_schemas(conn: sqlite3.Connection) -> None:
@@ -61,6 +66,11 @@ def ensure_schemas(conn: sqlite3.Connection) -> None:
     observability.ensure_schema(conn)
     door_idempotency.ensure_schema(conn)
     door_operations.ensure_schema(conn)
+    door_nouns_inspections.ensure_schema(conn)
+    door_nouns_providers.ensure_schema(conn)
+    door_nouns_budgets.ensure_schema(conn)
+    door_nouns_integrations.ensure_schema(conn)
+    door_nouns_secrets.ensure_schema(conn)
 
 
 def reconcile_indexes(conn: sqlite3.Connection) -> None:
@@ -68,7 +78,7 @@ def reconcile_indexes(conn: sqlite3.Connection) -> None:
 
     Separate from `ensure_schemas` because it is a different kind of work with
     a different cost, and only some callers need it. A process that takes turns
-    needs it: `client_surface._enabled_plugin_set` reads `plugin_state` to know
+    needs it: `client_surface.enabled_plugin_set` reads `plugin_state` to know
     what is switched off, so a stale index means a disabled plugin is still
     offered to the model. A one-shot `sadana` subcommand does not — nothing it
     reads touches either index, and `sadana memory list` has no business

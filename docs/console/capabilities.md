@@ -13,9 +13,9 @@ but not yet declared by any shipped work item.
 | `changes` | `GET /v1/changes` | 0.0.1 (H19) | not gated by a console prompt; declared for completeness |
 | `inventory` | `GET /v1/inventory` | 0.0.1 (H19) | not gated by a console prompt; declared for completeness |
 | `artifacts.download` | downloading a stored artifact's bytes | — | not gated by a console prompt; declared for completeness |
-| `plugins.install` | installing a plugin from a git source | — | not gated by a console prompt; declared for completeness |
-| `plugins.inspect` | reading a plugin's own layout/manifest | — | not gated by a console prompt; declared for completeness |
-| `plugins.write` | editing and saving a plugin | — | A24 |
+| `plugins.install` | installing a plugin from a git source | 0.0.1 (H24) | not gated by a console prompt; declared for completeness |
+| `plugins.inspect` | reading a plugin's own layout/manifest | 0.0.1 (H24) | not gated by a console prompt; declared for completeness |
+| `plugins.write` | editing and saving a plugin | 0.0.1 (H24) | A24 |
 | `schedules.write` | creating/editing a cron schedule | — | A18 |
 | `approvals.wait` | a paused `call` node becoming an addressable, resumable resource | — | not gated by a console prompt; declared for completeness |
 | `approvals.call` | resolving a pending approval | — | not gated by a console prompt; declared for completeness |

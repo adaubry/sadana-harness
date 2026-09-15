@@ -1128,7 +1128,7 @@ def test_a_body_two_nodes_deep_reads_the_setting_and_it_stays_out_of_the_result(
         "def build(value):\n"
         "    return {'query': 'paris'}\n\n"
         "def fetch(value):\n"
-        "    key = read_setting('weather', 'api_key')\n"
+        "    key = read_setting('weather', 'api_key', secret=True)\n"
         "    assert key == 'sk-live', key\n"
         "    return 'forecast for ' + value['query']\n",
     )
@@ -1190,7 +1190,7 @@ def test_a_call_node_two_steps_deep_reads_the_setting(tmp_path: Path, monkeypatc
         "def build(value):\n"
         "    return {'query': 'paris'}\n\n"
         "def fetch(value):\n"
-        "    key = read_setting('weather', 'api_key')\n"
+        "    key = read_setting('weather', 'api_key', secret=True)\n"
         "    assert key == 'sk-live', key\n"
         "    return 'forecast for ' + value['query']\n",
     )

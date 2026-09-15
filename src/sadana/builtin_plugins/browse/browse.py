@@ -21,7 +21,7 @@ PLUGIN = "browse"
 
 
 def browse(value: dict) -> str:
-    api_key = plugins.required_setting(PLUGIN, "api_key")
+    api_key = plugins.required_setting(PLUGIN, "api_key", secret=True)
 
     task = str(value.get("task", "")).strip()
     if not task:

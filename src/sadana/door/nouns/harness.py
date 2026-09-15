@@ -16,7 +16,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 
-from sadana import __version__, ledger
+from sadana import __version__, config, ledger
 from sadana.door import capabilities, grammar, problems
 from sadana.door.auth import Principal
 from sadana.door.nouns import ActionSpec, NounSpec, SearchDoc, unavailable
@@ -53,6 +53,11 @@ def get_harness(ctx: object, principal: Principal) -> dict[str, object]:
         "org": ctx.runtime.org,  # type: ignore[attr-defined]
         "ledger_head": ledger.ledger_head(reader),
         "leaves_the_box": tuple(ctx.nouns),  # type: ignore[attr-defined]
+        # H14: a sibling field, not a rename of `leaves_the_box` or a type
+        # change of `tether` — the latter is H30's, mid-flight on this same
+        # response shape. Read live: the console's own per-tenant mirror
+        # setting is authoritative, this is only the box's own floor.
+        "mirror": config.get("tether.mirror", "full"),
     }
 
 
